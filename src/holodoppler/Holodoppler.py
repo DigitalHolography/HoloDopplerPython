@@ -74,7 +74,7 @@ class Holodoppler:
 
     def _init_backend(self):
 
-        if self.backend == "cupy":
+        if self.backend == "cupy" or self.backend == "cupy_ramdisk" or self.backend == "cupy_diagnostic":
             if not _cupy_available:
                 raise RuntimeError("CuPy backend requested but CuPy is not available.")
             self.xp = cp
@@ -91,12 +91,12 @@ class Holodoppler:
             self.fftpack = np_fftpack
             
     def _to_backend(self, arr):
-        if self.backend == "cupy":
+        if self.backend == "cupy" or self.backend == "cupy_diagnostic" or self.backend == "cupy_ramdisk":
             return cp.asarray(arr)
         return arr
 
     def _to_numpy(self, arr):
-        if self.backend == "cupy":
+        if self.backend == "cupy" or self.backend == "cupy_diagnostic" or self.backend == "cupy_ramdisk":
             return cp.asnumpy(arr)
         return arr
 
@@ -173,10 +173,14 @@ class Holodoppler:
         frames = np.stack(images, axis=0)
         return self._to_backend(frames)
     
-    def read_frames_holo(self, first_frame, frame_size):
+    def read_frames_holo(self, first_frame, frame_size, fid = None):
+        
 
         try:
 
+            if fid is None:
+                fid = self.fid
+            
             byte_begin = (
                 self.HOLO_HEADER_SIZE
                 + self.file_header["width"] * self.file_header["height"] * first_frame * self.file_header["bit_depth"] // 8
@@ -184,8 +188,8 @@ class Holodoppler:
 
             byte_size = self.file_header["width"] * self.file_header["height"] * frame_size * self.file_header["bit_depth"] // 8
 
-            self.fid.seek(byte_begin)
-            raw_bytes = self.fid.read(byte_size)
+            fid.seek(byte_begin)
+            raw_bytes = fid.read(byte_size)
 
             if self.file_header["bit_depth"] == 8:
                 utyp = np.uint8
@@ -1035,6 +1039,185 @@ class Holodoppler:
             M0_reg, _, _, _, _, _, _, _ = self.render_moments(parameters, frames = frames)
             M0_reg = self._flatfield(M0_reg, parameters["registration_flatfield_gw"])
             reg_list = []
+            
+        if self.backend == "cupy_ramdisk":
+            import time
+
+            print("=== Preloading all batches into RAM ===")
+            t0 = time.perf_counter()
+
+            # --- Read ALL batches into RAM upfront in parallel ---
+            from concurrent.futures import ThreadPoolExecutor
+            from queue import Queue
+
+            NUM_IO_WORKERS = 8  # go wide, disk is the bottleneck
+
+            fid_pool = Queue()
+            worker_fids = [open(self.file_path, "rb") for _ in range(NUM_IO_WORKERS)]
+            for fid in worker_fids:
+                fid_pool.put(fid)
+
+            batch_list = [
+                (first_frame + i * parameters["batch_stride"], parameters["batch_size"])
+                for i in range(num_batch)
+            ]
+
+            def read_batch(args):
+                idx, (ff, bs) = args
+                fid = fid_pool.get()
+                try:
+                    return idx, self.read_frames(ff, bs, fid=fid)
+                finally:
+                    fid_pool.put(fid)
+
+            with ThreadPoolExecutor(max_workers=NUM_IO_WORKERS) as executor:
+                results = list(executor.map(read_batch, enumerate(batch_list)))
+
+            # Sort by index, guaranteed order
+            all_frames = [frames for _, frames in sorted(results, key=lambda x: x[0])]
+
+            print(f"Preload done in {time.perf_counter() - t0:.2f}s — now GPU loop is pure compute")
+
+            for fid in worker_fids:
+                fid.close()
+
+            # --- GPU loop: zero disk I/O, pure compute ---
+            stream_h2d     = cp.cuda.Stream(non_blocking=True)
+            stream_compute = cp.cuda.Stream(non_blocking=True)
+
+            with stream_h2d:
+                d_frames_next = cp.asarray(all_frames[0])
+            stream_h2d.synchronize()
+
+            for i in tqdm(range(num_batch)):
+                d_frames = d_frames_next
+
+                if i + 1 < num_batch:
+                    with stream_h2d:
+                        d_frames_next = cp.asarray(all_frames[i + 1])
+                    # no sync needed — compute stream will naturally be behind
+
+                with stream_compute:
+                    res = self.render_moments(parameters, frames=d_frames)
+
+                if res is None:
+                    break
+
+                M0, M1, M2 = res
+
+                with stream_compute:
+                    if parameters["image_registration"]:
+                        M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
+                        (shift_y, shift_x) = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
+                        M0 = self._roll2d(M0, shift_y, shift_x, self.xp)
+                        M1 = self._roll2d(M1, shift_y, shift_x, self.xp)
+                        M2 = self._roll2d(M2, shift_y, shift_x, self.xp)
+                        reg_list.append((shift_y, shift_x))
+
+                stream_compute.synchronize()
+                out_list.append(cp.stack([M0, M1, M2], axis=2))
+
+            stream_h2d.synchronize()
+            cp.cuda.Device().synchronize()
+            
+        if self.backend == "cupy_diagnostic":
+            print("Running in diagnostic mode with CuPy backend. This will report timing for each step of the pipeline to identify bottlenecks.")
+            import time
+            from collections import defaultdict
+
+            timings = defaultdict(list)
+
+            def cuda_sync_time(stream, label):
+                """Synchronize a stream and return elapsed time."""
+                t0 = time.perf_counter()
+                stream.synchronize()
+                t1 = time.perf_counter()
+                timings[label].append(t1 - t0)
+                return t1 - t0
+
+            stream_h2d     = cp.cuda.Stream(non_blocking=True)
+            stream_compute = cp.cuda.Stream(non_blocking=True)
+
+            # --- Prime first batch ---
+            t0 = time.perf_counter()
+            frames_next = self.read_frames(first_frame, parameters["batch_size"])
+            timings["disk_read"].append(time.perf_counter() - t0)
+
+            t0 = time.perf_counter()
+            with stream_h2d:
+                d_frames_next = cp.asarray(frames_next)
+            stream_h2d.synchronize()
+            timings["h2d_transfer"].append(time.perf_counter() - t0)
+
+            for i in tqdm(range(num_batch)):
+                d_frames = d_frames_next
+
+                # --- Disk read ---
+                if i + 1 < num_batch:
+                    t0 = time.perf_counter()
+                    frames_next = self.read_frames(
+                        first_frame + (i + 1) * parameters["batch_stride"],
+                        parameters["batch_size"]
+                    )
+                    timings["disk_read"].append(time.perf_counter() - t0)
+
+                    # --- H2D transfer ---
+                    t0 = time.perf_counter()
+                    with stream_h2d:
+                        d_frames_next = cp.asarray(frames_next)
+                    stream_h2d.synchronize()
+                    timings["h2d_transfer"].append(time.perf_counter() - t0)
+
+                # --- Compute ---
+                t0 = time.perf_counter()
+                with stream_compute:
+                    res = self.render_moments(parameters, frames=d_frames)
+                stream_compute.synchronize()
+                timings["compute"].append(time.perf_counter() - t0)
+
+                if res is None:
+                    break
+
+                M0, M1, M2 = res
+
+                # --- Registration ---
+                if parameters["image_registration"]:
+                    t0 = time.perf_counter()
+                    with stream_compute:
+                        M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
+                        (shift_y, shift_x) = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
+                        M0 = self._roll2d(M0, shift_y, shift_x, self.xp)
+                        M1 = self._roll2d(M1, shift_y, shift_x, self.xp)
+                        M2 = self._roll2d(M2, shift_y, shift_x, self.xp)
+                        reg_list.append((shift_y, shift_x))
+                    stream_compute.synchronize()
+                    timings["registration"].append(time.perf_counter() - t0)
+
+                # --- Stack ---
+                t0 = time.perf_counter()
+                out_list.append(cp.stack([M0, M1, M2], axis=2))
+                timings["stack"].append(time.perf_counter() - t0)
+
+            stream_h2d.synchronize()
+            cp.cuda.Device().synchronize()
+
+            # --- Report ---
+            import numpy as np
+            print("\n=== BOTTLENECK REPORT ===")
+            total_time = sum(sum(v) for v in timings.values())
+            for label, times in sorted(timings.items(), key=lambda x: -sum(x[1])):
+                arr = np.array(times)
+                pct = 100 * arr.sum() / total_time
+                print(
+                    f"{label:20s} | "
+                    f"total: {arr.sum():.3f}s ({pct:5.1f}%) | "
+                    f"mean: {arr.mean()*1000:.1f}ms | "
+                    f"max: {arr.max()*1000:.1f}ms | "
+                    f"min: {arr.min()*1000:.1f}ms | "
+                    f"std: {arr.std()*1000:.1f}ms"
+                )
+            print(f"{'TOTAL':20s} | {total_time:.3f}s")
+            print("=========================\n")
 
         if self.backend == "cupy":
             stream_h2d = cp.cuda.Stream(non_blocking=True)
@@ -1147,6 +1330,7 @@ class Holodoppler:
         if parameters["square"]:
             m = max(vid.shape[0], vid.shape[1])
             # vid = self.resize_fft2_slicewise(vid, m, m)
+            import numpy as np
             vid = self._to_numpy(vid).astype(np.float64)
             vid = self._resize(vid, m, m)
             
