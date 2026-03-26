@@ -1,0 +1,21 @@
+[project]
+name = "holodoppler"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+  "numpy>=2.3.4",
+  "tqdm>=4.67.1",
+  "cupy-cuda13x>=13.6.0",
+  "matplotlib>=3.10.7",
+  "scipy>=1.17.0",
+  "h5py",
+  "opencv-python",
+  "cinereader>=1.4.3",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+
