@@ -9,7 +9,7 @@ with open("C:\\Users\\Ivashka\\Documents\\Python\\Holodoppler\\src\\holodoppler\
     
 print("parameters :", parameters)
 
-HD = Holodoppler(backend = "cupy", pipeline_version = "old")
+HD = Holodoppler(backend = "cupy_ramdisk", pipeline_version = "old")
 
 HD.load_file("Z:\\260326\\260326_SEG.holo")
 
