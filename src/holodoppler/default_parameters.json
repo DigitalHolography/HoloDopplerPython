@@ -1,5 +1,5 @@
 {
-  "batch_size": 256,
+  "batch_size": 2560,
   "batch_stride": 256,
   "image_registration": true,
   "registration_disc_ratio": 0.8,

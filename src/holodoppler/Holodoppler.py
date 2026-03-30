@@ -19,7 +19,8 @@ import matplotlib.pyplot as plt
 try:
     import cupy as cp
     import cupyx.scipy.fft as cp_fft
-    from cupyx.scipy.ndimage import gaussian_filter as cp_gaussian_filter
+    from cupyx.scipy.ndimage import gaussian_filter as xp_gaussian_filter
+    import cupyx.scipy.ndimage as cp_ndi
     _cupy_available = True
 except Exception:
     cp = None
@@ -27,7 +28,9 @@ except Exception:
     _cupy_available = False
 
 import scipy.fft as np_fft
+import scipy.ndimage as np_ndi
 from scipy.ndimage import gaussian_filter as np_gaussian_filter
+
 from matlab_imresize.imresize import imresize
 
 
@@ -37,10 +40,10 @@ class Holodoppler:
         adding support for .cine files.
 
     Backend:
-        backend="numpy"  -> CPU
+        backend="numpy"  -> xpU
         backend="cupy"   -> GPU (if available)
 
-    Data is always read on CPU then transferred to GPU if needed.
+    Data is always read on xpU then transferred to GPU if needed.
     """
 
     HOLO_HEADER_SIZE = 64
@@ -74,21 +77,23 @@ class Holodoppler:
                 raise RuntimeError("CuPy backend requested but CuPy is not available.")
             self.xp = cp
             self.fft = cp_fft
-            self.gaussian_filter = cp_gaussian_filter
+            self.gaussian_filter = xp_gaussian_filter
+            self.ndi = cp_ndi
         else:
             self.backend = "numpy"
             self.xp = np
             self.fft = np_fft
             self.gaussian_filter = np_gaussian_filter
+            self.ndi = np_ndi
             
     def _to_backend(self, arr):
         if self.backend == "cupy" or self.backend == "cupy_diagnostic" or self.backend == "cupy_ramdisk":
-            return cp.asarray(arr)
+            return self.xp.asarray(arr)
         return arr
 
     def _to_numpy(self, arr):
         if self.backend == "cupy" or self.backend == "cupy_diagnostic" or self.backend == "cupy_ramdisk":
-            return cp.asnumpy(arr)
+            return self.xp.asnumpy(arr)
         return arr
 
     def _init_pipeline(self):
@@ -96,7 +101,7 @@ class Holodoppler:
             self._frequency_symmetric_filtering = self._new_frequency_symmetric_filtering
             self._resize = self.resize_fft2_slicewise
             self._registration = self.new_registration
-            return
+            
         elif self.pipeline_version == "old":
             self._frequency_symmetric_filtering = self._old_frequency_symmetric_filtering
             self._resize = self.resize_matlab_slicewise
@@ -156,16 +161,17 @@ class Holodoppler:
             self.fid.close()
 
     # ------------------------------------------------------------
-    # Reading frames (CPU only, then transferred if needed)
+    # Reading frames (xpU only, then transferred if needed)
     # ------------------------------------------------------------
 
     def read_frames_cine(self, first_frame, frame_size):
+        xp = np # forced then transferred to gpu
         _, images, _ = cinereader.read(self.file_path, self.cine_metadata.FirstImageNo + first_frame, frame_size)
-        frames = np.stack(images, axis=0)
+        frames = xp.stack(images, axis=0)
         return self._to_backend(frames)
     
     def read_frames_holo(self, first_frame, frame_size, fid = None):
-        
+        xp = np # forced then transferred to gpu
 
         try:
 
@@ -183,16 +189,16 @@ class Holodoppler:
             raw_bytes = fid.read(byte_size)
 
             if self.file_header["bit_depth"] == 8:
-                utyp = np.uint8
+                utyp = xp.uint8
             elif self.file_header["bit_depth"] == 16:
-                utyp = np.uint16
+                utyp = xp.uint16
             else:
                 raise RuntimeError("Unsupported bit depth : Supported bit depth are 8 bits or 16 bits")
 
             if self.file_header["endianness"] == 1:
                 utyp = utyp.newbyteorder('<')
 
-            out = np.frombuffer(raw_bytes, dtype=utyp)
+            out = xp.frombuffer(raw_bytes, dtype=utyp)
 
             out = out.reshape(
                 (frame_size,self.file_header["height"], self.file_header["width"]),
@@ -231,6 +237,21 @@ class Holodoppler:
         ).astype(xp.complex64)
 
         self.kernels["Fresnel"] = kernel[xp.newaxis, ...]
+        
+    
+    def _build_fresnel_out_kernel(self, Nx, Ny, dx, dy, wavelength, z, xp):
+        fx = xp.fft.fftfreq(Nx, d=dx)
+        fx = xp.fft.fftshift(fx)
+        fy = xp.fft.fftfreq(Ny, d=dy)
+        fy = xp.fft.fftshift(fy)
+        FX, FY = xp.meshgrid(fx, fy)
+
+        X = wavelength * z * FX
+        Y = wavelength * z * FY
+        k = 2 * xp.pi / wavelength
+        phase = 1j * xp.pi / (wavelength * z) * (X**2 + Y**2)
+        Qout = xp.exp(1j * k * z) / (1j * wavelength * z) * xp.exp(phase)
+        self.kernels["Fresnel_Out"] = Qout.astype(xp.complex64)[xp.newaxis, ...] 
 
     def _build_angular_kernel(self,
                               z,
@@ -264,6 +285,12 @@ class Holodoppler:
 
         return self.fft.fftshift(
             self.fft.fft2(frames *self.kernels["Fresnel"], axes=(-1, -2), norm="ortho"), axes=(-1, -2)
+        )
+        
+    def _fresnel_transform_with_phase(self, frames, phase_term):
+
+        return self.fft.fftshift(
+            self.fft.fft2(frames *self.kernels["Fresnel"] * phase_term, axes=(-1, -2), norm="ortho"), axes=(-1, -2)
         )
     
     def _angular_spectrum_transform(self, frames):
@@ -322,14 +349,17 @@ class Holodoppler:
         return idxs, freqs[idxs]
     
     def _old_frequency_symmetric_filtering(self, batch_size, fs, f1, f2 = None):
+        
+        xp = self.xp
+        
         # old and not clean but similar to matlab version
 
         if f2 is None:
             f2 = fs/2
 
         # convert frequencies to indices
-        n1 = int(np.ceil(f1 * batch_size / fs))
-        n2 = int(np.ceil(f2 * batch_size / fs))
+        n1 = int(xp.ceil(f1 * batch_size / fs))
+        n2 = int(xp.ceil(f2 * batch_size / fs))
 
         # clamp to valid range (MATLAB: 1..size(SH,3))
         n1 = max(min(n1, batch_size), 1)
@@ -346,13 +376,13 @@ class Holodoppler:
         i4 = n4      # exclusive
 
         # frequency ranges (MATLAB inclusive -> +1 in Python)
-        f_range = np.arange(n1, n2 + 1) * (fs / batch_size)
-        f_range_sym = np.arange(-n2, -n1 + 1) * (fs / batch_size)
+        f_range = xp.arange(n1, n2 + 1) * (fs / batch_size)
+        f_range_sym = xp.arange(-n2, -n1 + 1) * (fs / batch_size)
 
-        freqs = np.concatenate([f_range, f_range_sym], axis=0)
+        freqs = xp.concatenate([f_range, f_range_sym], axis=0)
 
         # boolean mask
-        idxs = np.zeros(batch_size, dtype=bool)
+        idxs = xp.zeros(batch_size, dtype=bool)
         idxs[i1:i2] = True
         idxs[i3:i4] = True
 
@@ -393,7 +423,7 @@ class Holodoppler:
 
     def resize_fft2_slicewise(self, img, new_h, new_w):
         xp = self.xp
-        fft = np_fft
+        fft = self.fft
         img = img.astype(xp.float32)
 
         h, w = img.shape[:2]
@@ -539,6 +569,306 @@ class Holodoppler:
 
         # moving_reg = self._roll2d(moving, -peak_y, -peak_x, xp)
         return (peak_y, peak_x)
+    
+    # ------------------------------------------------------------
+    # Shack-Hartmann wavefront reconstruction
+    # ------------------------------------------------------------
+
+    def _shack_hartmann_constructsubapsimages(self, U0, dx, dy, wavelength, z_prop, f0, f1, fs, time_window, nx_subabs, ny_subabs):
+        xp = self.xp
+        Nz, Ny, Nx = U0.shape
+        nb_iter = Nz // time_window
+        freq_mask = self._frequency_symmetric_filtering(time_window, fs, f0, high_freq = f1)
+        U_subaps_stack = xp.zeros((nb_iter, ny_subabs, nx_subabs, Ny // ny_subabs, Nx // nx_subabs), dtype=xp.float32)
+        Qin = self.self.kernels["Fresnel"]
+        for i in range(nb_iter):
+            start_idx = i * time_window
+            end_idx = start_idx + time_window
+            U_chunk = U0[start_idx:end_idx]
+            U_prop_filtered = self._svd_filter(U_chunk, 16)
+            U_fourier = xp.fft.fft(U_prop_filtered, axis=0)
+            U_filter = U_fourier[freq_mask,:,:]
+            U_prop_qin = U_filter * Qin # if zernike_phase is None else U_filter * Qin * xp.exp(- 1j * zernike_phase)
+            U_subaps = xp.zeros((ny_subabs, nx_subabs, Ny // ny_subabs, Nx // nx_subabs), dtype=xp.float32)
+            for (iy, ix) in [(iy, ix) for iy in range(ny_subabs) for ix in range(nx_subabs)]:
+                y_start = iy * (Ny // ny_subabs)
+                y_end = y_start + (Ny // ny_subabs)
+                x_start = ix * (Nx // nx_subabs)
+                x_end = x_start + (Nx // nx_subabs)
+                U_subap = U_prop_qin[:, y_start:y_end, x_start:x_end]
+                U_prop = xp.fft.fft2(U_subap, axes=(-2, -1))
+                U_prop = xp.fft.fftshift(U_prop, axes=(-2, -1))
+                S = xp.abs(U_prop)**2
+                M0 = xp.mean(S, axis=0)
+                U_subaps[iy, ix] = (M0.astype(xp.float32)) #flatfield(M0.astype(xp.float32),15)
+            U_subaps_stack[i] = U_subaps
+        U_subaps = xp.mean(U_subaps_stack, axis=0)
+        return U_subaps   
+
+    def _shack_hartmann_registration(self, fixed, moving, radius):
+        xp = self.xp
+        def parabolic_peak_1d(line, peak_idx):
+            v_m = line[peak_idx - 1]
+            v_0 = line[peak_idx]
+            v_p = line[peak_idx + 1]
+            denom = v_m - 2.0 * v_0 + v_p
+            delta = 0.5 * (v_m - v_p) / denom
+            return peak_idx + delta
+        def _elliptical_mask(ny, nx, radius_frac, xp):
+            radius_frac = max(0.0, min(2.0, float(radius_frac)))
+            a = (nx / 2) * radius_frac
+            b = (ny / 2) * radius_frac
+            Y, X = xp.ogrid[:ny, :nx]
+            cy, cx = ny / 2, nx / 2
+            mask = ((X - cx) / a) ** 2 + ((Y - cy) / b) ** 2 <= 1.0
+            return mask
+        def _xcorr2d(fixed, moving, xp):
+            f_fixed = xp.fft.fft2(fixed)
+            f_moving = xp.fft.fft2(moving)
+            cross_power = f_moving * f_fixed.conj()
+            # Normalize to avoid division by zero
+            cross_power /= (xp.abs(cross_power) + 1e-12)
+            return xp.fft.fftshift(xp.fft.ifft2(cross_power))
+        ny, nx = fixed.shape
+        mask = _elliptical_mask(ny, nx, radius, xp) if radius else xp.ones((ny, nx), dtype=bool)
+        lo_f, hi_f = xp.percentile(fixed[mask], (0.2, 99.8))
+        _fixed = xp.clip(fixed, lo_f, hi_f)
+        lo_m, hi_m = xp.percentile(moving[mask], (0.2, 99.8))
+        _moving = xp.clip(moving, lo_m, hi_m)
+        fixed_c = (_fixed - xp.mean(_fixed[mask])) * mask
+        moving_c = (_moving - xp.mean(_moving[mask])) * mask
+        xcorr = xp.abs(_xcorr2d(fixed_c, moving_c, xp))
+        peak_idx = xp.argmax(xcorr)	
+        peak_y, peak_x = xp.unravel_index(peak_idx, fixed.shape)
+        refined_y = parabolic_peak_1d(xcorr[:, peak_x], peak_y)
+        refined_x = parabolic_peak_1d(xcorr[peak_y, :], peak_x)
+        center_x = nx/2
+        center_y = ny/2
+        shift_x = refined_x - center_x
+        shift_y = refined_y - center_y
+        return xcorr, (shift_y, shift_x)
+
+    def _shack_hartmann_displacement_calculation(self, U_subabs, xp, ref=None):
+        def filter_shifts_pupil(shifts_y, shifts_x, Ny, Nx, sub_ny, sub_nx, radius=0.9):
+            shifts_y_c = xp.copy(shifts_y)
+            shifts_x_c = xp.copy(shifts_x)
+            x = xp.linspace(-1, 1, Nx)
+            y = xp.linspace(-1, 1, Ny)
+            for (iy, ix) in [(iy, ix) for iy in range(sub_ny) for ix in range(sub_nx)]:
+                if x[ix*(Nx//sub_nx) + (Nx//sub_nx)//2]**2+y[iy*(Ny//sub_ny) + (Ny//sub_ny)//2]**2 > radius**2:
+                    shifts_y_c[iy,ix], shifts_x_c[iy,ix] = xp.nan, xp.nan
+            return shifts_y_c, shifts_x_c	
+
+        def filter_shifts_threshold(shifts_y, shifts_x, Ny, Nx, sub_ny, sub_nx, threshold=0.9):
+            shifts_y_c = xp.copy(shifts_y)
+            shifts_x_c = xp.copy(shifts_x)
+
+            meanx = xp.nanmean(shifts_x,axis=(0,1))
+            meany = xp.nanmean(shifts_y,axis=(0,1))
+            stdx = xp.nanstd(shifts_x,axis=(0,1))
+            stdy = xp.nanstd(shifts_y,axis=(0,1))
+            for (iy, ix) in [(iy, ix) for iy in range(sub_ny) for ix in range(sub_nx)]:
+                if abs(shifts_x[iy, ix] - meanx) > threshold * stdx or abs(shifts_y[iy, ix] - meany) > threshold * stdy:
+                    shifts_y_c[iy,ix], shifts_x_c[iy,ix] = xp.nan, xp.nan
+            return shifts_y_c, shifts_x_c
+        xp = self.xp
+        ny_subabs, nx_subabs, _, _ = U_subabs.shape
+        shifts_y = xp.zeros((ny_subabs, nx_subabs), dtype=xp.float32)
+        shifts_x = xp.zeros((ny_subabs, nx_subabs), dtype=xp.float32)
+        if (ref is None):
+            assert ny_subabs % 2 == 1 and nx_subabs % 2 == 1, "Number of sub-apertures must be odd."
+            ref_subap = U_subabs[ny_subabs // 2, nx_subabs // 2] 
+        else:
+            ref_subap = ref
+        for (iy, ix) in [(iy, ix) for iy in range(ny_subabs) for ix in range(nx_subabs)]:
+            curr_subap = U_subabs[iy, ix]
+            xcorr, (shift_y, shift_x) = self._shack_hartmann_registration(ref_subap, curr_subap, radius=None, xp=xp)
+            shifts_y[iy, ix] = shift_y
+            shifts_x[iy, ix] = shift_x
+            
+        shifts_y, shifts_x = filter_shifts_pupil(shifts_y, shifts_x, U_subabs.shape[2], U_subabs.shape[3], ny_subabs, nx_subabs, radius=0.9)
+        shifts_y, shifts_x = filter_shifts_threshold(shifts_y, shifts_x, U_subabs.shape[2], U_subabs.shape[3], ny_subabs, nx_subabs, threshold=0.9)
+        return shifts_y, shifts_x
+    
+    def _get_zernike_mode2(self, mode_index, Nx, Ny, radius = 2.0):
+        xp = self.xp
+        # Scale so that the smallest dimension spans [-1, 1]
+        if Nx > Ny:
+            x = xp.linspace(-Nx / Ny, Nx / Ny, Nx)
+            y = xp.linspace(-1, 1, Ny)
+        else:
+            x = xp.linspace(-1, 1, Nx)
+            y = xp.linspace(-Ny / Nx, Ny / Nx, Ny)
+        X, Y = xp.meshgrid(x, y)
+        R = xp.sqrt(X**2 + Y**2)
+        Theta = xp.arctan2(Y, X)
+        Z = xp.full_like(R, xp.nan)
+        mask = R <= radius
+        if mode_index == 1:
+            Z[mask] = 1  # Piston
+        elif mode_index == 2:
+            Z[mask] = 2 * X[mask]  # Tilt X
+        elif mode_index == 3:
+            Z[mask] = 2 * Y[mask]  # Tilt Y
+        elif mode_index == 4:
+            Z[mask] = xp.sqrt(3) * (2 * R[mask]**2 - 1)  # Defocus
+        elif mode_index == 5:
+            Z[mask] = xp.sqrt(6) * R[mask]**2 * xp.sin(2 * Theta[mask])  # Astigmatism 45°
+        elif mode_index == 6:
+            Z[mask] = xp.sqrt(6) * R[mask]**2 * xp.cos(2 * Theta[mask])  # Astigmatism 0°
+        elif mode_index == 7:
+            Z[mask] = xp.sqrt(8) * (3*R[mask]**3 - 2*R[mask]) * xp.sin(Theta[mask])  # Coma Y
+        elif mode_index == 8:
+            Z[mask] = xp.sqrt(8) * (3*R[mask]**3 - 2*R[mask]) * xp.cos(Theta[mask])  # Coma X
+        elif mode_index == 9:
+            Z[mask] = xp.sqrt(8) * R[mask]**3 * xp.sin(3 * Theta[mask])  # Trefoil Y
+        elif mode_index == 10:
+            Z[mask] = xp.sqrt(8) * R[mask]**3 * xp.cos(3 * Theta[mask])  # Trefoil X
+        elif mode_index == 11:
+            Z[mask] = xp.sqrt(5) * (6*R[mask]**4 - 6*R[mask]**2 + 1)  # Spherical
+        elif mode_index == 12:
+            Z[mask] = xp.sqrt(10) * (4*R[mask]**4 - 3*R[mask]**2) * xp.cos(2 * Theta[mask])  # Astigmatism 0° (higher)
+        elif mode_index == 13:
+            Z[mask] = xp.sqrt(10) * (4*R[mask]**4 - 3*R[mask]**2) * xp.sin(2 * Theta[mask])  # Astigmatism 45° (higher)
+        elif mode_index == 14:
+            Z[mask] = xp.sqrt(10) * R[mask]**4 * xp.cos(4 * Theta[mask])  # Quadrafoil X
+        elif mode_index == 15:
+            Z[mask] = xp.sqrt(10) * R[mask]**4 * xp.sin(4 * Theta[mask])  # Quadrafoil Y
+        elif mode_index == 16:
+            Z[mask] = xp.sqrt(12) * (10*R[mask]**5 - 12*R[mask]**3 + 3*R[mask]) * xp.cos(Theta[mask])  # Secondary coma X
+        elif mode_index == 17:
+            Z[mask] = xp.sqrt(12) * (10*R[mask]**5 - 12*R[mask]**3 + 3*R[mask]) * xp.sin(Theta[mask])  # Secondary coma Y
+        elif mode_index == 18:
+            Z[mask] = xp.sqrt(12) * (5*R[mask]**5 - 4*R[mask]**3) * xp.cos(3 * Theta[mask])  # Secondary trefoil X
+        elif mode_index == 19:
+            Z[mask] = xp.sqrt(12) * (5*R[mask]**5 - 4*R[mask]**3) * xp.sin(3 * Theta[mask])  # Secondary trefoil Y
+        elif mode_index == 20:
+            Z[mask] = xp.sqrt(12) * R[mask]**5 * xp.cos(5 * Theta[mask])  # Pentafoil X
+        elif mode_index == 21:
+            Z[mask] = xp.sqrt(12) * R[mask]**5 * xp.sin(5 * Theta[mask])  # Pentafoil Y
+        else:
+            raise ValueError("Mode index not implemented")
+        return Z
+    
+    def _shack_hartmann_zernike(self, ny, nx, pixel_pitch_y, pixel_pitch_x, wavelength, shifts_y, shifts_x, zernike_modes):
+        xp = self.xp
+        def make_G_gradient_zernike_matrix(Ny, Nx, mode_indices, n_sub_x, n_sub_y, dx, dy):
+            n_modes = len(mode_indices)
+            M = xp.zeros((2,n_sub_y, n_sub_x, n_modes))
+            for k, idx in enumerate(mode_indices):
+                Z = self.get_zernike_mode2(idx, Nx, Ny, radius = 2)
+                dZdx = xp.gradient(Z, dx, axis=1)
+                dZdy = xp.gradient(Z, dy, axis=0)
+                for (iy, ix) in [(iy, ix) for iy in range(n_sub_y) for ix in range(n_sub_x)]:
+                    y_start = iy * (Ny // n_sub_y)
+                    y_end = y_start + (Ny // n_sub_y)
+                    x_start = ix * (Nx // n_sub_x)
+                    x_end = x_start + (Nx // n_sub_x)
+                    dZdx_subap = dZdx[y_start:y_end, x_start:x_end]
+                    dZdy_subap = dZdy[y_start:y_end, x_start:x_end]
+                    dZdx_avg = xp.nanmean(dZdx_subap, axis=(0,1))
+                    dZdy_avg = xp.nanmean(dZdy_subap, axis=(0,1))
+                    M[0 ,iy, ix, k] = dZdy_avg
+                    M[1 ,iy, ix, k] = dZdx_avg
+            return M
+        
+        def solve_modes(M, s, plot=False):
+            _, ny, nx, nm = M.shape
+            A = M.reshape(-1, nm)
+            b = s.reshape(-1)
+            m = (~xp.isnan(b)) & (~xp.isnan(A).any(1))
+            c, r, rank, sv = xp.linalg.lstsq(A[m], b[m], rcond=None)
+            recon = xp.full_like(b, xp.nan, dtype=float)
+            recon[m] = A[m] @ c
+            recon = recon.reshape(2, ny, nx)
+            return c, recon
+        
+        slopes_y = shifts_y * (wavelength)/(pixel_pitch_y*(ny//nysubabs)) 
+        slopes_x = shifts_x * (wavelength)/(pixel_pitch_x*(nx//nxsubabs))
+        nysubabs, nxsubabs = shifts_y.shape
+        
+        s = xp.stack([slopes_y,slopes_x])
+        
+        if (not "G_gradient_zernike_matrix" in self.kernels):
+            G = make_G_gradient_zernike_matrix(ny, nx, zernike_modes, nxsubabs, nysubabs, pixel_pitch_x, pixel_pitch_y) * wavelength / (2*xp.pi)
+            self.kernels["G_gradient_zernike_matrix"] = G
+        
+        zernike_coefs_radians, _ = solve_modes(self.kernels["G_gradient_zernike_matrix"], s) 
+        # print(zernike_coefs_radians, "radians")
+
+        zern_phase = xp.sum([coef * self.get_zernike_mode2(idx, nx, ny, radius = 2) for idx, coef in zip(zernike_modes, zernike_coefs_radians)], axis=0)
+        
+        return zernike_coefs_radians, zern_phase
+    
+    def _shack_hartmann_southwell(self, ny, nx, pixel_pitch_y, pixel_pitch_x, wavelength, shifts_y, shifts_x):
+        xp = self.xp
+        sp = self.sp
+        def southwell_fourier_nan(slope_y, slope_x):
+            """NaN-robust Southwell DCT Poisson solver."""
+            rows, cols = slope_y.shape
+            mask_x = xp.isfinite(slope_x)
+            mask_y = xp.isfinite(slope_y)
+            div = xp.zeros((rows, cols), dtype=float)
+            valid_x = mask_x[:, :-1]
+            sx = xp.where(valid_x, slope_x[:, :-1], 0.0)
+            div[:, :-1] += sx
+            div[:, 1:]  -= sx
+            valid_y = mask_y[:-1, :]
+            sy = xp.where(valid_y, slope_y[:-1, :], 0.0)
+            div[:-1, :] += sy
+            div[1:, :]  -= sy
+            valid_div = xp.zeros_like(div, dtype=bool)
+            valid_div[:, :-1] |= valid_x
+            valid_div[:, 1:]  |= valid_x
+            valid_div[:-1, :] |= valid_y
+            valid_div[1:, :]  |= valid_y
+            div = xp.where(valid_div, div, 0.0)
+            div_dct = scipy.fftpack.dct(
+                scipy.fftpack.dct(div, axis=0, norm="ortho"),
+                axis=1, norm="ortho"
+            )
+            cx = xp.cos(xp.pi * xp.arange(cols) / cols)
+            cy = xp.cos(xp.pi * xp.arange(rows) / rows)
+            CX, CY = xp.meshgrid(cx, cy)
+            eig = 2.0 * (CX + CY - 2.0)
+            eig[0, 0] = 1.0  # avoid division by zero
+            phi_dct = div_dct / eig
+            phi_dct[0, 0] = 0.0  # remove piston
+            phi = scipy.fftpack.idct(
+                scipy.fftpack.idct(phi_dct, axis=1, norm="ortho"),
+                axis=0, norm="ortho"
+            )
+            phi[~valid_div] = xp.nan
+            return phi  
+
+        def resize_phase_nan(phi, NY, NX, ndi):
+            phi = xp.asarray(phi)
+
+            # mask NaNs
+            mask = xp.isfinite(phi)
+
+            # fill NaNs using nearest neighbor (GPU-friendly)
+            idx = ndi.distance_transform_edt(~mask, return_indices=True)
+            phi_filled = phi[tuple(idx)]
+
+            # build coordinates
+            y = xp.linspace(0, phi.shape[0] - 1, NY)
+            x = xp.linspace(0, phi.shape[1] - 1, NX)
+            y_new, x_new = xp.meshgrid(y, x, indexing='ij')
+
+            coords = xp.stack([
+                y_new * (phi.shape[0] - 1) / (NY - 1),
+                x_new * (phi.shape[1] - 1) / (NX - 1)
+            ])
+
+            # cubic ≈ order=3 spline
+            return ndi.map_coordinates(phi_filled, coords, order=3, mode='nearest')
+        
+        nysubabs, nxsubabs = shifts_y.shape
+        slopes_y = shifts_y * wavelength # *(pixel_pitch_y*(ny//nysubabs)) same as before / (pixel_pitch_y*(ny//nysubabs)) the pitch between subaps
+        slopes_x = shifts_x * wavelength 
+        southwell_fourier_phase = southwell_fourier_nan(slopes_y, slopes_x) * (2*xp.pi) / WAVELENGTH
+        return southwell_phase
 
     # ------------------------------------------------------------
     # One batch full pipeline
@@ -552,6 +882,22 @@ class Holodoppler:
             raise RuntimeError("Could not read frames properly")
 
         nt, ny, nx = frames.shape
+        
+        if parameters["Shack_Hartmann"] and parameters["spatial_propagation"] == "Fresnel":
+            if (not "Fresnel" in self.kernels):
+                self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
+            
+            U_subaps = self._shack_hartmann_constructsubapsimages(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], parameters["time_window"], parameters["nx_subabs"], parameters["ny_subabs"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
+            shifts_y, shifts_x = self._shack_hartmann_estimate_shifts(U_subaps, ref = None) # get the shifts in pixels in the subapertures images
+            
+            if parameters["Shack_Hartmann_Zernike_Fit"] :
+                coefs, phase = self._shack_hartmann_zernike(shifts_y, shifts_x, parameters["Shack_Hartmann_Zernike_Fit_modes"]) # fit the shifts to Zernike polynomials to get the wavefront phase
+            elif parameters["Shack_Hartmann_Southwell_Phase_Integration "] :
+                phase = self._shack_hartmann_southwell(shifts_y, shifts_x)
+                
+            phase_term = self.xp.exp(- 1j * phase) 
+            phase_term[self.xp.isnan(phase_term)] = 0 # completely mask the nan zone where the phase could'nt be estimated
+            holograms = self._fresnel_transform_with_phase(frames, phase_term)
 
         if parameters["spatial_propagation"] == "Fresnel":
             if (not "Fresnel" in self.kernels):
@@ -657,11 +1003,11 @@ class Holodoppler:
                 fid.close()
 
             # --- GPU loop: zero disk I/O, pure compute ---
-            stream_h2d     = cp.cuda.Stream(non_blocking=True)
-            stream_compute = cp.cuda.Stream(non_blocking=True)
+            stream_h2d     = xp.cuda.Stream(non_blocking=True)
+            stream_compute = xp.cuda.Stream(non_blocking=True)
 
             with stream_h2d:
-                d_frames_next = cp.asarray(all_frames[0])
+                d_frames_next = xp.asarray(all_frames[0])
             stream_h2d.synchronize()
 
             for i in tqdm(range(num_batch)):
@@ -669,7 +1015,7 @@ class Holodoppler:
 
                 if i + 1 < num_batch:
                     with stream_h2d:
-                        d_frames_next = cp.asarray(all_frames[i + 1])
+                        d_frames_next = xp.asarray(all_frames[i + 1])
                     # no sync needed — compute stream will naturally be behind
 
                 with stream_compute:
@@ -690,10 +1036,10 @@ class Holodoppler:
                         reg_list.append((shift_y, shift_x))
 
                 stream_compute.synchronize()
-                out_list.append(cp.stack([M0, M1, M2], axis=2))
+                out_list.append(xp.stack([M0, M1, M2], axis=2))
 
             stream_h2d.synchronize()
-            cp.cuda.Device().synchronize()
+            xp.cuda.Device().synchronize()
             
         if self.backend == "cupy_diagnostic":
             print("Running in diagnostic mode with CuPy backend. This will report timing for each step of the pipeline to identify bottlenecks.")
@@ -710,8 +1056,8 @@ class Holodoppler:
                 timings[label].append(t1 - t0)
                 return t1 - t0
 
-            stream_h2d     = cp.cuda.Stream(non_blocking=True)
-            stream_compute = cp.cuda.Stream(non_blocking=True)
+            stream_h2d     = xp.cuda.Stream(non_blocking=True)
+            stream_compute = xp.cuda.Stream(non_blocking=True)
 
             # --- Prime first batch ---
             t0 = time.perf_counter()
@@ -720,7 +1066,7 @@ class Holodoppler:
 
             t0 = time.perf_counter()
             with stream_h2d:
-                d_frames_next = cp.asarray(frames_next)
+                d_frames_next = xp.asarray(frames_next)
             stream_h2d.synchronize()
             timings["h2d_transfer"].append(time.perf_counter() - t0)
 
@@ -739,7 +1085,7 @@ class Holodoppler:
                     # --- H2D transfer ---
                     t0 = time.perf_counter()
                     with stream_h2d:
-                        d_frames_next = cp.asarray(frames_next)
+                        d_frames_next = xp.asarray(frames_next)
                     stream_h2d.synchronize()
                     timings["h2d_transfer"].append(time.perf_counter() - t0)
 
@@ -770,18 +1116,18 @@ class Holodoppler:
 
                 # --- Stack ---
                 t0 = time.perf_counter()
-                out_list.append(cp.stack([M0, M1, M2], axis=2))
+                out_list.append(xp.stack([M0, M1, M2], axis=2))
                 timings["stack"].append(time.perf_counter() - t0)
 
             stream_h2d.synchronize()
-            cp.cuda.Device().synchronize()
+            xp.cuda.Device().synchronize()
 
             # --- Report ---
-            import numpy as np
+            import numpy as xp
             print("\n=== BOTTLENECK REPORT ===")
             total_time = sum(sum(v) for v in timings.values())
             for label, times in sorted(timings.items(), key=lambda x: -sum(x[1])):
-                arr = np.array(times)
+                arr = xp.array(times)
                 pct = 100 * arr.sum() / total_time
                 print(
                     f"{label:20s} | "
@@ -795,8 +1141,8 @@ class Holodoppler:
             print("=========================\n")
 
         if self.backend == "cupy":
-            stream_h2d = cp.cuda.Stream(non_blocking=True)
-            stream_compute = cp.cuda.Stream(non_blocking=True)
+            stream_h2d = xp.cuda.Stream(non_blocking=True)
+            stream_compute = xp.cuda.Stream(non_blocking=True)
 
             # --- Prefetch first batch ---
             frames_next = self.read_frames(
@@ -805,14 +1151,14 @@ class Holodoppler:
             )
 
             with stream_h2d:
-                d_frames_next = cp.asarray(frames_next)  # async if pinned
+                d_frames_next = xp.asarray(frames_next)  # async if pinned
 
             for i in tqdm(range(num_batch)):
 
                 # Swap buffers
                 d_frames = d_frames_next
 
-                # --- Prefetch next batch (CPU side) ---
+                # --- Prefetch next batch (xpU side) ---
                 if i + 1 < num_batch:
                     
                     with stream_h2d:
@@ -846,13 +1192,13 @@ class Holodoppler:
 
 
                 out_list.append(
-                    cp.stack([M0, M1, M2], axis=2)
+                    xp.stack([M0, M1, M2], axis=2)
                 )
 
             # Ensure transfers complete
             stream_h2d.synchronize()
 
-            cp.cuda.Device().synchronize()
+            xp.cuda.Device().synchronize()
         else:
             for i in tqdm(range(num_batch)):
 
@@ -891,8 +1237,8 @@ class Holodoppler:
         if parameters["square"]:
             m = max(vid.shape[0], vid.shape[1])
             # vid = self.resize_fft2_slicewise(vid, m, m)
-            import numpy as np
-            vid = self._to_numpy(vid).astype(np.float64)
+            import numpy as xp
+            vid = self._to_numpy(vid).astype(xp.float64)
             vid = self._resize(vid, m, m)
             
         if parameters["transpose"]:
@@ -917,7 +1263,7 @@ class Holodoppler:
                     f.create_dataset("registration", data=self._to_numpy(self.xp.array(reg_list)))
 
                 def json_serializer(obj):
-                    if isinstance(obj, np.ndarray):
+                    if isinstance(obj, xp.ndarray):
                         return obj.tolist()
                     raise TypeError(f"Type {type(obj)} not serializable")
 
@@ -928,12 +1274,12 @@ class Holodoppler:
                     f.create_dataset("cine_metadata", data=json.dumps(self.cine_metadata_json, default=json_serializer))
 
         if h5_path is not None:
-            save_to_h5path(h5_path, np.permute_dims(v, (3, 0, 1, 2)), parameters, reg_list if parameters["image_registration"] else None)
+            save_to_h5path(h5_path, xp.permute_dims(v, (3, 0, 1, 2)), parameters, reg_list if parameters["image_registration"] else None)
 
         if mp4_path is not None:
             pass
         if holodoppler_path is True:
-            # make the new directory at the same level as the input file with its name then _HD{idx} where idx is the number of existing holodoppler output directories for this file
+            # make the new directory at the same level as the ixput file with its name then _HD{idx} where idx is the number of existing holodoppler output directories for this file
             base_name = os.path.splitext(os.path.basename(self.file_path))[0]
             dir_name = f"{base_name}_HD_"
             parent_dir = os.path.dirname(self.file_path)
@@ -954,11 +1300,11 @@ class Holodoppler:
             os.makedirs(h5_dir, exist_ok=True)
             # save png
             for i in range(v.shape[2]):
-                plt.imsave(os.path.join(png_dir, f"moment_{i}.png"), np.mean(v[:, :, i, :],axis=2), cmap="gray")
+                plt.imsave(os.path.join(png_dir, f"moment_{i}.png"), xp.mean(v[:, :, i, :],axis=2), cmap="gray")
             vid_norm = v[:, :, 0, :]  # shape (H, W, T)
-            vid_norm = vid_norm.astype(np.float32)
+            vid_norm = vid_norm.astype(xp.float32)
             vid_norm = (vid_norm - vid_norm.min()) / (vid_norm.max() - vid_norm.min())
-            vid_norm = (vid_norm * 255).astype(np.uint8)
+            vid_norm = (vid_norm * 255).astype(xp.uint8)
             # save mp4
             height, width = v.shape[0], v.shape[1]
             duration = 1/parameters["sampling_freq"] * (end_frame-first_frame) 
@@ -978,7 +1324,7 @@ class Holodoppler:
             with open(os.path.join(json_dir, "parameters.json"), "w") as f:
                 json.dump(parameters, f, indent=4)
             # save h5
-            save_to_h5path(os.path.join(h5_dir, f"{holodoppler_dir_name}_output.h5"), np.permute_dims(v, (3, 1, 0, 2)), parameters, reg_list if parameters["image_registration"] else None)
+            save_to_h5path(os.path.join(h5_dir, f"{holodoppler_dir_name}_output.h5"), xp.permute_dims(v, (3, 1, 0, 2)), parameters, reg_list if parameters["image_registration"] else None)
             # add a version.txt file with the version of the holodoppler pipeline used
             with open(os.path.join(holodoppler_path, "version.txt"), "w") as f:
                 f.write(f"Python:\n")
