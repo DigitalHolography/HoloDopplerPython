@@ -1,6 +1,6 @@
 {
   "batch_size": 256,
-  "batch_stride": 256,
+  "batch_stride": 25600,
   "image_registration": true,
   "registration_disc_ratio": 0.8,
   "registration_flatfield_gw": 35,
@@ -10,19 +10,19 @@
   "wavelength": 8.52e-7,
   "pixel_pitch": 2e-5,
   "spatial_propagation": "Fresnel",
-  "z": 0.489,
+  "z": 0.6,
   "sampling_freq": 37037,
   "low_freq": 6000,
   "high_freq": 18300,
   "svd_threshold": 64,
-  "square": true,
+  "square": false,
   "transpose": false,
   "flip_x": false,
   "flip_y": false,
   "shack_hartmann": true,
   "shack_hartmann_ny_subap": 5,
   "shack_hartmann_nx_subap": 5,
-  "shack_hartmann_zernike_fit": false,
+  "shack_hartmann_zernike_fit": true,
   "shack_hartmann_zernike_fit_modes": [1,2,3,4,5,6],
-  "shack_hartmann_southwell_phase_integration ": true
+  "shack_hartmann_southwell_phase_integration ": false
 }

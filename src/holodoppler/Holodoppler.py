@@ -664,8 +664,8 @@ class Holodoppler:
             shifts_y[iy, ix] = shift_y
             shifts_x[iy, ix] = shift_x
             
-        shifts_y, shifts_x = filter_shifts_pupil(shifts_y, shifts_x, U_subabs.shape[2], U_subabs.shape[3], ny_subabs, nx_subabs, radius=0.9)
-        shifts_y, shifts_x = filter_shifts_threshold(shifts_y, shifts_x, U_subabs.shape[2], U_subabs.shape[3], ny_subabs, nx_subabs, threshold=0.9)
+        shifts_y, shifts_x = filter_shifts_pupil(shifts_y, shifts_x, U_subabs.shape[2], U_subabs.shape[3], ny_subabs, nx_subabs, radius=1)
+        shifts_y, shifts_x = filter_shifts_threshold(shifts_y, shifts_x, U_subabs.shape[2], U_subabs.shape[3], ny_subabs, nx_subabs, threshold=1)
         return shifts_y, shifts_x
     
     def _get_zernike_mode2(self, mode_index, Nx, Ny, radius = 2.0):
@@ -734,7 +734,7 @@ class Holodoppler:
             n_modes = len(mode_indices)
             M = xp.zeros((2,n_sub_y, n_sub_x, n_modes))
             for k, idx in enumerate(mode_indices):
-                Z = self.get_zernike_mode2(idx, Nx, Ny, radius = 2)
+                Z = self._get_zernike_mode2(idx, Nx, Ny, radius = 2)
                 dZdx = xp.gradient(Z, dx, axis=1)
                 dZdy = xp.gradient(Z, dy, axis=0)
                 for (iy, ix) in [(iy, ix) for iy in range(n_sub_y) for ix in range(n_sub_x)]:
@@ -761,6 +761,8 @@ class Holodoppler:
             recon = recon.reshape(2, ny, nx)
             return c, recon
         
+        nysubabs, nxsubabs = shifts_y.shape
+        
         slopes_y = shifts_y * (wavelength)/(pixel_pitch_y*(ny//nysubabs)) 
         slopes_x = shifts_x * (wavelength)/(pixel_pitch_x*(nx//nxsubabs))
         nysubabs, nxsubabs = shifts_y.shape
@@ -772,9 +774,9 @@ class Holodoppler:
             self.kernels["G_gradient_zernike_matrix"] = G
         
         zernike_coefs_radians, _ = solve_modes(self.kernels["G_gradient_zernike_matrix"], s) 
-        # print(zernike_coefs_radians, "radians")
+        print(zernike_coefs_radians, "radians")
 
-        zern_phase = xp.sum([coef * self.get_zernike_mode2(idx, nx, ny, radius = 2) for idx, coef in zip(zernike_modes, zernike_coefs_radians)], axis=0)
+        zern_phase = xp.sum(xp.stack([coef * self._get_zernike_mode2(idx, nx, ny, radius = 2) for idx, coef in zip(zernike_modes, zernike_coefs_radians)]), axis=0)
         
         return zernike_coefs_radians, zern_phase
     
@@ -819,29 +821,46 @@ class Holodoppler:
             phi[~valid_div] = xp.nan
             return phi  
 
-        def resize_phase_nan_cp(phi, NY, NX, ndi, xp):
-            phi = xp.asarray(phi)
+        from cupyx.scipy.ndimage import zoom
 
-            mask = xp.isfinite(phi)
+        def resize_phase_nan_cp(phi, NY, NX, order=1):
+            """
+            Resize a 2D CuPy array with NaNs using smooth interpolation.
+            
+            Parameters:
+                phi : cupy.ndarray (2D)
+                NY, NX : target shape
+                order : interpolation order (1 = linear, 3 = cubic)
+            
+            Returns:
+                cupy.ndarray of shape (NY, NX)
+            """
+            phi = phi.reshape(phi.shape[-2], phi.shape[-1])
 
-            idx = ndi.distance_transform_edt(~mask, return_indices=True)
-            idx = [i.astype(int) for i in idx]
-            phi_filled = phi[tuple(idx)]
+            # Mask of valid values
+            mask = ~cp.isnan(phi)
 
-            y = xp.linspace(0, phi.shape[0] - 1, NY)
-            x = xp.linspace(0, phi.shape[1] - 1, NX)
-            y_new, x_new = xp.meshgrid(y, x, indexing='ij')
+            # Replace NaNs with 0
+            phi_filled = cp.where(mask, phi, 0)
 
-            coords = xp.stack([
-                (y_new * (phi.shape[0] - 1) / (NY - 1)).ravel(),
-                (x_new * (phi.shape[1] - 1) / (NX - 1)).ravel()
-            ])
+            # Compute zoom factors
+            zoom_y = NY / phi.shape[0]
+            zoom_x = NX / phi.shape[1]
 
-            phi_resized = ndi.map_coordinates(phi_filled, coords, order=3, mode='nearest')
+            # Interpolate data and mask
+            phi_zoom = zoom(phi_filled, (zoom_y, zoom_x), order=order)
+            mask_zoom = zoom(mask.astype(cp.float32), (zoom_y, zoom_x), order=order)
+
+            # Avoid division by zero
+            eps = 1e-6
+            phi_resized = phi_zoom / (mask_zoom + eps)
+
+            # Optional: reintroduce NaNs where confidence is too low
+            phi_resized = cp.where(mask_zoom > 0.1, phi_resized, cp.nan)
 
             return phi_resized.reshape(NY, NX)
         
-        def resize_phase_nan_np(phi, NY, NX, ndi, xp):
+        def resize_phase_nan_np(phi, NY, NX):
             y, x = np.indices(phi.shape)
             mask = np.isfinite(phi)
 
@@ -863,11 +882,10 @@ class Holodoppler:
         elif self.xp == cp:
             resize_phase_nan = resize_phase_nan_cp
                
-        nysubabs, nxsubabs = shifts_y.shape
         slopes_y = shifts_y * wavelength # /(pixel_pitch_y*(ny//nysubabs)) same as before *(pixel_pitch_y*(ny//nysubabs)) the pitch between subaps before integration
         slopes_x = shifts_x * wavelength 
         southwell_fourier_phase = southwell_fourier_nan(slopes_y, slopes_x) * (2*xp.pi) / wavelength
-        southwell_fourier_phase = resize_phase_nan(southwell_fourier_phase, ny, nx, self.ndi, self.xp)
+        southwell_fourier_phase = resize_phase_nan(southwell_fourier_phase, ny, nx)
         return southwell_fourier_phase
     
     def _fresnel_transform_phase(self, frames, phase_term):
@@ -893,18 +911,54 @@ class Holodoppler:
                 self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
             
             U_subaps = self._shack_hartmann_constructsubapsimages(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], parameters["batch_size"], parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
-            shifts_y, shifts_x = self._shack_hartmann_displacement_calculation(U_subaps, self.xp, ref = None) # get the shifts in pixels in the subapertures images
+            def plot_subaps(U_subaps, nx_subabs, ny_subabs):
+                rows = []
+                for iy in range(ny_subabs):
+                    row_imgs = [self.xp.asnumpy(U_subaps[iy, ix]) for ix in range(nx_subabs)]
+                    rows.append(np.hstack(row_imgs))  # horizontally stack each row
+                montage_img = np.vstack(rows)  # vertically stack all rows
+                # Display montage
+                plt.figure(figsize=(12, 8))
+                plt.imshow(montage_img, cmap='gray')
+                plt.axis('off')  # remove axes
+                plt.title('Montage of Sub-apertures')
+                plt.show()
+                
+            plot_subaps(U_subaps, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"])
             
+            shifts_y, shifts_x = self._shack_hartmann_displacement_calculation(U_subaps, self.xp, ref = None) # get the shifts in pixels in the subapertures images
+            nysubabs, nxsubabs = shifts_y.shape
+            def plot_shifts(shifts_y, shifts_x,nx_subabs, ny_subabs, title = "Wavefront Slopes from Sub-aperture Shifts", holdon= False, scale=50):
+                # print(shifts_y,shifts_x)
+                if not holdon :
+                    plt.figure(figsize=(10, 4))
+                ax = plt.gca()
+                X, Y = np.meshgrid(np.arange(nx_subabs), np.arange(ny_subabs))
+                plt.quiver(X, Y, (shifts_x.get()), (shifts_y.get()), scale=scale)
+                plt.title(title)
+                plt.xlabel('Sub-aperture X Index')
+                plt.ylabel('Sub-aperture Y Index')
+                plt.xlim(-0.5, nx_subabs - 0.5)
+                plt.ylim(-0.5, ny_subabs - 0.5)
+                plt.grid(True, linestyle='--', alpha=0.7)
+                plt.gca().set_aspect('equal')
+                plt.show()
+                
+            
+            plot_shifts(shifts_y, shifts_x, nxsubabs, nysubabs, scale=50)
             if parameters["shack_hartmann_zernike_fit"] :
-                coefs, phase = self._shack_hartmann_zernike(shifts_y, shifts_x, parameters["shack_hartmann_zernike_fit_modes"]) # fit the shifts to Zernike polynomials to get the wavefront phase
+                coefs, phase = self._shack_hartmann_zernike(ny, nx, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], shifts_y, shifts_x, parameters["shack_hartmann_zernike_fit_modes"]) # fit the shifts to Zernike polynomials to get the wavefront phase
             elif parameters["shack_hartmann_southwell_phase_integration "] :
                 phase = self._shack_hartmann_southwell(ny, nx, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], shifts_y, shifts_x)
-                
+            # display the phase plt show phase twilight 
+            plt.figure(figsize=(6,6))
+            plt.imshow((phase.get() + np.pi) % (2*np.pi) - np.pi, cmap="twilight")
+            plt.colorbar(fraction=0.029, pad=0.04)
+            plt.show()
             phase_term = self.xp.exp(- 1j * phase) 
             phase_term = self.xp.nan_to_num(phase_term, nan=0.0) # completely mask the nan zone where the phase could'nt be estimated
             holograms = self._fresnel_transform_phase(frames, phase_term)
-
-        if parameters["spatial_propagation"] == "Fresnel":
+        elif parameters["spatial_propagation"] == "Fresnel":
             if (not "Fresnel" in self.kernels):
                 self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
             holograms = self._fresnel_transform(frames)
