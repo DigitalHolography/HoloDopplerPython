@@ -676,7 +676,8 @@ class Holodoppler:
         shifts_y = xp.zeros((ny_subabs, nx_subabs), dtype=xp.float32)
         shifts_x = xp.zeros((ny_subabs, nx_subabs), dtype=xp.float32)
         if (ref is None):
-            assert ny_subabs % 2 == 1 and nx_subabs % 2 == 1, "Number of sub-apertures must be odd."
+            if ny_subabs % 2 == 1 and nx_subabs % 2 == 1 :
+                print("Warning : Number of sub-apertures must be odd.")
             ref_subap = U_subabs[ny_subabs // 2, nx_subabs // 2] 
         else:
             ref_subap = ref
@@ -823,8 +824,8 @@ class Holodoppler:
             valid_div[:-1, :] |= valid_y
             valid_div[1:, :]  |= valid_y
             div = xp.where(valid_div, div, 0.0)
-            div_dct = scipy.fftpack.dct(
-                scipy.fftpack.dct(div, axis=0, norm="ortho"),
+            div_dct = sp.fftpack.dct(
+                sp.fftpack.dct(div, axis=0, norm="ortho"),
                 axis=1, norm="ortho"
             )
             cx = xp.cos(xp.pi * xp.arange(cols) / cols)
@@ -834,8 +835,8 @@ class Holodoppler:
             eig[0, 0] = 1.0  # avoid division by zero
             phi_dct = div_dct / eig
             phi_dct[0, 0] = 0.0  # remove piston
-            phi = scipy.fftpack.idct(
-                scipy.fftpack.idct(phi_dct, axis=1, norm="ortho"),
+            phi = sp.fftpack.idct(
+                sp.fftpack.idct(phi_dct, axis=1, norm="ortho"),
                 axis=0, norm="ortho"
             )
             phi[~valid_div] = xp.nan
@@ -865,10 +866,11 @@ class Holodoppler:
             return ndi.map_coordinates(phi_filled, coords, order=3, mode='nearest')
         
         nysubabs, nxsubabs = shifts_y.shape
-        slopes_y = shifts_y * wavelength # *(pixel_pitch_y*(ny//nysubabs)) same as before / (pixel_pitch_y*(ny//nysubabs)) the pitch between subaps
+        slopes_y = shifts_y * wavelength # /(pixel_pitch_y*(ny//nysubabs)) same as before *(pixel_pitch_y*(ny//nysubabs)) the pitch between subaps before integration
         slopes_x = shifts_x * wavelength 
-        southwell_fourier_phase = southwell_fourier_nan(slopes_y, slopes_x) * (2*xp.pi) / WAVELENGTH
-        return southwell_phase
+        southwell_fourier_phase = southwell_fourier_nan(slopes_y, slopes_x) * (2*xp.pi) / wavelength
+        southwell_fourier_phase = resize_phase_nan(southwell_fourier_phase, ny, nx, self.ndi)
+        return southwell_fourier_phase
 
     # ------------------------------------------------------------
     # One batch full pipeline
@@ -883,16 +885,16 @@ class Holodoppler:
 
         nt, ny, nx = frames.shape
         
-        if parameters["Shack_Hartmann"] and parameters["spatial_propagation"] == "Fresnel":
+        if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel":
             if (not "Fresnel" in self.kernels):
                 self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
             
             U_subaps = self._shack_hartmann_constructsubapsimages(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], parameters["time_window"], parameters["nx_subabs"], parameters["ny_subabs"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
             shifts_y, shifts_x = self._shack_hartmann_estimate_shifts(U_subaps, ref = None) # get the shifts in pixels in the subapertures images
             
-            if parameters["Shack_Hartmann_Zernike_Fit"] :
-                coefs, phase = self._shack_hartmann_zernike(shifts_y, shifts_x, parameters["Shack_Hartmann_Zernike_Fit_modes"]) # fit the shifts to Zernike polynomials to get the wavefront phase
-            elif parameters["Shack_Hartmann_Southwell_Phase_Integration "] :
+            if parameters["shack_hartmann_zernike_fit"] :
+                coefs, phase = self._shack_hartmann_zernike(shifts_y, shifts_x, parameters["shack_hartmann_zernike_fit_modes"]) # fit the shifts to Zernike polynomials to get the wavefront phase
+            elif parameters["shack_hartmann_southwell_phase_integration "] :
                 phase = self._shack_hartmann_southwell(shifts_y, shifts_x)
                 
             phase_term = self.xp.exp(- 1j * phase) 
@@ -960,6 +962,8 @@ class Holodoppler:
             M0_reg, _, _ = self.render_moments(parameters, frames = frames)
             M0_reg = self._flatfield(M0_reg, parameters["registration_flatfield_gw"])
             reg_list = []
+            
+        xp = self.xp
             
         if self.backend == "cupy_ramdisk":
             import time
@@ -1151,7 +1155,7 @@ class Holodoppler:
             )
 
             with stream_h2d:
-                d_frames_next = xp.asarray(frames_next)  # async if pinned
+                d_frames_next = self.xp.asarray(frames_next)  # async if pinned
 
             for i in tqdm(range(num_batch)):
 
