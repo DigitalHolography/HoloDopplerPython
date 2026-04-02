@@ -34,6 +34,7 @@ from matlab_imresize.imresize import imresize
 import scipy.ndimage as np_ndi
 from scipy.interpolate import griddata
 import scipy.fftpack as np_fftpack
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 class Holodoppler:
     """
@@ -626,21 +627,7 @@ class Holodoppler:
         return xcorr, (shift_y, shift_x)
 
     def _shack_hartmann_displacement_calculation(self, U_subabs, xp, ref=None):
-        def plot_shifts(shifts_y, shifts_x,nx_subabs, ny_subabs, title = "Wavefront Slopes from Sub-aperture Shifts", holdon= False, scale=50):
-                # print(shifts_y,shifts_x)
-                if not holdon :
-                    plt.figure(figsize=(10, 4))
-                ax = plt.gca()
-                X, Y = np.meshgrid(np.arange(nx_subabs), np.arange(ny_subabs))
-                plt.quiver(X, Y, (shifts_x.get()), (shifts_y.get()), scale=scale)
-                plt.title(title)
-                plt.xlabel('Sub-aperture X Index')
-                plt.ylabel('Sub-aperture Y Index')
-                plt.xlim(-0.5, nx_subabs - 0.5)
-                plt.ylim(-0.5, ny_subabs - 0.5)
-                plt.grid(True, linestyle='--', alpha=0.7)
-                plt.gca().set_aspect('equal')
-                plt.show()
+        
                 
         def filter_shifts_pupil(shifts_y, shifts_x, Ny, Nx, sub_ny, sub_nx, radius=0.9):
             shifts_y_c = xp.copy(shifts_y)
@@ -794,7 +781,7 @@ class Holodoppler:
             self.kernels["G_gradient_zernike_matrix"] = G
         
         zernike_coefs_radians, _ = solve_modes(self.kernels["G_gradient_zernike_matrix"], s) 
-        print(zernike_coefs_radians, "radians")
+        # print(zernike_coefs_radians, "radians")
 
         zern_phase = xp.sum(xp.stack([coef * self._get_zernike_mode2(idx, nx, ny, radius = 2) for idx, coef in zip(zernike_modes, zernike_coefs_radians)]), axis=0)
         
@@ -926,30 +913,74 @@ class Holodoppler:
                     row_imgs = [self.xp.asnumpy(U_subaps[iy, ix]) for ix in range(nx_subabs)]
                     rows.append(np.hstack(row_imgs))  # horizontally stack each row
                 montage_img = np.vstack(rows)  # vertically stack all rows
+                return montage_img
                 # Display montage
-                plt.figure(figsize=(12, 8))
-                plt.imshow(montage_img, cmap='gray')
-                plt.axis('off')  # remove axes
-                plt.title('Montage of Sub-apertures')
-                plt.show()
+                # plt.figure(figsize=(12, 8))
+                # plt.imshow(montage_img, cmap='gray')
+                # plt.axis('off')  # remove axes
+                # plt.title('Montage of Sub-apertures')
+                # plt.show()
                 
-            plot_subaps(U_subaps, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"])
+            montage_img = plot_subaps(U_subaps, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"])
             
             shifts_y, shifts_x = self._shack_hartmann_displacement_calculation(U_subaps, self.xp, ref = None) # get the shifts in pixels in the subapertures images
             nysubabs, nxsubabs = shifts_y.shape
             
+            def plot_shifts(shifts_y, shifts_x, nx_subabs, ny_subabs, title="Wavefront Slopes from Sub-aperture Shifts", scale=50):
+                fig, ax = plt.subplots(figsize=(8, 6), dpi=100)
+                canvas = FigureCanvasAgg(fig)
+                
+                # Derive dimensions from figure
+                width = int(fig.get_figwidth() * fig.dpi)
+                height = int(fig.get_figheight() * fig.dpi)
+                
+                X, Y = np.meshgrid(np.arange(nx_subabs), np.arange(ny_subabs))
+                ax.quiver(X, Y, shifts_x.get(), shifts_y.get(), scale=scale)
+                ax.set_title(title)
+                ax.set_xlabel('Sub-aperture X Index')
+                ax.set_ylabel('Sub-aperture Y Index')
+                ax.set_xlim(-0.5, nx_subabs - 0.5)
+                ax.set_ylim(-0.5, ny_subabs - 0.5)
+                ax.grid(True, linestyle='--', alpha=0.7)
+                ax.set_aspect('equal')
+                
+                canvas.draw()
+                img = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8).reshape(height, width, 4)[:, :, :3]
+                plt.close(fig)  # Important: free memory
+                
+                return img
+            
+            shifts_img = plot_shifts(shifts_y, shifts_x, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], title = "Wavefront Slopes from Sub-aperture Shifts", scale=50)
             if parameters["shack_hartmann_zernike_fit"] :
                 coefs, phase = self._shack_hartmann_zernike(ny, nx, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], shifts_y, shifts_x, parameters["shack_hartmann_zernike_fit_modes"]) # fit the shifts to Zernike polynomials to get the wavefront phase
             elif parameters["shack_hartmann_southwell_phase_integration "] :
                 phase = self._shack_hartmann_southwell(ny, nx, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], shifts_y, shifts_x)
             # display the phase plt show phase twilight 
-            plt.figure(figsize=(6,6))
-            plt.imshow((phase.get() + np.pi) % (2*np.pi) - np.pi, cmap="twilight")
-            plt.colorbar(fraction=0.029, pad=0.04)
-            plt.show()
+            def plot_phase(phase, title="Wavefront Phase"):
+                fig, ax = plt.subplots(figsize=(6, 6), dpi=100)
+                canvas = FigureCanvasAgg(fig)
+                
+                # Derive dimensions from figure
+                width = int(fig.get_figwidth() * fig.dpi)
+                height = int(fig.get_figheight() * fig.dpi)
+                
+                ax.set_title(title)
+                im = ax.imshow((phase.get() + np.pi) % (2*np.pi) - np.pi, cmap="twilight")
+                fig.colorbar(im, ax=ax, fraction=0.029, pad=0.04)  # Use fig.colorbar with ax parameter
+                ax.set_aspect('equal')
+                
+                canvas.draw()
+                img = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8).reshape(height, width, 4)[:, :, :3]
+                plt.close(fig)
+                
+                return img
+            
+            phase_img = plot_phase(phase, title="Wavefront Phase")
+            
             phase_term = self.xp.exp(- 1j * phase) 
             phase_term = self.xp.nan_to_num(phase_term, nan=0.0) # completely mask the nan zone where the phase could'nt be estimated
             holograms = self._fresnel_transform_phase(frames, phase_term)
+            hologramsnotfixed = self._fresnel_transform(frames)
         elif parameters["spatial_propagation"] == "Fresnel":
             if (not "Fresnel" in self.kernels):
                 self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
@@ -971,8 +1002,17 @@ class Holodoppler:
         M0 = self._moment(psd, freqs, 0)
         M1 = self._moment(psd, freqs, 1)
         M2 = self._moment(psd, freqs, 2)
+        
+        if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel":
+            hologramsnotfixed
+            hologramsnotfixed_f = self._svd_filter(hologramsnotfixed, parameters["svd_threshold"])
+            spectrumnotfixed_f = self._fourier_time_transform(hologramsnotfixed_f)
+            psdnotfixed = self.xp.abs(spectrumnotfixed_f[idxs,:,:]) ** 2
+            M0notfixed = self._moment(psdnotfixed, freqs, 0)
+            
+        c = self._to_numpy(coefs) if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and parameters["shack_hartmann_zernike_fit"] else None
 
-        return M0, M1, M2
+        return M0, M1, M2, montage_img, shifts_img, phase_img, self._to_numpy(M0notfixed), [c] if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" else (M0, M1, M2, None, None, None)
 
     # ------------------------------------------------------------
     # Full video processing
@@ -1001,6 +1041,7 @@ class Holodoppler:
             num_batch = int((end_frame-first_frame) / batch_stride)
 
         out_list = []
+        debug_list = [None for _ in range(num_batch)]
 
         if num_batch <= 0:
             return None
@@ -1008,7 +1049,7 @@ class Holodoppler:
         
         if parameters["image_registration"]:
             frames = self.read_frames(first_frame, parameters["batch_size_registration"]) # the first frame to be rendered
-            M0_reg, _, _ = self.render_moments(parameters, frames = frames)
+            M0_reg, _, _, _, _, _, _, _ = self.render_moments(parameters, frames = frames)
             M0_reg = self._flatfield(M0_reg, parameters["registration_flatfield_gw"])
             reg_list = []
 
@@ -1043,12 +1084,10 @@ class Holodoppler:
                 with stream_compute:
                     res = self.render_moments(parameters, frames=d_frames)
 
-                
-
                 if res is None:
                     break
 
-                M0, M1, M2 = res
+                M0, M1, M2, *debug_imgs = res
 
                 # --- Register current batch ---
                 with stream_compute:
@@ -1061,11 +1100,11 @@ class Holodoppler:
                         reg_list.append((shift_y, shift_x))
 
                 stream_compute.synchronize()
-
-
+                
                 out_list.append(
                     cp.stack([M0, M1, M2], axis=2)
                 )
+                debug_list[i] = debug_imgs
 
             # Ensure transfers complete
             stream_h2d.synchronize()
@@ -1083,7 +1122,7 @@ class Holodoppler:
                     if res is None:
                         break
 
-                    M0, M1, M2 = res
+                    M0, M1, M2, *debug_imgs = res
 
                     if parameters["image_registration"]:
                         M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
@@ -1096,6 +1135,7 @@ class Holodoppler:
                     out_list.append(
                         self.xp.stack([M0, M1, M2], axis=2)
                     )
+                    debug_list[i] = debug_imgs
 
                 except Exception:
                     traceback.print_exc()
@@ -1105,6 +1145,22 @@ class Holodoppler:
                 return None
 
         vid = self.xp.stack(out_list, axis=3)
+        
+        if any(tup is not None for tup in debug_list):
+            streams = [[], [], [], [], []]
+            for tup in debug_list:
+                if tup is not None:
+                    for i, img in enumerate(tup):
+                        streams[i].append(img if img is not None else np.zeros_like(streams[i][0] if streams[i] else img))
+            
+            vid_debug = [np.stack(stream, axis=2) for stream in streams if stream]
+        else:
+            vid_debug = None
+            
+        if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel":
+            zernike_coefs = self._to_numpy(vid_debug[4]) if vid_debug and len(vid_debug) > 4 else None
+        else:
+            zernike_coefs = None
 
         if parameters["square"]:
             m = max(vid.shape[0], vid.shape[1])
@@ -1122,9 +1178,10 @@ class Holodoppler:
             vid = self.xp.flip(vid, axis=0)
 
         if (h5_path is not None) or (mp4_path is not None) or holodoppler_path:
-            v = self._to_numpy(vid)
+            vid = self._to_numpy(vid)
             
-        def save_to_h5path(h5_path, v, parameters, reg_list = None):
+            
+        def save_to_h5path(h5_path, v, parameters, reg_list = None, zernike_coefs = None):
             with h5py.File(h5_path, "w") as f:
                 f.create_dataset("moment0", data=v[:, :, :, 0])
                 f.create_dataset("moment1", data=v[:, :, :, 1])
@@ -1132,6 +1189,9 @@ class Holodoppler:
                 f.create_dataset("HD_parameters", data=json.dumps(parameters))
                 if parameters["image_registration"]:
                     f.create_dataset("registration", data=self._to_numpy(self.xp.array(reg_list)))
+                    
+                if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and zernike_coefs is not None:
+                    f.create_dataset("zernike_coefs_radians", data=self._to_numpy((zernike_coefs).astype(np.float64)))
 
                 def json_serializer(obj):
                     if isinstance(obj, np.ndarray):
@@ -1145,7 +1205,7 @@ class Holodoppler:
                     f.create_dataset("cine_metadata", data=json.dumps(self.cine_metadata_json, default=json_serializer))
 
         if h5_path is not None:
-            save_to_h5path(h5_path, np.permute_dims(v, (3, 0, 1, 2)), parameters, reg_list if parameters["image_registration"] else None)
+            save_to_h5path(h5_path, np.permute_dims(v, (3, 0, 1, 2)), parameters, reg_list if parameters["image_registration"] else None, zernike_coefs)
 
         if mp4_path is not None:
             pass
@@ -1169,15 +1229,16 @@ class Holodoppler:
             os.makedirs(mp4_dir, exist_ok=True)
             os.makedirs(json_dir, exist_ok=True)
             os.makedirs(h5_dir, exist_ok=True)
-            # save png
-            for i in range(v.shape[2]):
-                plt.imsave(os.path.join(png_dir, f"moment_{i}.png"), np.mean(v[:, :, i, :],axis=2), cmap="gray")
-            vid_norm = v[:, :, 0, :]  # shape (H, W, T)
+            # save pngs
+            for i in range(vid.shape[2]):
+                plt.imsave(os.path.join(png_dir, f"moment_{i}.png"), np.mean(vid[:, :, i, :],axis=2), cmap="gray")
+            # save m0 as mp4 and avi
+            vid_norm = vid[:, :, 0, :]  # shape (H, W, T)
             vid_norm = vid_norm.astype(np.float32)
             vid_norm = (vid_norm - vid_norm.min()) / (vid_norm.max() - vid_norm.min())
             vid_norm = (vid_norm * 255).astype(np.uint8)
             # save mp4
-            height, width = v.shape[0], v.shape[1]
+            height, width = vid.shape[0], vid.shape[1]
             duration = 1/parameters["sampling_freq"] * (end_frame-first_frame) 
             fps = num_batch / duration
             out_mp4 = cv2.VideoWriter(os.path.join(mp4_dir, "moment_0.mp4"),cv2.VideoWriter_fourcc(*'mp4v'),fps,(width, height),isColor=False)
@@ -1185,17 +1246,44 @@ class Holodoppler:
                 frame = vid_norm[:, :, i]
                 out_mp4.write(frame)
             out_mp4.release()
-            # save mp4
+            # save avi
             out_avi = cv2.VideoWriter(os.path.join(mp4_dir, "moment_0.avi"),cv2.VideoWriter_fourcc(*'XVID'),fps,(width, height),isColor=False)
             for i in range(num_batch):
                 frame = vid_norm[:, :, i]
                 out_avi.write(frame)
             out_avi.release()
+            #save debug mp4s if they exist
+            if vid_debug is not None:
+                for idx, v in enumerate(vid_debug):
+                    print(v.shape)
+                    height, width = v.shape[0], v.shape[1]
+                    isColor = (v.ndim == 4 and v.shape[3] == 3)
+                    if not isColor and (v.max() - v.min()) > 0:
+                        v = v.astype(np.float32)
+                        v = (v - v.min()) / (v.max() - v.min())
+                        v = (v * 255).astype(np.uint8)
+                    duration = 1 / parameters["sampling_freq"] * (end_frame - first_frame)
+                    fps = num_batch / duration
+                    out_mp4 = cv2.VideoWriter(
+                        os.path.join(mp4_dir, f"debug_{idx}.mp4"),
+                        cv2.VideoWriter_fourcc(*'mp4v'),
+                        fps,
+                        (width, height),
+                        isColor=isColor
+                    )
+                    for i in range(num_batch):
+                        
+                        if v.ndim == 3:
+                            frame = v[:, :, i]  # (H, W)
+                        else:
+                            frame = v[:, :, i, :]  # (H, W, 3)
+                        out_mp4.write(frame)
+                    out_mp4.release()
             # save json
             with open(os.path.join(json_dir, "parameters.json"), "w") as f:
                 json.dump(parameters, f, indent=4)
             # save h5
-            save_to_h5path(os.path.join(h5_dir, f"{holodoppler_dir_name}_output.h5"), np.permute_dims(v, (3, 1, 0, 2)), parameters, reg_list if parameters["image_registration"] else None)
+            save_to_h5path(os.path.join(h5_dir, f"{holodoppler_dir_name}_output.h5"), np.permute_dims(vid, (3, 1, 0, 2)), parameters, reg_list if parameters["image_registration"] else None, zernike_coefs)
             # add a version.txt file with the version of the holodoppler pipeline used
             with open(os.path.join(holodoppler_path, "version.txt"), "w") as f:
                 f.write(f"Python:\n")
