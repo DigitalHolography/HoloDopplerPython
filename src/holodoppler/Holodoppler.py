@@ -551,7 +551,7 @@ class Holodoppler:
     # Shack-Hartmann wavefront reconstruction
     # ------------------------------------------------------------
 
-    def _shack_hartmann_constructsubapsimages(self, U0, dx, dy, wavelength, z_prop, f0, f1, fs, time_window, nx_subabs, ny_subabs):
+    def _shack_hartmann_constructsubapsimages(self, U0, dx, dy, wavelength, z_prop, f0, f1, fs, time_window, nx_subabs, ny_subabs, svd_threshold):
         xp = self.xp
         Nz, Ny, Nx = U0.shape
         nb_iter = Nz // time_window
@@ -561,11 +561,8 @@ class Holodoppler:
         for i in range(nb_iter):
             start_idx = i * time_window
             end_idx = start_idx + time_window
-            U_chunk = U0[start_idx:end_idx]
-            # U_prop_filtered = self._svd_filter(U_chunk, 16)
-            U_fourier = xp.fft.fft(U_chunk, axis=0)
-            U_filter = U_fourier[idxs,:,:]
-            U_prop_qin = U_filter * Qin # if zernike_phase is None else U_filter * Qin * xp.exp(- 1j * zernike_phase)
+            U_chunk = U0[start_idx:end_idx]     
+            U_prop_qin = U_chunk * Qin # if zernike_phase is None else U_filter * Qin * xp.exp(- 1j * zernike_phase)
             U_subaps = xp.zeros((ny_subabs, nx_subabs, Ny // ny_subabs, Nx // nx_subabs), dtype=xp.float32)
             for (iy, ix) in [(iy, ix) for iy in range(ny_subabs) for ix in range(nx_subabs)]:
                 y_start = iy * (Ny // ny_subabs)
@@ -573,9 +570,12 @@ class Holodoppler:
                 x_start = ix * (Nx // nx_subabs)
                 x_end = x_start + (Nx // nx_subabs)
                 U_subap = U_prop_qin[:, y_start:y_end, x_start:x_end]
-                U_prop = xp.fft.fft2(U_subap, axes=(-2, -1))
-                U_prop = xp.fft.fftshift(U_prop, axes=(-2, -1))
-                S = xp.abs(U_prop)**2
+                U_subap_filtered = self._svd_filter(U_subap, svd_threshold)
+                U_prop_filtered = xp.fft.fft2(U_subap_filtered, axes=(-2, -1))
+                U_prop_filtered = xp.fft.fftshift(U_prop_filtered, axes=(-2, -1))
+                U_fourier = xp.fft.fft(U_prop_filtered, axis=0)
+                U_filter = U_fourier[idxs,:,:]
+                S = xp.abs(U_filter)**2
                 M0 = xp.mean(S, axis=0)
                 U_subaps[iy, ix] = (M0.astype(xp.float32)) #flatfield(M0.astype(xp.float32),15)
             U_subaps_stack[i] = U_subaps
@@ -626,6 +626,22 @@ class Holodoppler:
         return xcorr, (shift_y, shift_x)
 
     def _shack_hartmann_displacement_calculation(self, U_subabs, xp, ref=None):
+        def plot_shifts(shifts_y, shifts_x,nx_subabs, ny_subabs, title = "Wavefront Slopes from Sub-aperture Shifts", holdon= False, scale=50):
+                # print(shifts_y,shifts_x)
+                if not holdon :
+                    plt.figure(figsize=(10, 4))
+                ax = plt.gca()
+                X, Y = np.meshgrid(np.arange(nx_subabs), np.arange(ny_subabs))
+                plt.quiver(X, Y, (shifts_x.get()), (shifts_y.get()), scale=scale)
+                plt.title(title)
+                plt.xlabel('Sub-aperture X Index')
+                plt.ylabel('Sub-aperture Y Index')
+                plt.xlim(-0.5, nx_subabs - 0.5)
+                plt.ylim(-0.5, ny_subabs - 0.5)
+                plt.grid(True, linestyle='--', alpha=0.7)
+                plt.gca().set_aspect('equal')
+                plt.show()
+                
         def filter_shifts_pupil(shifts_y, shifts_x, Ny, Nx, sub_ny, sub_nx, radius=0.9):
             shifts_y_c = xp.copy(shifts_y)
             shifts_x_c = xp.copy(shifts_x)
@@ -664,8 +680,12 @@ class Holodoppler:
             shifts_y[iy, ix] = shift_y
             shifts_x[iy, ix] = shift_x
             
-        shifts_y, shifts_x = filter_shifts_pupil(shifts_y, shifts_x, U_subabs.shape[2], U_subabs.shape[3], ny_subabs, nx_subabs, radius=1)
-        shifts_y, shifts_x = filter_shifts_threshold(shifts_y, shifts_x, U_subabs.shape[2], U_subabs.shape[3], ny_subabs, nx_subabs, threshold=1)
+        # plot_shifts(shifts_y, shifts_x, nx_subabs, ny_subabs, title = "Wavefront Slopes from Sub-aperture Shifts", scale=50)
+
+        shifts_y, shifts_x = filter_shifts_pupil(shifts_y, shifts_x, U_subabs.shape[-2], U_subabs.shape[-1], ny_subabs, nx_subabs, radius=1)
+        shifts_y, shifts_x = filter_shifts_threshold(shifts_y, shifts_x, U_subabs.shape[-2], U_subabs.shape[-1], ny_subabs, nx_subabs, threshold=3)
+        
+        # plot_shifts(shifts_y, shifts_x, nx_subabs, ny_subabs, title = "Wavefront Slopes from Sub-aperture Shifts", scale=50)
         return shifts_y, shifts_x
     
     def _get_zernike_mode2(self, mode_index, Nx, Ny, radius = 2.0):
@@ -824,17 +844,6 @@ class Holodoppler:
         from cupyx.scipy.ndimage import zoom
 
         def resize_phase_nan_cp(phi, NY, NX, order=1):
-            """
-            Resize a 2D CuPy array with NaNs using smooth interpolation.
-            
-            Parameters:
-                phi : cupy.ndarray (2D)
-                NY, NX : target shape
-                order : interpolation order (1 = linear, 3 = cubic)
-            
-            Returns:
-                cupy.ndarray of shape (NY, NX)
-            """
             phi = phi.reshape(phi.shape[-2], phi.shape[-1])
 
             # Mask of valid values
@@ -910,7 +919,7 @@ class Holodoppler:
             if (not "Fresnel" in self.kernels):
                 self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
             
-            U_subaps = self._shack_hartmann_constructsubapsimages(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], parameters["batch_size"], parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
+            U_subaps = self._shack_hartmann_constructsubapsimages(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], parameters["batch_size"], parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
             def plot_subaps(U_subaps, nx_subabs, ny_subabs):
                 rows = []
                 for iy in range(ny_subabs):
@@ -928,24 +937,7 @@ class Holodoppler:
             
             shifts_y, shifts_x = self._shack_hartmann_displacement_calculation(U_subaps, self.xp, ref = None) # get the shifts in pixels in the subapertures images
             nysubabs, nxsubabs = shifts_y.shape
-            def plot_shifts(shifts_y, shifts_x,nx_subabs, ny_subabs, title = "Wavefront Slopes from Sub-aperture Shifts", holdon= False, scale=50):
-                # print(shifts_y,shifts_x)
-                if not holdon :
-                    plt.figure(figsize=(10, 4))
-                ax = plt.gca()
-                X, Y = np.meshgrid(np.arange(nx_subabs), np.arange(ny_subabs))
-                plt.quiver(X, Y, (shifts_x.get()), (shifts_y.get()), scale=scale)
-                plt.title(title)
-                plt.xlabel('Sub-aperture X Index')
-                plt.ylabel('Sub-aperture Y Index')
-                plt.xlim(-0.5, nx_subabs - 0.5)
-                plt.ylim(-0.5, ny_subabs - 0.5)
-                plt.grid(True, linestyle='--', alpha=0.7)
-                plt.gca().set_aspect('equal')
-                plt.show()
-                
             
-            plot_shifts(shifts_y, shifts_x, nxsubabs, nysubabs, scale=50)
             if parameters["shack_hartmann_zernike_fit"] :
                 coefs, phase = self._shack_hartmann_zernike(ny, nx, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], shifts_y, shifts_x, parameters["shack_hartmann_zernike_fit_modes"]) # fit the shifts to Zernike polynomials to get the wavefront phase
             elif parameters["shack_hartmann_southwell_phase_integration "] :
@@ -967,9 +959,9 @@ class Holodoppler:
                 self._build_angular_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
             holograms = self._angular_spectrum_transform(frames)
             
-        # holograms_f = self._svd_filter(holograms, parameters["svd_threshold"])
+        holograms_f = self._svd_filter(holograms, parameters["svd_threshold"])
 
-        spectrum_f = self._fourier_time_transform(holograms)
+        spectrum_f = self._fourier_time_transform(holograms_f)
 
         # idxs, freqs = self._frequency_symmetric_filtering(frames.shape[-1], parameters["sampling_freq"], parameters["low_freq"])
         idxs, freqs = self._old_frequency_symmetric_filtering(frames.shape[0], parameters["sampling_freq"], parameters["low_freq"], parameters["high_freq"])
