@@ -907,6 +907,7 @@ class Holodoppler:
                 self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
             
             U_subaps = self._shack_hartmann_constructsubapsimages(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], parameters["batch_size"], parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
+            
             def plot_subaps(U_subaps, nx_subabs, ny_subabs):
                 rows = []
                 for iy in range(ny_subabs):
@@ -1011,8 +1012,11 @@ class Holodoppler:
             M0notfixed = self._moment(psdnotfixed, freqs, 0)
             
         c = self._to_numpy(coefs) if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and parameters["shack_hartmann_zernike_fit"] else None
-
-        return M0, M1, M2, montage_img, shifts_img, phase_img, self._to_numpy(M0notfixed), [c] if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" else (M0, M1, M2, None, None, None)
+        if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel":
+            res = (M0, M1, M2, montage_img, shifts_img, phase_img, self._to_numpy(M0notfixed), [c])
+        else:
+            res = (M0, M1, M2, None, None, None, None, None)
+        return res
 
     # ------------------------------------------------------------
     # Full video processing
@@ -1145,8 +1149,7 @@ class Holodoppler:
                 return None
 
         vid = self.xp.stack(out_list, axis=3)
-        
-        if any(tup is not None for tup in debug_list):
+        if debug_list[0][0] is not None:
             streams = [[], [], [], [], []]
             for tup in debug_list:
                 if tup is not None:

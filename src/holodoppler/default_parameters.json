@@ -19,7 +19,7 @@
   "transpose": false,
   "flip_x": false,
   "flip_y": false,
-  "shack_hartmann": true,
+  "shack_hartmann": false,
   "shack_hartmann_ny_subap": 5,
   "shack_hartmann_nx_subap": 5,
   "shack_hartmann_zernike_fit": true,
