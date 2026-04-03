@@ -9,7 +9,7 @@ with open("C:\\Users\\Ivashka\\Documents\\Python\\HolodopplerPython\\src\\holodo
     
 print("parameters :", parameters)
 
-HD = Holodoppler(backend = "cupy", pipeline_version = "old")
+HD = Holodoppler(backend = "cupy", pipeline_version = "latest")
 
 HD.load_file("D:\\STAGE\\260113_AUZ0752_2.holo")
 
