@@ -3,7 +3,7 @@ import json
 import os
 import matplotlib.pyplot as plt
 
-with open("C:\\Users\\Ivashka\\Documents\\Python\\Holodoppler\\src\\holodoppler\\default_parameters.json") as f :
+with open("C:\\Users\\Ivashka\\Documents\\Python\\HolodopplerPython\\src\\holodoppler\\default_parameters.json") as f :
     x = f.read()
     parameters = json.loads(x)
     
@@ -11,7 +11,7 @@ print("parameters :", parameters)
 
 HD = Holodoppler(backend = "cupy", pipeline_version = "old")
 
-HD.load_file("Z:\\260326\\260326_SEG.holo")
+HD.load_file("D:\\STAGE\\260113_AUZ0752_2.holo")
 
 print("file header :", HD.file_header)
 
