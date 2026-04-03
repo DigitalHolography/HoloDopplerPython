@@ -1050,7 +1050,7 @@ class Holodoppler:
             from concurrent.futures import ThreadPoolExecutor
             from queue import Queue
 
-            NUM_IO_WORKERS = 8  # go wide, disk is the bottleneck
+            NUM_IO_WORKERS = 32  # go wide, disk is the bottleneck
 
             fid_pool = Queue()
             worker_fids = [open(self.file_path, "rb") for _ in range(NUM_IO_WORKERS)]
@@ -1103,7 +1103,7 @@ class Holodoppler:
                 if res is None:
                     break
 
-                M0, M1, M2 = res
+                M0, M1, M2, *debug_imgs = res
 
                 with stream_compute:
                     if parameters["image_registration"]:
@@ -1116,6 +1116,7 @@ class Holodoppler:
 
                 stream_compute.synchronize()
                 out_list.append(cp.stack([M0, M1, M2], axis=2))
+                debug_list[i] = debug_imgs
 
             stream_h2d.synchronize()
             cp.cuda.Device().synchronize()
