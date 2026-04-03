@@ -400,64 +400,43 @@ class Holodoppler:
     # ------------------------------------------------------------
 
     def resize_fft2_slicewise(self, img, new_h, new_w):
-        xp = self.xp
+        xp = np
         fft = np_fft
         img = img.astype(xp.float32)
-
         h, w = img.shape[:2]
         rest = img.shape[2:]
-
-        # Flatten trailing dimensions
         img = img.reshape(h, w, -1)
         n_slices = img.shape[-1]
-
         out = xp.empty((new_h, new_w, n_slices), dtype=xp.float32)
-
         for i in range(n_slices):
             slice_2d = img[:, :, i]
-
             F = fft.fftshift(
                 fft.fft2(slice_2d),
             )
-
             F_new = xp.zeros((new_h, new_w), dtype=F.dtype)
-
             h_min, w_min = min(h, new_h), min(w, new_w)
             ho, wo = (h - h_min)//2, (w - w_min)//2
             hn, wn = (new_h - h_min)//2, (new_w - w_min)//2
-
             F_new[hn:hn+h_min, wn:wn+w_min] = F[ho:ho+h_min, wo:wo+w_min]
-
             resized = fft.ifft2(
                 fft.ifftshift(F_new)
             ).real
-
             resized *= (new_h * new_w) / (h * w)
-
             out[:, :, i] = resized
-
         return out.reshape(new_h, new_w, *rest)
     
     def resize_matlab_slicewise(self, img, new_h, new_w):
         xp = np
         img = img.astype(xp.float32)
-
         h, w = img.shape[:2]
         rest = img.shape[2:]
-
-        # Flatten trailing dimensions
         img = img.reshape(h, w, -1)
         n_slices = img.shape[-1]
-
         out = xp.empty((new_h, new_w, n_slices), dtype=xp.float32)
-
         for i in range(n_slices):
             slice_2d = img[:, :, i]
-
             resized = imresize(slice_2d, output_shape=(new_h, new_w))
-
             out[:, :, i] = resized
-
         return out.reshape(new_h, new_w, *rest)
 
     # ------------------------------------------------------------
@@ -1267,9 +1246,9 @@ class Holodoppler:
                         v = (v * 255).astype(np.uint8)
                     duration = 1 / parameters["sampling_freq"] * (end_frame - first_frame)
                     fps = num_batch / duration
-                    out_mp4 = cv2.VideoWriter(
-                        os.path.join(mp4_dir, f"debug_{idx}.mp4"),
-                        cv2.VideoWriter_fourcc(*'mp4v'),
+                    out_avi = cv2.VideoWriter(
+                        os.path.join(mp4_dir, f"debug_{idx}.avi"),
+                        cv2.VideoWriter_fourcc(*'XVID'),
                         fps,
                         (width, height),
                         isColor=isColor
@@ -1280,8 +1259,8 @@ class Holodoppler:
                             frame = v[:, :, i]  # (H, W)
                         else:
                             frame = v[:, :, i, :]  # (H, W, 3)
-                        out_mp4.write(frame)
-                    out_mp4.release()
+                        out_avi.write(frame)
+                    out_avi.release()
             # save json
             with open(os.path.join(json_dir, "parameters.json"), "w") as f:
                 json.dump(parameters, f, indent=4)
