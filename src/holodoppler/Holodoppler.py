@@ -83,7 +83,7 @@ class Holodoppler:
             self.ndi = cp_ndi
             self.fftpack = cp_fft
         else:
-            self.backend = "numpy"
+            self.backend = self.backend
             self.xp = np
             self.fft = np_fft
             self.gaussian_filter = np_gaussian_filter
@@ -1101,6 +1101,8 @@ class Holodoppler:
             from concurrent.futures import ProcessPoolExecutor, as_completed
             from multiprocessing import cpu_count
 
+            print("CPU count :" , cpu_count)
+
             def process_batch(args):
                 i, first_frame, parameters, self_state = args
                 try:
@@ -1139,7 +1141,7 @@ class Holodoppler:
 
             out_list = [x for x in out_list if x is not None]
             debug_list = {i: v for i, v in enumerate(debug_list) if v is not None}
-            
+
         else:
             for i in tqdm(range(num_batch)):
 
