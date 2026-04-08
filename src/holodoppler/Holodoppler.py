@@ -891,75 +891,70 @@ class Holodoppler:
             
             U_subaps = self._shack_hartmann_constructsubapsimages(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], parameters["batch_size"], parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
             
-            def plot_subaps(U_subaps, nx_subabs, ny_subabs):
-                rows = []
-                for iy in range(ny_subabs):
-                    row_imgs = [self.xp.asnumpy(U_subaps[iy, ix]) for ix in range(nx_subabs)]
-                    rows.append(np.hstack(row_imgs))  # horizontally stack each row
-                montage_img = np.vstack(rows)  # vertically stack all rows
-                return montage_img
-                # Display montage
-                # plt.figure(figsize=(12, 8))
-                # plt.imshow(montage_img, cmap='gray')
-                # plt.axis('off')  # remove axes
-                # plt.title('Montage of Sub-apertures')
-                # plt.show()
-                
-            montage_img = plot_subaps(U_subaps, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"])
+            if parameters["debug"]:
+                def plot_subaps(U_subaps, nx_subabs, ny_subabs):
+                    rows = []
+                    for iy in range(ny_subabs):
+                        row_imgs = [self._to_numpy(U_subaps[iy, ix]) for ix in range(nx_subabs)]
+                        rows.append(np.hstack(row_imgs))  # horizontally stack each row
+                    montage_img = np.vstack(rows)  # vertically stack all rows
+                    return montage_img
+                montage_img = plot_subaps(U_subaps, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"])
             
             shifts_y, shifts_x = self._shack_hartmann_displacement_calculation(U_subaps, self.xp, ref = None) # get the shifts in pixels in the subapertures images
-            nysubabs, nxsubabs = shifts_y.shape
             
-            def plot_shifts(shifts_y, shifts_x, nx_subabs, ny_subabs, title="Wavefront Slopes from Sub-aperture Shifts", scale=50):
-                fig, ax = plt.subplots(figsize=(8, 6), dpi=100)
-                canvas = FigureCanvasAgg(fig)
-                
-                # Derive dimensions from figure
-                width = int(fig.get_figwidth() * fig.dpi)
-                height = int(fig.get_figheight() * fig.dpi)
-                
-                X, Y = np.meshgrid(np.arange(nx_subabs), np.arange(ny_subabs))
-                ax.quiver(X, Y, shifts_x.get(), shifts_y.get(), scale=scale)
-                ax.set_title(title)
-                ax.set_xlabel('Sub-aperture X Index')
-                ax.set_ylabel('Sub-aperture Y Index')
-                ax.set_xlim(-0.5, nx_subabs - 0.5)
-                ax.set_ylim(-0.5, ny_subabs - 0.5)
-                ax.grid(True, linestyle='--', alpha=0.7)
-                ax.set_aspect('equal')
-                
-                canvas.draw()
-                img = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8).reshape(height, width, 4)[:, :, :3]
-                plt.close(fig)  # Important: free memory
-                
-                return img
+            if parameters["debug"]:
+                def plot_shifts(shifts_y, shifts_x, nx_subabs, ny_subabs, title="Wavefront Slopes from Sub-aperture Shifts", scale=50):
+                    fig, ax = plt.subplots(figsize=(8, 6), dpi=100)
+                    canvas = FigureCanvasAgg(fig)
+                    
+                    # Derive dimensions from figure
+                    width = int(fig.get_figwidth() * fig.dpi)
+                    height = int(fig.get_figheight() * fig.dpi)
+                    
+                    X, Y = np.meshgrid(np.arange(nx_subabs), np.arange(ny_subabs))
+                    ax.quiver(X, Y, self._to_numpy(shifts_x), self._to_numpy(shifts_y), scale=scale)
+                    ax.set_title(title)
+                    ax.set_xlabel('Sub-aperture X Index')
+                    ax.set_ylabel('Sub-aperture Y Index')
+                    ax.set_xlim(-0.5, nx_subabs - 0.5)
+                    ax.set_ylim(-0.5, ny_subabs - 0.5)
+                    ax.grid(True, linestyle='--', alpha=0.7)
+                    ax.set_aspect('equal')
+                    
+                    canvas.draw()
+                    img = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8).reshape(height, width, 4)[:, :, :3]
+                    plt.close(fig)  # Important: free memory
+                    
+                    return img
+                shifts_img = plot_shifts(shifts_y, shifts_x, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], title = "Wavefront Slopes from Sub-aperture Shifts", scale=50)
             
-            shifts_img = plot_shifts(shifts_y, shifts_x, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], title = "Wavefront Slopes from Sub-aperture Shifts", scale=50)
             if parameters["shack_hartmann_zernike_fit"] :
                 coefs, phase = self._shack_hartmann_zernike(ny, nx, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], shifts_y, shifts_x, parameters["shack_hartmann_zernike_fit_modes"]) # fit the shifts to Zernike polynomials to get the wavefront phase
             elif parameters["shack_hartmann_southwell_phase_integration "] :
                 phase = self._shack_hartmann_southwell(ny, nx, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], shifts_y, shifts_x)
-            # display the phase plt show phase twilight 
-            def plot_phase(phase, title="Wavefront Phase"):
-                fig, ax = plt.subplots(figsize=(6, 6), dpi=100)
-                canvas = FigureCanvasAgg(fig)
+            if parameters["debug"]:
+                # display the phase plt show phase twilight 
+                def plot_phase(phase, title="Wavefront Phase"):
+                    fig, ax = plt.subplots(figsize=(6, 6), dpi=100)
+                    canvas = FigureCanvasAgg(fig)
+                    
+                    # Derive dimensions from figure
+                    width = int(fig.get_figwidth() * fig.dpi)
+                    height = int(fig.get_figheight() * fig.dpi)
+                    
+                    ax.set_title(title)
+                    im = ax.imshow((self._to_numpy(phase) + np.pi) % (2*np.pi) - np.pi, cmap="twilight")
+                    fig.colorbar(im, ax=ax, fraction=0.029, pad=0.04)  # Use fig.colorbar with ax parameter
+                    ax.set_aspect('equal')
+                    
+                    canvas.draw()
+                    img = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8).reshape(height, width, 4)[:, :, :3]
+                    plt.close(fig)
+                    
+                    return img
                 
-                # Derive dimensions from figure
-                width = int(fig.get_figwidth() * fig.dpi)
-                height = int(fig.get_figheight() * fig.dpi)
-                
-                ax.set_title(title)
-                im = ax.imshow((phase.get() + np.pi) % (2*np.pi) - np.pi, cmap="twilight")
-                fig.colorbar(im, ax=ax, fraction=0.029, pad=0.04)  # Use fig.colorbar with ax parameter
-                ax.set_aspect('equal')
-                
-                canvas.draw()
-                img = np.frombuffer(canvas.buffer_rgba(), dtype=np.uint8).reshape(height, width, 4)[:, :, :3]
-                plt.close(fig)
-                
-                return img
-            
-            phase_img = plot_phase(phase, title="Wavefront Phase")
+                phase_img = plot_phase(phase, title="Wavefront Phase")
             
             phase_term = self.xp.exp(- 1j * phase) 
             phase_term = self.xp.nan_to_num(phase_term, nan=0.0) # completely mask the nan zone where the phase could'nt be estimated
@@ -979,7 +974,7 @@ class Holodoppler:
         spectrum_f = self._fourier_time_transform(holograms_f)
 
         # idxs, freqs = self._frequency_symmetric_filtering(frames.shape[-1], parameters["sampling_freq"], parameters["low_freq"])
-        idxs, freqs = self._old_frequency_symmetric_filtering(frames.shape[0], parameters["sampling_freq"], parameters["low_freq"], parameters["high_freq"])
+        idxs, freqs = self._frequency_symmetric_filtering(frames.shape[0], parameters["sampling_freq"], parameters["low_freq"], parameters["high_freq"])
 
         psd = self.xp.abs(spectrum_f[idxs,:,:]) ** 2
 
@@ -995,8 +990,11 @@ class Holodoppler:
             M0notfixed = self._moment(psdnotfixed, freqs, 0)
             
         c = self._to_numpy(coefs) if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and parameters["shack_hartmann_zernike_fit"] else None
-        if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel":
-            res = (M0, M1, M2, montage_img, shifts_img, phase_img, self._to_numpy(M0notfixed), [c])
+        if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" :
+            if parameters["debug"]:
+                res = (M0, M1, M2, montage_img, shifts_img, phase_img, self._to_numpy(M0notfixed), [c])
+            else:
+                res = (M0, M1, M2, None, None, None, None, [c])
         else:
             res = (M0, M1, M2, None, None, None, None, None)
         return res
@@ -1039,186 +1037,6 @@ class Holodoppler:
             M0_reg, _, _, _, _, _, _, _ = self.render_moments(parameters, frames = frames)
             M0_reg = self._flatfield(M0_reg, parameters["registration_flatfield_gw"])
             reg_list = []
-            
-        if self.backend == "cupy_ramdisk":
-            import time
-
-            print("=== Preloading all batches into RAM ===")
-            t0 = time.perf_counter()
-
-            # --- Read ALL batches into RAM upfront in parallel ---
-            from concurrent.futures import ThreadPoolExecutor
-            from queue import Queue
-
-            NUM_IO_WORKERS = 32  # go wide, disk is the bottleneck
-
-            fid_pool = Queue()
-            worker_fids = [open(self.file_path, "rb") for _ in range(NUM_IO_WORKERS)]
-            for fid in worker_fids:
-                fid_pool.put(fid)
-
-            batch_list = [
-                (first_frame + i * parameters["batch_stride"], parameters["batch_size"])
-                for i in range(num_batch)
-            ]
-
-            def read_batch(args):
-                idx, (ff, bs) = args
-                fid = fid_pool.get()
-                try:
-                    return idx, self.read_frames(ff, bs, fid=fid)
-                finally:
-                    fid_pool.put(fid)
-
-            with ThreadPoolExecutor(max_workers=NUM_IO_WORKERS) as executor:
-                results = list(executor.map(read_batch, enumerate(batch_list)))
-
-            # Sort by index, guaranteed order
-            all_frames = [frames for _, frames in sorted(results, key=lambda x: x[0])]
-
-            print(f"Preload done in {time.perf_counter() - t0:.2f}s — now GPU loop is pure compute")
-
-            for fid in worker_fids:
-                fid.close()
-
-            # --- GPU loop: zero disk I/O, pure compute ---
-            stream_h2d     = cp.cuda.Stream(non_blocking=True)
-            stream_compute = cp.cuda.Stream(non_blocking=True)
-
-            with stream_h2d:
-                d_frames_next = cp.asarray(all_frames[0])
-            stream_h2d.synchronize()
-
-            for i in tqdm(range(num_batch)):
-                d_frames = d_frames_next
-
-                if i + 1 < num_batch:
-                    with stream_h2d:
-                        d_frames_next = cp.asarray(all_frames[i + 1])
-                    # no sync needed — compute stream will naturally be behind
-
-                with stream_compute:
-                    res = self.render_moments(parameters, frames=d_frames)
-
-                if res is None:
-                    break
-
-                M0, M1, M2, *debug_imgs = res
-
-                with stream_compute:
-                    if parameters["image_registration"]:
-                        M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
-                        (shift_y, shift_x) = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
-                        M0 = self._roll2d(M0, shift_y, shift_x, self.xp)
-                        M1 = self._roll2d(M1, shift_y, shift_x, self.xp)
-                        M2 = self._roll2d(M2, shift_y, shift_x, self.xp)
-                        reg_list.append((shift_y, shift_x))
-
-                stream_compute.synchronize()
-                out_list.append(cp.stack([M0, M1, M2], axis=2))
-                debug_list[i] = debug_imgs
-
-            stream_h2d.synchronize()
-            cp.cuda.Device().synchronize()
-            
-        if self.backend == "cupy_diagnostic":
-            print("Running in diagnostic mode with CuPy backend. This will report timing for each step of the pipeline to identify bottlenecks.")
-            import time
-            from collections import defaultdict
-
-            timings = defaultdict(list)
-
-            def cuda_sync_time(stream, label):
-                """Synchronize a stream and return elapsed time."""
-                t0 = time.perf_counter()
-                stream.synchronize()
-                t1 = time.perf_counter()
-                timings[label].append(t1 - t0)
-                return t1 - t0
-
-            stream_h2d     = cp.cuda.Stream(non_blocking=True)
-            stream_compute = cp.cuda.Stream(non_blocking=True)
-
-            # --- Prime first batch ---
-            t0 = time.perf_counter()
-            frames_next = self.read_frames(first_frame, parameters["batch_size"])
-            timings["disk_read"].append(time.perf_counter() - t0)
-
-            t0 = time.perf_counter()
-            with stream_h2d:
-                d_frames_next = cp.asarray(frames_next)
-            stream_h2d.synchronize()
-            timings["h2d_transfer"].append(time.perf_counter() - t0)
-
-            for i in tqdm(range(num_batch)):
-                d_frames = d_frames_next
-
-                # --- Disk read ---
-                if i + 1 < num_batch:
-                    t0 = time.perf_counter()
-                    frames_next = self.read_frames(
-                        first_frame + (i + 1) * parameters["batch_stride"],
-                        parameters["batch_size"]
-                    )
-                    timings["disk_read"].append(time.perf_counter() - t0)
-
-                    # --- H2D transfer ---
-                    t0 = time.perf_counter()
-                    with stream_h2d:
-                        d_frames_next = cp.asarray(frames_next)
-                    stream_h2d.synchronize()
-                    timings["h2d_transfer"].append(time.perf_counter() - t0)
-
-                # --- Compute ---
-                t0 = time.perf_counter()
-                with stream_compute:
-                    res = self.render_moments(parameters, frames=d_frames)
-                stream_compute.synchronize()
-                timings["compute"].append(time.perf_counter() - t0)
-
-                if res is None:
-                    break
-
-                M0, M1, M2 = res
-
-                # --- Registration ---
-                if parameters["image_registration"]:
-                    t0 = time.perf_counter()
-                    with stream_compute:
-                        M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
-                        (shift_y, shift_x) = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
-                        M0 = self._roll2d(M0, shift_y, shift_x, self.xp)
-                        M1 = self._roll2d(M1, shift_y, shift_x, self.xp)
-                        M2 = self._roll2d(M2, shift_y, shift_x, self.xp)
-                        reg_list.append((shift_y, shift_x))
-                    stream_compute.synchronize()
-                    timings["registration"].append(time.perf_counter() - t0)
-
-                # --- Stack ---
-                t0 = time.perf_counter()
-                out_list.append(cp.stack([M0, M1, M2], axis=2))
-                timings["stack"].append(time.perf_counter() - t0)
-
-            stream_h2d.synchronize()
-            cp.cuda.Device().synchronize()
-
-            # --- Report ---
-            import numpy as np
-            print("\n=== BOTTLENECK REPORT ===")
-            total_time = sum(sum(v) for v in timings.values())
-            for label, times in sorted(timings.items(), key=lambda x: -sum(x[1])):
-                arr = np.array(times)
-                pct = 100 * arr.sum() / total_time
-                print(
-                    f"{label:20s} | "
-                    f"total: {arr.sum():.3f}s ({pct:5.1f}%) | "
-                    f"mean: {arr.mean()*1000:.1f}ms | "
-                    f"max: {arr.max()*1000:.1f}ms | "
-                    f"min: {arr.min()*1000:.1f}ms | "
-                    f"std: {arr.std()*1000:.1f}ms"
-                )
-            print(f"{'TOTAL':20s} | {total_time:.3f}s")
-            print("=========================\n")
 
         if self.backend == "cupy":
             stream_h2d = cp.cuda.Stream(non_blocking=True)
@@ -1318,7 +1136,7 @@ class Holodoppler:
                 if tup is not None:
                     for i, img in enumerate(tup):
                         streams[i].append(img if img is not None else np.zeros_like(streams[i][0] if streams[i] else img))
-            
+            import numpy as np
             vid_debug = [np.stack(stream, axis=2) for stream in streams if stream]
         else:
             vid_debug = None

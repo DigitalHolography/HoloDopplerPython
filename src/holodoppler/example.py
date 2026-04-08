@@ -3,15 +3,15 @@ import json
 import os
 import matplotlib.pyplot as plt
 
-with open("C:\\Users\\Ivashka\\Documents\\Python\\HolodopplerPython\\src\\holodoppler\\default_parameters.json") as f :
+with open(r"./src/holodoppler/default_parameters.json") as f :
     x = f.read()
     parameters = json.loads(x)
     
 print("parameters :", parameters)
 
-HD = Holodoppler(backend = "cupy_ramdisk", pipeline_version = "old")
+HD = Holodoppler(backend = "numpy", pipeline_version = "old")
 
-HD.load_file("D:\\STAGE\\260113_AUZ0752_2.holo")
+HD.load_file(r"D:\PROJETS\DATA\AUZ.holo")
 
 print("file header :", HD.file_header)
 
