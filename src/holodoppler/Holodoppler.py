@@ -1095,6 +1095,51 @@ class Holodoppler:
             stream_h2d.synchronize()
 
             cp.cuda.Device().synchronize()
+
+        elif self.backend == "numpy multiprocessing":
+            import numpy as np
+            from concurrent.futures import ProcessPoolExecutor, as_completed
+            from multiprocessing import cpu_count
+
+            def process_batch(args):
+                i, first_frame, parameters, self_state = args
+                try:
+                    frames = self_state.read_frames(first_frame + i * parameters["batch_stride"], parameters["batch_size"])
+                    res = self_state.render_moments(parameters, frames=frames)
+                    if res is None:
+                        return i, None
+                    M0, M1, M2, *debug_imgs = res
+                    shift_y = shift_x = None
+                    if parameters["image_registration"]:
+                        M0_ff = self_state._flatfield(M0, parameters["registration_flatfield_gw"])
+                        shift_y, shift_x = self_state._registration(self_state.M0_reg, M0_ff, parameters["registration_disc_ratio"])
+                        M0 = self_state._roll2d(M0, shift_y, shift_x, np)
+                        M1 = self_state._roll2d(M1, shift_y, shift_x, np)
+                        M2 = self_state._roll2d(M2, shift_y, shift_x, np)
+                    return i, (M0, M1, M2, debug_imgs, shift_y, shift_x)
+                except Exception:
+                    traceback.print_exc()
+                    return i, None
+
+            out_list = [None] * num_batch
+            debug_list = [None] * num_batch
+
+            with ProcessPoolExecutor(max_workers=cpu_count()) as pool:
+                futures = {pool.submit(process_batch, (i, first_frame, parameters, self)): i for i in range(num_batch)}
+                for fut in tqdm(as_completed(futures), total=num_batch):
+                    i, result = fut.result()
+                    if result is None:
+                        for f in futures: f.cancel()
+                        break
+                    M0, M1, M2, debug_imgs, shift_y, shift_x = result
+                    out_list[i] = np.stack([M0, M1, M2], axis=2)
+                    debug_list[i] = debug_imgs
+                    if shift_y is not None:
+                        reg_list.append((shift_y, shift_x))
+
+            out_list = [x for x in out_list if x is not None]
+            debug_list = {i: v for i, v in enumerate(debug_list) if v is not None}
+            
         else:
             for i in tqdm(range(num_batch)):
 

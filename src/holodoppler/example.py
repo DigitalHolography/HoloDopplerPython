@@ -9,7 +9,7 @@ with open(r"./src/holodoppler/default_parameters.json") as f :
     
 print("parameters :", parameters)
 
-HD = Holodoppler(backend = "numpy", pipeline_version = "old")
+HD = Holodoppler(backend = "numpy multiprocessing", pipeline_version = "old")
 
 HD.load_file(r"D:\PROJETS\DATA\AUZ.holo")
 
