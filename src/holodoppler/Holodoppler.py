@@ -5,7 +5,9 @@ from tqdm import tqdm
 import cv2
 import json
 import os
-
+import threading
+import queue
+import time
 import cinereader
 
 import matplotlib.pyplot as plt
@@ -718,6 +720,74 @@ class Holodoppler:
             raise ValueError("Mode index not implemented")
         return Z
     
+    def _get_legendre_mode(self, mode_index, Nx, Ny):
+        xp = self.xp
+
+        # Grid in [-1, 1]
+        x = xp.linspace(-1, 1, Nx)
+        y = xp.linspace(-1, 1, Ny)
+        X, Y = xp.meshgrid(x, y)
+
+        # --- Legendre polynomials (up to order 5) ---
+        def P0(t): return xp.ones_like(t)
+        def P1(t): return t
+        def P2(t): return 0.5 * (3*t**2 - 1)
+        def P3(t): return 0.5 * (5*t**3 - 3*t)
+        def P4(t): return (1/8) * (35*t**4 - 30*t**2 + 3)
+        def P5(t): return (1/8) * (63*t**5 - 70*t**3 + 15*t)
+
+        # Precompute
+        Px = [P0(X), P1(X), P2(X), P3(X), P4(X), P5(X)]
+        Py = [P0(Y), P1(Y), P2(Y), P3(Y), P4(Y), P5(Y)]
+
+        Z = xp.zeros_like(X)
+
+        # Mode mapping (similar spirit to Zernike ordering)
+        if mode_index == 1:
+            Z = Px[0] * Py[0]  # piston
+        elif mode_index == 2:
+            Z = Px[1] * Py[0]  # tilt X
+        elif mode_index == 3:
+            Z = Px[0] * Py[1]  # tilt Y
+        elif mode_index == 4:
+            Z = Px[2] * Py[0]  # defocus-like (X)
+        elif mode_index == 5:
+            Z = Px[1] * Py[1]  # astig-like (diagonal)
+        elif mode_index == 6:
+            Z = Px[0] * Py[2]  # defocus-like (Y)
+        elif mode_index == 7:
+            Z = Px[3] * Py[0]
+        elif mode_index == 8:
+            Z = Px[2] * Py[1]
+        elif mode_index == 9:
+            Z = Px[1] * Py[2]
+        elif mode_index == 10:
+            Z = Px[0] * Py[3]
+        elif mode_index == 11:
+            Z = Px[4] * Py[0]
+        elif mode_index == 12:
+            Z = Px[3] * Py[1]
+        elif mode_index == 13:
+            Z = Px[2] * Py[2]
+        elif mode_index == 14:
+            Z = Px[1] * Py[3]
+        elif mode_index == 15:
+            Z = Px[0] * Py[4]
+        elif mode_index == 16:
+            Z = Px[5] * Py[0]
+        elif mode_index == 17:
+            Z = Px[4] * Py[1]
+        elif mode_index == 18:
+            Z = Px[3] * Py[2]
+        elif mode_index == 19:
+            Z = Px[2] * Py[3]
+        elif mode_index == 20:
+            Z = Px[1] * Py[4]
+        elif mode_index == 21:
+            Z = Px[0] * Py[5]
+        else:
+            raise ValueError("Mode index not implemented")
+    
     def _shack_hartmann_zernike(self, ny, nx, pixel_pitch_y, pixel_pitch_x, wavelength, shifts_y, shifts_x, zernike_modes):
         xp = self.xp
         def make_G_gradient_zernike_matrix(Ny, Nx, mode_indices, n_sub_x, n_sub_y, dx, dy):
@@ -872,6 +942,114 @@ class Holodoppler:
             self.fft.fft2(frames * self.kernels["Fresnel"] * phase_term, axes=(-1, -2), norm="ortho"), axes=(-1, -2)
         )
 
+    # ------------------------------------------------------------
+    # Render tools for debug and visualization
+    # ------------------------------------------------------------
+    
+    class FigureCanvasAgg:
+        def __init__(self, fig):
+            self.fig = fig
+            self.canvas = FigureCanvasAgg(fig)
+
+        def draw(self):
+            self.canvas.draw()
+
+        def get_image(self):
+            width, height = self.canvas.get_width_height()
+            return np.frombuffer(self.canvas.tostring_rgb(), dtype=np.uint8).reshape(height, width, 3)
+        
+    class PhasePlotter:
+        def __init__(self, title="Wavefront Phase", cmap="twilight", figsize=(6, 6), dpi=100):
+            self.fig, self.ax = plt.subplots(figsize=figsize, dpi=dpi)
+            self.canvas = FigureCanvasAgg(self.fig)
+            self.title = title
+            self.cmap = cmap
+
+        def plot(self, phase):
+            self.ax.clear()
+            self.ax.set_title(self.title)
+            im = self.ax.imshow((phase.get() + np.pi) % (2*np.pi) - np.pi, cmap=self.cmap)
+            self.fig.colorbar(im, ax=self.ax, fraction=0.029, pad=0.04)
+            self.ax.set_aspect('equal')
+            self.canvas.draw()
+            img = np.frombuffer(self.canvas.tostring_rgb(), dtype=np.uint8).reshape(self.canvas.get_width_height()[::-1] + (3,))
+            return img
+        
+    class ShiftsPlotter:
+        def __init__(self, title="Wavefront Slopes from Sub-aperture Shifts", figsize=(8, 6), dpi=100, scale=50):
+            self.fig, self.ax = plt.subplots(figsize=figsize, dpi=dpi)
+            self.canvas = FigureCanvasAgg(self.fig)
+            self.title = title
+            self.scale = scale
+
+        def plot(self, shifts_y, shifts_x):
+            self.ax.clear()
+            ny_subabs, nx_subabs = shifts_y.shape
+            X, Y = np.meshgrid(np.arange(nx_subabs), np.arange(ny_subabs))
+            self.ax.quiver(X, Y, shifts_x.get(), shifts_y.get(), scale=self.scale)
+            self.ax.set_title(self.title)
+            self.ax.set_xlabel('Sub-aperture X Index')
+            self.ax.set_ylabel('Sub-aperture Y Index')
+            self.ax.set_xlim(-0.5, nx_subabs - 0.5)
+            self.ax.set_ylim(-0.5, ny_subabs - 0.5)
+            self.ax.grid(True, linestyle='--', alpha=0.7)
+            self.ax.set_aspect('equal')
+            self.canvas.draw()
+            img = np.frombuffer(self.canvas.tostring_rgb(), dtype=np.uint8).reshape(self.canvas.get_width_height()[::-1] + (3,))
+            return img
+        
+        class SubapertureMontagePlotter:
+            def __init__(self, figsize=(12, 8), dpi=100):
+                self.fig, self.ax = plt.subplots(figsize=figsize, dpi=dpi)
+                self.canvas = FigureCanvasAgg(self.fig)
+
+            def plot(self, U_subaps):
+                rows = []
+                for iy in range(U_subaps.shape[0]):
+                    row_imgs = [self.xp.asnumpy(U_subaps[iy, ix]) for ix in range(U_subaps.shape[1])]
+                    rows.append(np.hstack(row_imgs))
+                montage_img = np.vstack(rows)
+                self.ax.clear()
+                self.ax.imshow(montage_img, cmap='gray')
+                self.ax.axis('off')
+                self.ax.set_title('Montage of Sub-apertures')
+                self.canvas.draw()
+                img = np.frombuffer(self.canvas.tostring_rgb(), dtype=np.uint8).reshape(self.canvas.get_width_height()[::-1] + (3,))
+                return img
+
+        class DebugQueue:
+            def __init__(self, maxsize=32, drop_if_full=True, worker_fn=None):
+                self.q = queue.Queue(maxsize=maxsize)
+                self.drop_if_full = drop_if_full
+                self.worker_fn = worker_fn or self._default_worker
+                self._stop_event = threading.Event()
+                self.thread = threading.Thread(target=self._run, daemon=True)
+
+            def start(self):
+                self.thread.start()
+
+            def stop(self):
+                self._stop_event.set()
+                self.thread.join()
+
+            def push(self, item):
+                try:
+                    self.q.put(item, block=not self.drop_if_full, timeout=0.01)
+                except queue.Full:
+                    # Drop silently (debug must not block pipeline)
+                    pass
+
+            def _run(self):
+                while not self._stop_event.is_set():
+                    try:
+                        item = self.q.get(timeout=0.1)
+                        self.worker_fn(item)
+                    except queue.Empty:
+                        continue
+
+            def _default_worker(self, item):
+                # Fallback behavior: just print metadata
+                print(f"[DEBUG] Received item: {type(item)}")
     # ------------------------------------------------------------
     # One batch full pipeline
     # ------------------------------------------------------------
@@ -1318,7 +1496,7 @@ class Holodoppler:
                 if tup is not None:
                     for i, img in enumerate(tup):
                         streams[i].append(img if img is not None else np.zeros_like(streams[i][0] if streams[i] else img))
-            
+            import numpy as np
             vid_debug = [np.stack(stream, axis=2) for stream in streams if stream]
         else:
             vid_debug = None
