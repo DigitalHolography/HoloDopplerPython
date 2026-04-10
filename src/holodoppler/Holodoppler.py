@@ -32,11 +32,16 @@ except Exception:
 
 import scipy.fft as np_fft
 from scipy.ndimage import gaussian_filter as np_gaussian_filter
+from scipy.ndimage import gaussian_filter1d
 from matlab_imresize.imresize import imresize
 import scipy.ndimage as np_ndi
 from scipy.interpolate import griddata
 import scipy.fftpack as np_fftpack
 from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+import numpy as np
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import cpu_count
 
 class Holodoppler:
     """
@@ -1275,9 +1280,7 @@ class Holodoppler:
             cp.cuda.Device().synchronize()
 
         elif self.backend == "numpy multiprocessing":
-            import numpy as np
-            from concurrent.futures import ProcessPoolExecutor, as_completed
-            from multiprocessing import cpu_count
+            
 
             print("CPU count :" , cpu_count)
 
@@ -1365,7 +1368,12 @@ class Holodoppler:
             vid_debug = [np.stack(stream, axis=2) for stream in streams if stream]
         else:
             vid_debug = None
-            
+
+        if parameters["accumulation"] > 1:
+            acc = parameters["accumulation"] 
+            ny, nx, nimgs, nt = vid.shape
+            vid = self.xp.reshape(vid[:,:,:,:(nt//acc)*acc],(ny, nx, nimgs, nt//acc, acc)) @ self.xp.ones(acc)
+
         if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel":
             zernike_coefs = self._to_numpy(vid_debug[4]) if vid_debug and len(vid_debug) > 4 else None
         else:
@@ -1414,81 +1422,66 @@ class Holodoppler:
                 elif self.ext == ".cine":
                     f.create_dataset("cine_metadata", data=json.dumps(self.cine_metadata_json, default=json_serializer))
 
-        if h5_path is not None:
-            save_to_h5path(h5_path, np.permute_dims(v, (3, 0, 1, 2)), parameters, reg_list if parameters["image_registration"] else None, zernike_coefs)
-
-        if mp4_path is not None:
-            pass
         if holodoppler_path is True:
-            # make the new directory at the same level as the input file with its name then _HD{idx} where idx is the number of existing holodoppler output directories for this file
+            # make the new directory at the same level as the input file with its name then _HD{idx} where idx is the max index of existing holodoppler output directories for this file + 1
             base_name = os.path.splitext(os.path.basename(self.file_path))[0]
             dir_name = f"{base_name}_HD_"
             parent_dir = os.path.dirname(self.file_path)
             existing_dirs = [d for d in os.listdir(parent_dir) if os.path.isdir(os.path.join(parent_dir, d)) and d.startswith(dir_name)]
-            idx = len(existing_dirs) + 1    
+            existing_indices = [int(directory.split('_')[-1]) for directory in existing_dirs]
+            idx = max(existing_indices) + 1 if len(existing_dirs) > 0 else 1 
             holodoppler_dir_name = f"{dir_name}{idx}"
             holodoppler_path = os.path.join(parent_dir, holodoppler_dir_name)
             os.makedirs(holodoppler_path, exist_ok=True)
             # make a png, mp4 json and h5 sub directories with their respective content
             png_dir = os.path.join((holodoppler_path), "png")
             mp4_dir = os.path.join((holodoppler_path), "mp4")
+            avi_dir = os.path.join((holodoppler_path), "avi")
             json_dir = os.path.join((holodoppler_path), "json")
             h5_dir = os.path.join((holodoppler_path), "raw")
             print(f"Saving output to: {holodoppler_path}")
             os.makedirs(png_dir, exist_ok=True)
             os.makedirs(mp4_dir, exist_ok=True)
+            os.makedirs(avi_dir, exist_ok=True)
             os.makedirs(json_dir, exist_ok=True)
             os.makedirs(h5_dir, exist_ok=True)
             # save pngs
             for i in range(vid.shape[2]):
                 plt.imsave(os.path.join(png_dir, f"moment_{i}.png"), np.mean(vid[:, :, i, :],axis=2), cmap="gray")
             # save m0 as mp4 and avi
-            vid_norm = vid[:, :, 0, :]  # shape (H, W, T)
-            vid_norm = vid_norm.astype(np.float32)
-            vid_norm = (vid_norm - vid_norm.min()) / (vid_norm.max() - vid_norm.min())
-            vid_norm = (vid_norm * 255).astype(np.uint8)
-            # save mp4
-            height, width = vid.shape[0], vid.shape[1]
-            duration = 1/parameters["sampling_freq"] * (end_frame-first_frame) 
-            fps = num_batch / duration
-            out_mp4 = cv2.VideoWriter(os.path.join(mp4_dir, "moment_0.mp4"),cv2.VideoWriter_fourcc(*'mp4v'),fps,(width, height),isColor=False)
-            for i in range(num_batch):
-                frame = vid_norm[:, :, i]
-                out_mp4.write(frame)
-            out_mp4.release()
-            # save avi
-            out_avi = cv2.VideoWriter(os.path.join(mp4_dir, "moment_0.avi"),cv2.VideoWriter_fourcc(*'XVID'),fps,(width, height),isColor=False)
-            for i in range(num_batch):
-                frame = vid_norm[:, :, i]
-                out_avi.write(frame)
-            out_avi.release()
-            #save debug mp4s if they exist
+            def normalize(arr):
+                arr = arr.astype(np.float32)
+                lo, hi = arr.min(), arr.max()
+                return ((arr - lo) / (hi - lo) * 255).astype(np.uint8) if hi > lo else arr.astype(np.uint8)
+
+
+            def temporal_gaussian(arr, sigma):
+                if sigma == 0 :
+                    return arr
+                return gaussian_filter1d(arr.astype(np.float32), sigma=sigma, axis=2)
+
+
+            def write_video(path, frames, fps, fourcc, is_color=False):
+                h, w, n = frames.shape[0], frames.shape[1], frames.shape[2]
+                out = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fourcc), fps, (w, h), isColor=is_color)
+                for i in range(n):
+                    out.write(frames[:, :, i] if frames.ndim == 3 else frames[:, :, i, :])
+                out.release()
+
+
+            def save_pair(stem, frames, fps, mp4_dir, avi_dir, sigma = 4.0, is_color=False):
+                frames = normalize(temporal_gaussian(frames, sigma))
+                write_video(os.path.join(mp4_dir, f"{stem}.mp4"), frames, min(fps, 65), "mp4v", is_color)
+                write_video(os.path.join(avi_dir, f"{stem}.avi"), frames, min(fps, 65), "XVID", is_color)
+
+            fps = num_batch / (end_frame - first_frame) * parameters["sampling_freq"]
+
+            save_pair("moment_0", vid[:, :, 0, :], fps, mp4_dir, avi_dir)
+
             if vid_debug is not None:
                 for idx, v in enumerate(vid_debug):
-                    print(v.shape)
-                    height, width = v.shape[0], v.shape[1]
-                    isColor = (v.ndim == 4 and v.shape[3] == 3)
-                    if not isColor and (v.max() - v.min()) > 0:
-                        v = v.astype(np.float32)
-                        v = (v - v.min()) / (v.max() - v.min())
-                        v = (v * 255).astype(np.uint8)
-                    duration = 1 / parameters["sampling_freq"] * (end_frame - first_frame)
-                    fps = num_batch / duration
-                    out_avi = cv2.VideoWriter(
-                        os.path.join(mp4_dir, f"debug_{idx}.avi"),
-                        cv2.VideoWriter_fourcc(*'XVID'),
-                        fps,
-                        (width, height),
-                        isColor=isColor
-                    )
-                    for i in range(num_batch):
-                        
-                        if v.ndim == 3:
-                            frame = v[:, :, i]  # (H, W)
-                        else:
-                            frame = v[:, :, i, :]  # (H, W, 3)
-                        out_avi.write(frame)
-                    out_avi.release()
+                    save_pair(f"debug_{idx}", v, fps, mp4_dir, avi_dir, sigma=0, is_color=v.ndim == 4)
+
             # save json
             with open(os.path.join(json_dir, "parameters.json"), "w") as f:
                 json.dump(parameters, f, indent=4)
