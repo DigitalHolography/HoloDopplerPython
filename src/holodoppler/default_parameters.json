@@ -10,7 +10,7 @@
   "wavelength": 8.52e-7,
   "pixel_pitch": 2e-5,
   "spatial_propagation": "Fresnel",
-  "z": 0.6,
+  "z": 0.480,
   "sampling_freq": 37037,
   "low_freq": 6000,
   "high_freq": 18300,
