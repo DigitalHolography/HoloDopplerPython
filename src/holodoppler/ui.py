@@ -24,23 +24,27 @@ class ParameterForm(ttk.Frame):
         self._variables: dict[str, tk.Variable] = {}
         self._definitions = parameter_definitions()
 
-        canvas = tk.Canvas(self, highlightthickness=0)
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
-        self._content = ttk.Frame(canvas, padding=12)
+        self._canvas = tk.Canvas(
+            self,
+            highlightthickness=0,
+            borderwidth=0,
+        )
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self._canvas.yview)
+        self._content = ttk.Frame(self._canvas, padding=12)
 
         self._content.bind(
             "<Configure>",
-            lambda event: canvas.configure(scrollregion=canvas.bbox("all")),
+            lambda event: self._canvas.configure(scrollregion=self._canvas.bbox("all")),
         )
-        canvas.bind(
+        self._canvas.bind(
             "<Configure>",
-            lambda event: canvas.itemconfigure(content_window, width=event.width),
+            lambda event: self._canvas.itemconfigure(content_window, width=event.width),
         )
 
-        content_window = canvas.create_window((0, 0), window=self._content, anchor="nw")
-        canvas.configure(yscrollcommand=scrollbar.set)
+        content_window = self._canvas.create_window((0, 0), window=self._content, anchor="nw")
+        self._canvas.configure(yscrollcommand=scrollbar.set)
 
-        canvas.grid(row=0, column=0, sticky="nsew")
+        self._canvas.grid(row=0, column=0, sticky="nsew")
         scrollbar.grid(row=0, column=1, sticky="ns")
 
         self.columnconfigure(0, weight=1)
@@ -78,7 +82,41 @@ class ParameterForm(ttk.Frame):
             self._variables[definition.name] = variable
 
         self._content.columnconfigure(1, weight=1)
+        self._install_mousewheel_support()
         self.set_parameters(load_builtin_parameters())
+
+    def _install_mousewheel_support(self) -> None:
+        self.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self.bind_all("<Button-4>", self._on_mousewheel, add="+")
+        self.bind_all("<Button-5>", self._on_mousewheel, add="+")
+
+    def _is_descendant(self, widget: tk.Misc | None) -> bool:
+        current = widget
+        while current is not None:
+            if current is self:
+                return True
+            current = current.master
+        return False
+
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        hovered_widget = self.winfo_containing(self.winfo_pointerx(), self.winfo_pointery())
+        if not self._is_descendant(hovered_widget):
+            return
+
+        if getattr(event, "num", None) == 4:
+            step = -1
+        elif getattr(event, "num", None) == 5:
+            step = 1
+        else:
+            delta = getattr(event, "delta", 0)
+            if delta == 0:
+                return
+            if abs(delta) >= 120:
+                step = -int(delta / 120)
+            else:
+                step = -1 if delta > 0 else 1
+
+        self._canvas.yview_scroll(step, "units")
 
     def set_parameters(self, parameters: ProcessingParameters) -> None:
         parameter_dict = parameters.to_dict()
@@ -101,7 +139,7 @@ class HolodopplerApp(tk.Tk):
         self.geometry("1080x760")
         self.minsize(960, 680)
 
-        sv_ttk.set_theme("light")
+        sv_ttk.set_theme("dark")
 
         self._worker_queue: queue.Queue[tuple[str, object]] = queue.Queue()
         self._worker_thread: threading.Thread | None = None
@@ -130,10 +168,15 @@ class HolodopplerApp(tk.Tk):
 
         title_frame = ttk.Frame(root)
         title_frame.pack(fill="x")
-        ttk.Label(title_frame, text="Holodoppler Runner", font=("Segoe UI", 18, "bold")).pack(anchor="w")
+        ttk.Label(
+            title_frame,
+            text="Holodoppler Runner",
+            font=("Segoe UI", 18, "bold"),
+        ).pack(anchor="w")
         ttk.Label(
             title_frame,
             text="Processes .holo files directly, recursively through folders, or from zip archives.",
+            font=("Segoe UI", 11),
         ).pack(anchor="w", pady=(4, 0))
 
         notebook = ttk.Notebook(root)
@@ -147,7 +190,11 @@ class HolodopplerApp(tk.Tk):
         self._build_run_tab(run_tab)
         self._build_advanced_tab(advanced_tab)
 
-        status_bar = ttk.Label(root, textvariable=self.status_var, anchor="w")
+        status_bar = ttk.Label(
+            root,
+            textvariable=self.status_var,
+            anchor="w",
+        )
         status_bar.pack(fill="x", pady=(12, 0))
 
     def _build_run_tab(self, parent: ttk.Frame) -> None:
@@ -219,23 +266,25 @@ class HolodopplerApp(tk.Tk):
         runtime_frame = ttk.LabelFrame(parent, text="Runtime", padding=12)
         runtime_frame.pack(fill="x", pady=(16, 0))
 
-        ttk.Label(runtime_frame, text="Backend").grid(row=0, column=0, sticky="w", pady=4)
-        ttk.Combobox(
+        ttk.Label(runtime_frame, text="Backend").grid(row=0, column=0, sticky="w", padx=(0, 10), pady=4)
+        backend_combo = ttk.Combobox(
             runtime_frame,
             textvariable=self.backend_var,
             values=("numpy", "cupy"),
             state="readonly",
             width=18,
-        ).grid(row=0, column=1, sticky="w", pady=4)
+        )
+        backend_combo.grid(row=0, column=1, sticky="w", padx=(0, 28), pady=4)
 
-        ttk.Label(runtime_frame, text="Pipeline version").grid(row=0, column=2, sticky="w", padx=(24, 0), pady=4)
-        ttk.Combobox(
+        ttk.Label(runtime_frame, text="Pipeline version").grid(row=0, column=2, sticky="w", padx=(0, 10), pady=4)
+        pipeline_combo = ttk.Combobox(
             runtime_frame,
             textvariable=self.pipeline_version_var,
             values=("latest", "old"),
             state="readonly",
             width=18,
-        ).grid(row=0, column=3, sticky="w", pady=4)
+        )
+        pipeline_combo.grid(row=0, column=3, sticky="w", padx=(0, 16), pady=4)
 
         self.run_button = ttk.Button(runtime_frame, text="Run Processing", command=self._run_processing)
         self.run_button.grid(row=0, column=4, sticky="e", padx=(24, 0))
