@@ -1377,7 +1377,6 @@ class Holodoppler:
             vid = self.xp.reshape(vid[:,:,:,:(nt//acc)*acc],(ny, nx, nimgs, nt//acc, acc)) @ self.xp.ones(acc)
 
         if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel":
-            print("Zernike coefficients (radians):", zernike_coefs)
             zernike_coefs = self._to_numpy(zernike_coefs) if zernike_coefs else None
         else:
             zernike_coefs = None
