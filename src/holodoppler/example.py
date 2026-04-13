@@ -1,11 +1,9 @@
 from holodoppler.Holodoppler import Holodoppler
-import json
+from holodoppler.config import load_builtin_parameters
 import os
 import matplotlib.pyplot as plt
 
-with open("C:\\Users\\Ivashka\\Documents\\Python\\Holodoppler\\src\\holodoppler\\default_parameters.json") as f :
-    x = f.read()
-    parameters = json.loads(x)
+parameters = load_builtin_parameters().to_dict()
     
 print("parameters :", parameters)
 

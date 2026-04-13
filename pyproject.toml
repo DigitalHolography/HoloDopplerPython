@@ -1,7 +1,11 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "holodoppler"
 version = "0.1.0"
-description = "Add your description here"
+description = "Holodoppler processing toolkit with CLI and Tkinter UI"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -13,9 +17,15 @@ dependencies = [
   "h5py",
   "opencv-python",
   "cinereader>=1.4.3",
+  "sv-ttk>=2.6.1",
 ]
+
+[project.scripts]
+holodoppler = "holodoppler.cli:main"
+holodoppler-ui = "holodoppler.ui:launch_app"
 
 [tool.setuptools.packages.find]
 where = ["src"]
 
-
+[tool.setuptools.package-data]
+holodoppler = ["settings/*.json"]
