@@ -1,11 +1,9 @@
 from holodoppler.Holodoppler import Holodoppler
-import json
+from holodoppler.config import load_builtin_parameters
 import os
 import matplotlib.pyplot as plt
 
-with open("default_parameters.json") as f :
-    x = f.read()
-    parameters = json.loads(x)
+parameters = load_builtin_parameters().to_dict()
 
 parameters["spatial_propagation"] = "AngularSpectrum"
 parameters["z"] = 0.4

@@ -1,6 +1,8 @@
 def main():
-    print("Hello from holodoppler!")
+    from holodoppler.cli import main as cli_main
+
+    return cli_main()
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
