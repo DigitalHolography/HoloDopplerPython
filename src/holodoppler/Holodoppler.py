@@ -1356,8 +1356,9 @@ class Holodoppler:
 
             if len(out_list) == 0:
                 return None
-
-        vid = self.xp.stack(out_list, axis=3)
+        zernike_coefs = [tup[4][0] for tup in debug_list if tup is not None and tup[4] is not None]
+        
+        vid = self.xp.stack(out_list, axis=3) # TODO improve this part for coefs zernike that ae not really debug images
         if debug_list[0][0] is not None:
             streams = [[], [], [], [], []]
             for tup in debug_list:
@@ -1367,6 +1368,7 @@ class Holodoppler:
             import numpy as np
             vid_debug = [np.stack(stream, axis=2) for stream in streams if stream]
         else:
+            
             vid_debug = None
 
         if parameters["accumulation"] > 1:
@@ -1375,7 +1377,8 @@ class Holodoppler:
             vid = self.xp.reshape(vid[:,:,:,:(nt//acc)*acc],(ny, nx, nimgs, nt//acc, acc)) @ self.xp.ones(acc)
 
         if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel":
-            zernike_coefs = self._to_numpy(vid_debug[4]) if vid_debug and len(vid_debug) > 4 else None
+            print("Zernike coefficients (radians):", zernike_coefs)
+            zernike_coefs = self._to_numpy(zernike_coefs) if zernike_coefs else None
         else:
             zernike_coefs = None
 
@@ -1470,13 +1473,16 @@ class Holodoppler:
 
 
             def save_pair(stem, frames, fps, mp4_dir, avi_dir, sigma = 4.0, is_color=False):
-                frames = normalize(temporal_gaussian(frames, sigma))
+                # frames = temporal_gaussian(frames, sigma) # removing for clarity only raw output
+                frames = normalize(frames)
                 write_video(os.path.join(mp4_dir, f"{stem}.mp4"), frames, min(fps, 65), "mp4v", is_color)
                 write_video(os.path.join(avi_dir, f"{stem}.avi"), frames, min(fps, 65), "XVID", is_color)
 
             fps = num_batch / (end_frame - first_frame) * parameters["sampling_freq"]
 
             save_pair("moment_0", vid[:, :, 0, :], fps, mp4_dir, avi_dir)
+            save_pair("moment_1", vid[:, :, 1, :], fps, mp4_dir, avi_dir)
+            save_pair("moment_2", vid[:, :, 2, :], fps, mp4_dir, avi_dir)
 
             if vid_debug is not None:
                 for idx, v in enumerate(vid_debug):
