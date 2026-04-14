@@ -13,7 +13,7 @@ print("parameters :", parameters)
 
 HD = Holodoppler(backend="cupy", pipeline_version="old")
 
-HD.load_file(r"Y:\260113_IOP_BP\260113_AUZ0752_1.holo")
+HD.load_file(r"D:\Data\260113_AUZ0752_1.holo")
 
 print("file header :", HD.file_header)
 
