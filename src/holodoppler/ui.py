@@ -9,6 +9,7 @@ from tkinter.scrolledtext import ScrolledText
 
 import sv_ttk
 
+from holodoppler.Holodoppler import cupy_backend_status
 from holodoppler.config import (
     available_builtin_settings,
     export_builtin_setting,
@@ -154,6 +155,7 @@ class HolodopplerApp(tk.Tk):
         self.backend_var = tk.StringVar(value="numpy")
         self.pipeline_version_var = tk.StringVar(value="latest")
         self.status_var = tk.StringVar(value="Ready")
+        self._cupy_backend_ready, self._cupy_backend_message = cupy_backend_status()
 
         builtin_settings = available_builtin_settings()
         self.builtin_setting_var = tk.StringVar(
@@ -161,6 +163,8 @@ class HolodopplerApp(tk.Tk):
         )
 
         self._build_layout()
+        if not self._cupy_backend_ready and self._cupy_backend_message:
+            self._append_log(f"CuPy unavailable: {self._cupy_backend_message}")
         self._update_parameter_source_state()
         self.after(150, self._poll_worker_queue)
 
@@ -272,7 +276,7 @@ class HolodopplerApp(tk.Tk):
         backend_combo = ttk.Combobox(
             runtime_frame,
             textvariable=self.backend_var,
-            values=("numpy", "cupy"),
+            values=("numpy", "cupy") if self._cupy_backend_ready else ("numpy",),
             state="readonly",
             width=18,
         )
@@ -291,6 +295,13 @@ class HolodopplerApp(tk.Tk):
         self.run_button = ttk.Button(runtime_frame, text="Run Processing", command=self._run_processing)
         self.run_button.grid(row=0, column=4, sticky="e", padx=(24, 0))
         runtime_frame.columnconfigure(4, weight=1)
+
+        if not self._cupy_backend_ready and self._cupy_backend_message:
+            ttk.Label(
+                runtime_frame,
+                text="CuPy is unavailable in this environment. NumPy processing remains available.",
+                wraplength=640,
+            ).grid(row=1, column=0, columnspan=5, sticky="w", pady=(8, 0))
 
         log_frame = ttk.LabelFrame(parent, text="Log", padding=12)
         log_frame.pack(fill="both", expand=True, pady=(16, 0))
