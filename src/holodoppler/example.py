@@ -3,15 +3,17 @@ import json
 import os
 import matplotlib.pyplot as plt
 
-with open("C:\\Users\\Ivashka\\Documents\\Python\\Holodoppler\\src\\holodoppler\\default_parameters.json") as f :
+with open(
+    r"D:\Witty077_Repo\HoloDopplerPython\src\holodoppler\default_parameters.json"
+) as f:
     x = f.read()
     parameters = json.loads(x)
-    
+
 print("parameters :", parameters)
 
-HD = Holodoppler(backend = "cupy", pipeline_version = "old")
+HD = Holodoppler(backend="cupy", pipeline_version="old")
 
-HD.load_file("Z:\\260326\\260326_SEG.holo")
+HD.load_file(r"Y:\260113_IOP_BP\260113_AUZ0752_1.holo")
 
 print("file header :", HD.file_header)
 
@@ -22,6 +24,6 @@ print("file header :", HD.file_header)
 
 # HD.render_moments(parameters)
 
-desktop = os.path.join(os.path.join(os.path.expanduser('~')), 'Desktop') 
+desktop = os.path.join(os.path.join(os.path.expanduser("~")), "Desktop")
 
-HD.process_moments_(parameters, holodoppler_path = True)
+HD.process_moments_(parameters, holodoppler_path=True)
