@@ -16,6 +16,8 @@ uv sync
 uv pip install -e .
 ```
 
+GPU acceleration uses the CUDA 12 CuPy wheel (`cupy-cuda12x`). If the CUDA 12 runtime DLLs are not available on your machine, keep the backend on `numpy`.
+
 ## Builtin Settings Library
 
 The packaged settings library currently includes `default_parameters.json`.
@@ -67,6 +69,8 @@ Launch the desktop app:
 ```bash
 uv run holodoppler ui
 ```
+
+The UI only offers the `cupy` backend when the CUDA FFT runtime is available.
 
 The `Run` tab lets you:
 

@@ -14,6 +14,8 @@ import matplotlib.pyplot as plt
 # Optional CuPy support
 # ------------------------------------------------------------
 
+_cupy_import_error = None
+_cupy_runtime_status = None
 
 
 try:
@@ -21,10 +23,41 @@ try:
     import cupyx.scipy.fft as cp_fft
     from cupyx.scipy.ndimage import gaussian_filter as cp_gaussian_filter
     _cupy_available = True
-except Exception:
+except Exception as exc:
     cp = None
     cp_fft = None
+    cp_gaussian_filter = None
     _cupy_available = False
+    _cupy_import_error = exc
+
+
+def cupy_backend_status():
+    global _cupy_runtime_status
+
+    if _cupy_runtime_status is not None:
+        return _cupy_runtime_status
+
+    if not _cupy_available:
+        message = "CuPy could not be imported."
+        if _cupy_import_error is not None:
+            message = f"{message} {type(_cupy_import_error).__name__}: {_cupy_import_error}"
+        _cupy_runtime_status = (False, message)
+        return _cupy_runtime_status
+
+    try:
+        from cupy.cuda import cufft as _cupy_cufft  # noqa: F401
+    except Exception as exc:
+        _cupy_runtime_status = (
+            False,
+            "CuPy is installed, but the CUDA FFT runtime could not be loaded. "
+            "Install a CUDA toolkit/runtime that matches the installed CuPy wheel, "
+            "or switch to the numpy backend. "
+            f"Original error: {type(exc).__name__}: {exc}",
+        )
+        return _cupy_runtime_status
+
+    _cupy_runtime_status = (True, None)
+    return _cupy_runtime_status
 
 import scipy.fft as np_fft
 from scipy.ndimage import gaussian_filter as np_gaussian_filter
@@ -70,8 +103,9 @@ class Holodoppler:
     def _init_backend(self):
 
         if self.backend == "cupy":
-            if not _cupy_available:
-                raise RuntimeError("CuPy backend requested but CuPy is not available.")
+            cupy_ready, cupy_error = cupy_backend_status()
+            if not cupy_ready:
+                raise RuntimeError(cupy_error or "CuPy backend requested but CuPy is not available.")
             self.xp = cp
             self.fft = cp_fft
             self.gaussian_filter = cp_gaussian_filter
@@ -388,8 +422,13 @@ class Holodoppler:
     # ------------------------------------------------------------
 
     def resize_fft2_slicewise(self, img, new_h, new_w):
-        xp = self.xp
-        fft = np_fft
+        if cp is not None and isinstance(img, cp.ndarray):
+            xp = cp
+            fft = cp_fft
+        else:
+            xp = np
+            fft = np_fft
+
         img = img.astype(xp.float32)
 
         h, w = img.shape[:2]
