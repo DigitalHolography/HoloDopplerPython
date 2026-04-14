@@ -13,6 +13,7 @@ dependencies = [
   "h5py",
   "opencv-python",
   "cinereader>=1.4.3",
+  "line-profiler>=5.0.2",
 ]
 
 [tool.setuptools.packages.find]

@@ -15,11 +15,11 @@ import matplotlib.pyplot as plt
 # ------------------------------------------------------------
 
 
-
 try:
     import cupy as cp
     import cupyx.scipy.fft as cp_fft
     from cupyx.scipy.ndimage import gaussian_filter as cp_gaussian_filter
+
     _cupy_available = True
 except Exception:
     cp = None
@@ -33,7 +33,7 @@ from matlab_imresize.imresize import imresize
 
 class Holodoppler:
     """
-    Holodoppler processing class for .holo files. 
+    Holodoppler processing class for .holo files.
         adding support for .cine files.
 
     Backend:
@@ -45,7 +45,7 @@ class Holodoppler:
 
     HOLO_HEADER_SIZE = 64
 
-    def __init__(self, backend = "numpy", pipeline_version = "latest"):
+    def __init__(self, backend="numpy", pipeline_version="latest"):
 
         self.file_path = ""
 
@@ -80,7 +80,7 @@ class Holodoppler:
             self.xp = np
             self.fft = np_fft
             self.gaussian_filter = np_gaussian_filter
-            
+
     def _to_backend(self, arr):
         if self.backend == "cupy":
             return cp.asarray(arr)
@@ -93,12 +93,16 @@ class Holodoppler:
 
     def _init_pipeline(self):
         if self.pipeline_version == "latest":
-            self._frequency_symmetric_filtering = self._new_frequency_symmetric_filtering
+            self._frequency_symmetric_filtering = (
+                self._new_frequency_symmetric_filtering
+            )
             self._resize = self.resize_fft2_slicewise
             self._registration = self.new_registration
             return
         elif self.pipeline_version == "old":
-            self._frequency_symmetric_filtering = self._old_frequency_symmetric_filtering
+            self._frequency_symmetric_filtering = (
+                self._old_frequency_symmetric_filtering
+            )
             self._resize = self.resize_matlab_slicewise
             self._registration = self.old_registration
             self._moment = self._momentkHz
@@ -118,6 +122,7 @@ class Holodoppler:
 
         if ext == ".holo":
             self.ext = ext
+
             def _extract_holo_footer(f, w, h, numframes):
                 offset = w * h * numframes + 64
                 f.seek(offset)
@@ -129,10 +134,11 @@ class Holodoppler:
                     return json.loads(footer_str)
                 except Exception:
                     return {}
+
             self.fid = open(self.file_path, "rb")
             header = self.fid.read(self.HOLO_HEADER_SIZE)
             file_header = dict()
-            file_header["magic_number"] = ''.join(list(map(chr, header[0:4])))
+            file_header["magic_number"] = "".join(list(map(chr, header[0:4])))
             file_header["version"] = int.from_bytes(header[4:6], "little")
             file_header["bit_depth"] = int.from_bytes(header[6:8], "little")
             file_header["width"] = int.from_bytes(header[8:12], "little")
@@ -141,7 +147,12 @@ class Holodoppler:
             file_header["total_size"] = int.from_bytes(header[20:28], "little")
             file_header["endianness"] = header[28]
 
-            self.file_footer = _extract_holo_footer(self.fid, file_header["width"], file_header["height"], file_header["num_frames"])
+            self.file_footer = _extract_holo_footer(
+                self.fid,
+                file_header["width"],
+                file_header["height"],
+                file_header["num_frames"],
+            )
             self.file_header = file_header
             self.read_frames = self.read_frames_holo
 
@@ -160,20 +171,31 @@ class Holodoppler:
     # ------------------------------------------------------------
 
     def read_frames_cine(self, first_frame, frame_size):
-        _, images, _ = cinereader.read(self.file_path, self.cine_metadata.FirstImageNo + first_frame, frame_size)
+        _, images, _ = cinereader.read(
+            self.file_path, self.cine_metadata.FirstImageNo + first_frame, frame_size
+        )
         frames = np.stack(images, axis=0)
         return self._to_backend(frames)
-    
+
     def read_frames_holo(self, first_frame, frame_size):
 
         try:
-
             byte_begin = (
                 self.HOLO_HEADER_SIZE
-                + self.file_header["width"] * self.file_header["height"] * first_frame * self.file_header["bit_depth"] // 8
+                + self.file_header["width"]
+                * self.file_header["height"]
+                * first_frame
+                * self.file_header["bit_depth"]
+                // 8
             )
 
-            byte_size = self.file_header["width"] * self.file_header["height"] * frame_size * self.file_header["bit_depth"] // 8
+            byte_size = (
+                self.file_header["width"]
+                * self.file_header["height"]
+                * frame_size
+                * self.file_header["bit_depth"]
+                // 8
+            )
 
             self.fid.seek(byte_begin)
             raw_bytes = self.fid.read(byte_size)
@@ -183,18 +205,20 @@ class Holodoppler:
             elif self.file_header["bit_depth"] == 16:
                 utyp = np.uint16
             else:
-                raise RuntimeError("Unsupported bit depth : Supported bit depth are 8 bits or 16 bits")
+                raise RuntimeError(
+                    "Unsupported bit depth : Supported bit depth are 8 bits or 16 bits"
+                )
 
             if self.file_header["endianness"] == 1:
-                utyp = utyp.newbyteorder('<')
+                utyp = utyp.newbyteorder("<")
 
             out = np.frombuffer(raw_bytes, dtype=utyp)
 
             out = out.reshape(
-                (frame_size,self.file_header["height"], self.file_header["width"]),
-                order="C"
+                (frame_size, self.file_header["height"], self.file_header["width"]),
+                order="C",
             )
-            
+
             return self._to_backend(out)
 
         except Exception:
@@ -205,10 +229,7 @@ class Holodoppler:
     # Calculation kernels
     # ------------------------------------------------------------
 
-    def _build_fresnel_kernel(self,
-                              z,
-                              pixel_pitch,
-                              wavelength, ny, nx):
+    def _build_fresnel_kernel(self, z, pixel_pitch, wavelength, ny, nx):
 
         if isinstance(pixel_pitch, (float, int)):
             pixel_pitch = (pixel_pitch, pixel_pitch)
@@ -222,16 +243,13 @@ class Holodoppler:
 
         X, Y = xp.meshgrid(x, y)
 
-        kernel = xp.exp(
-            1j * xp.pi / (wavelength * z) * (X ** 2 + Y ** 2)
-        ).astype(xp.complex64)
+        kernel = xp.exp(1j * xp.pi / (wavelength * z) * (X**2 + Y**2)).astype(
+            xp.complex64
+        )
 
         self.kernels["Fresnel"] = kernel[xp.newaxis, ...]
 
-    def _build_angular_kernel(self,
-                              z,
-                              pixel_pitch,
-                              wavelength, ny, nx):
+    def _build_angular_kernel(self, z, pixel_pitch, wavelength, ny, nx):
 
         if isinstance(pixel_pitch, (float, int)):
             pixel_pitch = (pixel_pitch, pixel_pitch)
@@ -246,8 +264,11 @@ class Holodoppler:
         v = (xp.arange(1, int(ny) + 1) - 1 - xp.round(ny / 2)) * dv
         U, V = xp.meshgrid(u, v)
         kernel = xp.exp(
-            2j * xp.pi * z / wavelength *
-            xp.sqrt(1.0 - (wavelength * U) ** 2 - (wavelength * V) ** 2)
+            2j
+            * xp.pi
+            * z
+            / wavelength
+            * xp.sqrt(1.0 - (wavelength * U) ** 2 - (wavelength * V) ** 2)
         )
 
         self.kernels["AngularSpectrum"] = kernel[xp.newaxis, ...]
@@ -259,18 +280,23 @@ class Holodoppler:
     def _fresnel_transform(self, frames):
 
         return self.fft.fftshift(
-            self.fft.fft2(frames *self.kernels["Fresnel"], axes=(-1, -2), norm="ortho"), axes=(-1, -2)
+            self.fft.fft2(
+                frames * self.kernels["Fresnel"], axes=(-1, -2), norm="ortho"
+            ),
+            axes=(-1, -2),
         )
-    
+
     def _angular_spectrum_transform(self, frames):
 
-        tmp = self.fft.fft2(frames,axes=(-1, -2), norm="ortho") * self.fft.fftshift(self.kernels["AngularSpectrum"],axes=(-1, -2))
+        tmp = self.fft.fft2(frames, axes=(-1, -2), norm="ortho") * self.fft.fftshift(
+            self.kernels["AngularSpectrum"], axes=(-1, -2)
+        )
 
-        return self.fft.ifft2(tmp,axes=(-1, -2), norm="ortho")
+        return self.fft.ifft2(tmp, axes=(-1, -2), norm="ortho")
 
     def _fourier_time_transform(self, H):
 
-        return self.fft.fft(H, axis=0, norm="ortho") 
+        return self.fft.fft(H, axis=0, norm="ortho")
 
     # ------------------------------------------------------------
     # SVD filtering
@@ -285,7 +311,7 @@ class Holodoppler:
         xp = self.xp
 
         sz = H.shape
-        H2 = H.reshape((sz[0],sz[-1] * sz[-2])).T
+        H2 = H.reshape((sz[0], sz[-1] * sz[-2])).T
 
         cov = H2.conj().T @ H2
 
@@ -303,7 +329,9 @@ class Holodoppler:
     # Frequency axis and masks
     # ------------------------------------------------------------
 
-    def _new_frequency_symmetric_filtering(self, batch_size, sampling_freq, low_freq, high_freq = None):
+    def _new_frequency_symmetric_filtering(
+        self, batch_size, sampling_freq, low_freq, high_freq=None
+    ):
 
         xp = self.xp
 
@@ -316,12 +344,12 @@ class Holodoppler:
             idxs = (high_freq > xp.abs(freqs)) & (xp.abs(freqs) > low_freq)
 
         return idxs, freqs[idxs]
-    
-    def _old_frequency_symmetric_filtering(self, batch_size, fs, f1, f2 = None):
+
+    def _old_frequency_symmetric_filtering(self, batch_size, fs, f1, f2=None):
         # old and not clean but similar to matlab version
 
         if f2 is None:
-            f2 = fs/2
+            f2 = fs / 2
 
         # convert frequencies to indices
         n1 = int(np.ceil(f1 * batch_size / fs))
@@ -337,9 +365,9 @@ class Holodoppler:
 
         # convert to Python indexing (0-based)
         i1 = n1 - 1
-        i2 = n2      # exclusive
+        i2 = n2  # exclusive
         i3 = n3 - 1
-        i4 = n4      # exclusive
+        i4 = n4  # exclusive
 
         # frequency ranges (MATLAB inclusive -> +1 in Python)
         f_range = np.arange(n1, n2 + 1) * (fs / batch_size)
@@ -362,27 +390,25 @@ class Holodoppler:
 
         xp = self.xp
 
-        return xp.sum(
-            A * (freqs[... ,xp.newaxis, xp.newaxis] ** n),
-            axis=0
-        ).astype(xp.float32)
-        
+        return xp.sum(A * (freqs[..., xp.newaxis, xp.newaxis] ** n), axis=0).astype(
+            xp.float32
+        )
+
     def _momentkHz(self, A, freqs, n):
 
         xp = self.xp
 
         return xp.sum(
-            A * ((freqs[... ,xp.newaxis, xp.newaxis] / 1000) ** n),
-            axis=0
+            A * ((freqs[..., xp.newaxis, xp.newaxis] / 1000) ** n), axis=0
         ).astype(xp.float32)
-    
+
     # ------------------------------------------------------------
     # Flatfielding for registration
     # ------------------------------------------------------------
 
     def _flatfield(self, A, gaussian_width):
-        return A / self.gaussian_filter(A,gaussian_width)
-    
+        return A / self.gaussian_filter(A, gaussian_width)
+
     # ------------------------------------------------------------
     # Resizing for square output
     # ------------------------------------------------------------
@@ -411,21 +437,21 @@ class Holodoppler:
             F_new = xp.zeros((new_h, new_w), dtype=F.dtype)
 
             h_min, w_min = min(h, new_h), min(w, new_w)
-            ho, wo = (h - h_min)//2, (w - w_min)//2
-            hn, wn = (new_h - h_min)//2, (new_w - w_min)//2
+            ho, wo = (h - h_min) // 2, (w - w_min) // 2
+            hn, wn = (new_h - h_min) // 2, (new_w - w_min) // 2
 
-            F_new[hn:hn+h_min, wn:wn+w_min] = F[ho:ho+h_min, wo:wo+w_min]
+            F_new[hn : hn + h_min, wn : wn + w_min] = F[
+                ho : ho + h_min, wo : wo + w_min
+            ]
 
-            resized = fft.ifft2(
-                fft.ifftshift(F_new)
-            ).real
+            resized = fft.ifft2(fft.ifftshift(F_new)).real
 
             resized *= (new_h * new_w) / (h * w)
 
             out[:, :, i] = resized
 
         return out.reshape(new_h, new_w, *rest)
-    
+
     def resize_matlab_slicewise(self, img, new_h, new_w):
         xp = np
         img = img.astype(xp.float32)
@@ -470,7 +496,7 @@ class Holodoppler:
         f_moving = xp.fft.fft2(moving)
         cross_power = f_moving * f_fixed.conj()
         # Normalize to avoid division by zero
-        cross_power /= (xp.abs(cross_power) + 1e-12)
+        cross_power /= xp.abs(cross_power) + 1e-12
         return xp.fft.ifft2(cross_power)
 
     @staticmethod
@@ -478,17 +504,21 @@ class Holodoppler:
         fa = xp.fft.fft2(a)
         fb = xp.fft.fft2(b)
         return xp.fft.ifft2(fa * xp.conj(fb))
-    
+
     @staticmethod
     def _roll2d(img, peak_y, peak_x, xp):
-        return xp.roll(xp.roll(img, peak_y, axis = -2), peak_x, axis = -1)
+        return xp.roll(xp.roll(img, peak_y, axis=-2), peak_x, axis=-1)
 
     def new_registration(self, fixed, moving, radius):
         ny, nx = fixed.shape
 
         xp = self.xp
 
-        mask = self._elliptical_mask(ny, nx, radius, xp) if radius else xp.ones((ny, nx), dtype=bool)
+        mask = (
+            self._elliptical_mask(ny, nx, radius, xp)
+            if radius
+            else xp.ones((ny, nx), dtype=bool)
+        )
 
         # lo_f, hi_f = xp.percentile(fixed[mask], (0.2, 99.8))
         # _fixed = xp.clip(fixed, lo_f, hi_f)
@@ -515,10 +545,14 @@ class Holodoppler:
 
         xp = self.xp
 
-        mask = self._elliptical_mask(ny, nx, radius, xp) if radius else xp.ones((ny, nx), dtype=bool)
+        mask = (
+            self._elliptical_mask(ny, nx, radius, xp)
+            if radius
+            else xp.ones((ny, nx), dtype=bool)
+        )
 
-        _fixed = self.gaussian_filter(fixed,1.5)
-        _moving = self.gaussian_filter(moving,1.5)
+        _fixed = self.gaussian_filter(fixed, 1.5)
+        _moving = self.gaussian_filter(moving, 1.5)
 
         fixed_c = (_fixed - xp.mean(_fixed[mask])) * mask
         moving_c = (_moving - xp.mean(_moving[mask])) * mask
@@ -540,22 +574,36 @@ class Holodoppler:
     # One batch full pipeline
     # ------------------------------------------------------------
 
-    def render_moments(self, parameters, frames = None):
+    def render_moments(self, parameters, frames=None):
 
         if frames is None:
-            frames = self.read_frames(parameters["first_frame"], parameters["batch_size"])
+            frames = self.read_frames(
+                parameters["first_frame"], parameters["batch_size"]
+            )
         if frames is None:
             raise RuntimeError("Could not read frames properly")
 
         nt, ny, nx = frames.shape
 
         if parameters["spatial_propagation"] == "Fresnel":
-            if (not "Fresnel" in self.kernels):
-                self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
+            if not "Fresnel" in self.kernels:
+                self._build_fresnel_kernel(
+                    parameters["z"],
+                    parameters["pixel_pitch"],
+                    parameters["wavelength"],
+                    ny,
+                    nx,
+                )
             holograms = self._fresnel_transform(frames)
         elif parameters["spatial_propagation"] == "AngularSpectrum":
-            if (not "AngularSpectrum" in self.kernels):
-                self._build_angular_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
+            if not "AngularSpectrum" in self.kernels:
+                self._build_angular_kernel(
+                    parameters["z"],
+                    parameters["pixel_pitch"],
+                    parameters["wavelength"],
+                    ny,
+                    nx,
+                )
             holograms = self._angular_spectrum_transform(frames)
 
         holograms_f = self._svd_filter(holograms, parameters["svd_threshold"])
@@ -563,9 +611,14 @@ class Holodoppler:
         spectrum_f = self._fourier_time_transform(holograms_f)
 
         # idxs, freqs = self._frequency_symmetric_filtering(frames.shape[-1], parameters["sampling_freq"], parameters["low_freq"])
-        idxs, freqs = self._old_frequency_symmetric_filtering(frames.shape[0], parameters["sampling_freq"], parameters["low_freq"], parameters["high_freq"])
+        idxs, freqs = self._old_frequency_symmetric_filtering(
+            frames.shape[0],
+            parameters["sampling_freq"],
+            parameters["low_freq"],
+            parameters["high_freq"],
+        )
 
-        psd = self.xp.abs(spectrum_f[idxs,:,:]) ** 2
+        psd = self.xp.abs(spectrum_f[idxs, :, :]) ** 2
 
         M0 = self._moment(psd, freqs, 0)
         M1 = self._moment(psd, freqs, 1)
@@ -577,9 +630,15 @@ class Holodoppler:
     # Full video processing
     # ------------------------------------------------------------
 
-    def process_moments_(self, parameters, h5_path = None, mp4_path = None, return_numpy = False, holodoppler_path = False):
-        
-        
+    def process_moments_(
+        self,
+        parameters,
+        h5_path=None,
+        mp4_path=None,
+        return_numpy=False,
+        holodoppler_path=False,
+    ):
+
         batch_size = parameters["batch_size"]
         batch_stride = parameters["batch_stride"]
         first_frame = parameters["first_frame"]
@@ -589,25 +648,26 @@ class Holodoppler:
                 end_frame = self.file_header["num_frames"]
             elif self.ext == ".cine":
                 end_frame = self.cine_metadata.ImageCount
-        
+
         # please do not remove it is good
-        if batch_stride >= (end_frame-first_frame):
-            if batch_size <= (end_frame-first_frame):
+        if batch_stride >= (end_frame - first_frame):
+            if batch_size <= (end_frame - first_frame):
                 num_batch = 1
             else:
                 num_batch = 0
         else:
-            num_batch = int((end_frame-first_frame) / batch_stride)
+            num_batch = int((end_frame - first_frame) / batch_stride)
 
         out_list = []
 
         if num_batch <= 0:
             return None
-        
-        
+
         if parameters["image_registration"]:
-            frames = self.read_frames(first_frame, parameters["batch_size_registration"]) # the first frame to be rendered
-            M0_reg, _, _ = self.render_moments(parameters, frames = frames)
+            frames = self.read_frames(
+                first_frame, parameters["batch_size_registration"]
+            )  # the first frame to be rendered
+            M0_reg, _, _ = self.render_moments(parameters, frames=frames)
             M0_reg = self._flatfield(M0_reg, parameters["registration_flatfield_gw"])
             reg_list = []
 
@@ -616,33 +676,26 @@ class Holodoppler:
             stream_compute = cp.cuda.Stream(non_blocking=True)
 
             # --- Prefetch first batch ---
-            frames_next = self.read_frames(
-                first_frame,
-                parameters["batch_size"]
-            )
+            frames_next = self.read_frames(first_frame, parameters["batch_size"])
 
             with stream_h2d:
                 d_frames_next = cp.asarray(frames_next)  # async if pinned
 
             for i in tqdm(range(num_batch)):
-
                 # Swap buffers
                 d_frames = d_frames_next
 
                 # --- Prefetch next batch (CPU side) ---
                 if i + 1 < num_batch:
-                    
                     with stream_h2d:
                         d_frames_next = self.read_frames(
-                        first_frame + (i + 1) * parameters["batch_stride"],
-                        parameters["batch_size"]
-                    )
+                            first_frame + (i + 1) * parameters["batch_stride"],
+                            parameters["batch_size"],
+                        )
 
                 # --- Compute current batch ---
                 with stream_compute:
                     res = self.render_moments(parameters, frames=d_frames)
-
-                
 
                 if res is None:
                     break
@@ -652,8 +705,12 @@ class Holodoppler:
                 # --- Register current batch ---
                 with stream_compute:
                     if parameters["image_registration"]:
-                        M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
-                        (shift_y, shift_x) = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
+                        M0_ff = self._flatfield(
+                            M0, parameters["registration_flatfield_gw"]
+                        )
+                        (shift_y, shift_x) = self._registration(
+                            M0_reg, M0_ff, parameters["registration_disc_ratio"]
+                        )
                         M0 = self._roll2d(M0, shift_y, shift_x, self.xp)
                         M1 = self._roll2d(M1, shift_y, shift_x, self.xp)
                         M2 = self._roll2d(M2, shift_y, shift_x, self.xp)
@@ -661,10 +718,7 @@ class Holodoppler:
 
                 stream_compute.synchronize()
 
-
-                out_list.append(
-                    cp.stack([M0, M1, M2], axis=2)
-                )
+                out_list.append(cp.stack([M0, M1, M2], axis=2))
 
             # Ensure transfers complete
             stream_h2d.synchronize()
@@ -672,12 +726,13 @@ class Holodoppler:
             cp.cuda.Device().synchronize()
         else:
             for i in tqdm(range(num_batch)):
-
                 try:
+                    frames = self.read_frames(
+                        first_frame + i * parameters["batch_stride"],
+                        parameters["batch_size"],
+                    )
 
-                    frames = self.read_frames(first_frame + i * parameters["batch_stride"] , parameters["batch_size"])
-
-                    res = self.render_moments(parameters, frames = frames)
+                    res = self.render_moments(parameters, frames=frames)
 
                     if res is None:
                         break
@@ -685,16 +740,18 @@ class Holodoppler:
                     M0, M1, M2 = res
 
                     if parameters["image_registration"]:
-                        M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
-                        (shift_y, shift_x) = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
+                        M0_ff = self._flatfield(
+                            M0, parameters["registration_flatfield_gw"]
+                        )
+                        (shift_y, shift_x) = self._registration(
+                            M0_reg, M0_ff, parameters["registration_disc_ratio"]
+                        )
                         M0 = self._roll2d(M0, shift_y, shift_x, self.xp)
                         M1 = self._roll2d(M1, shift_y, shift_x, self.xp)
                         M2 = self._roll2d(M2, shift_y, shift_x, self.xp)
                         reg_list.append((shift_y, shift_x))
 
-                    out_list.append(
-                        self.xp.stack([M0, M1, M2], axis=2)
-                    )
+                    out_list.append(self.xp.stack([M0, M1, M2], axis=2))
 
                 except Exception:
                     traceback.print_exc()
@@ -710,27 +767,29 @@ class Holodoppler:
             # vid = self.resize_fft2_slicewise(vid, m, m)
             vid = self._to_numpy(vid).astype(np.float64)
             vid = self._resize(vid, m, m)
-            
+
         if parameters["transpose"]:
             vid = self.xp.transpose(vid, axes=(1, 0, 2, 3))
-            
+
         if parameters["flip_x"]:
             vid = self.xp.flip(vid, axis=1)
-        
+
         if parameters["flip_y"]:
             vid = self.xp.flip(vid, axis=0)
 
         if (h5_path is not None) or (mp4_path is not None) or holodoppler_path:
             v = self._to_numpy(vid)
-            
-        def save_to_h5path(h5_path, v, parameters, reg_list = None):
+
+        def save_to_h5path(h5_path, v, parameters, reg_list=None):
             with h5py.File(h5_path, "w") as f:
                 f.create_dataset("moment0", data=v[:, :, :, 0])
                 f.create_dataset("moment1", data=v[:, :, :, 1])
                 f.create_dataset("moment2", data=v[:, :, :, 2])
                 f.create_dataset("HD_parameters", data=json.dumps(parameters))
                 if parameters["image_registration"]:
-                    f.create_dataset("registration", data=self._to_numpy(self.xp.array(reg_list)))
+                    f.create_dataset(
+                        "registration", data=self._to_numpy(self.xp.array(reg_list))
+                    )
 
                 def json_serializer(obj):
                     if isinstance(obj, np.ndarray):
@@ -738,13 +797,29 @@ class Holodoppler:
                     raise TypeError(f"Type {type(obj)} not serializable")
 
                 if self.ext == ".holo":
-                    f.create_dataset("holo_header", data=json.dumps(self.file_header, default=json_serializer))
-                    f.create_dataset("holo_footer", data=json.dumps(self.file_footer, default=json_serializer))
+                    f.create_dataset(
+                        "holo_header",
+                        data=json.dumps(self.file_header, default=json_serializer),
+                    )
+                    f.create_dataset(
+                        "holo_footer",
+                        data=json.dumps(self.file_footer, default=json_serializer),
+                    )
                 elif self.ext == ".cine":
-                    f.create_dataset("cine_metadata", data=json.dumps(self.cine_metadata_json, default=json_serializer))
+                    f.create_dataset(
+                        "cine_metadata",
+                        data=json.dumps(
+                            self.cine_metadata_json, default=json_serializer
+                        ),
+                    )
 
         if h5_path is not None:
-            save_to_h5path(h5_path, np.permute_dims(v, (3, 0, 1, 2)), parameters, reg_list if parameters["image_registration"] else None)
+            save_to_h5path(
+                h5_path,
+                np.permute_dims(v, (3, 0, 1, 2)),
+                parameters,
+                reg_list if parameters["image_registration"] else None,
+            )
 
         if mp4_path is not None:
             pass
@@ -753,8 +828,12 @@ class Holodoppler:
             base_name = os.path.splitext(os.path.basename(self.file_path))[0]
             dir_name = f"{base_name}_HD_"
             parent_dir = os.path.dirname(self.file_path)
-            existing_dirs = [d for d in os.listdir(parent_dir) if os.path.isdir(os.path.join(parent_dir, d)) and d.startswith(dir_name)]
-            idx = len(existing_dirs) + 1    
+            existing_dirs = [
+                d
+                for d in os.listdir(parent_dir)
+                if os.path.isdir(os.path.join(parent_dir, d)) and d.startswith(dir_name)
+            ]
+            idx = len(existing_dirs) + 1
             holodoppler_dir_name = f"{dir_name}{idx}"
             holodoppler_path = os.path.join(parent_dir, holodoppler_dir_name)
             os.makedirs(holodoppler_path, exist_ok=True)
@@ -770,22 +849,38 @@ class Holodoppler:
             os.makedirs(h5_dir, exist_ok=True)
             # save png
             for i in range(v.shape[2]):
-                plt.imsave(os.path.join(png_dir, f"moment_{i}.png"), np.mean(v[:, :, i, :],axis=2), cmap="gray")
+                plt.imsave(
+                    os.path.join(png_dir, f"moment_{i}.png"),
+                    np.mean(v[:, :, i, :], axis=2),
+                    cmap="gray",
+                )
             vid_norm = v[:, :, 0, :]  # shape (H, W, T)
             vid_norm = vid_norm.astype(np.float32)
             vid_norm = (vid_norm - vid_norm.min()) / (vid_norm.max() - vid_norm.min())
             vid_norm = (vid_norm * 255).astype(np.uint8)
             # save mp4
             height, width = v.shape[0], v.shape[1]
-            duration = 1/parameters["sampling_freq"] * (end_frame-first_frame) 
+            duration = 1 / parameters["sampling_freq"] * (end_frame - first_frame)
             fps = num_batch / duration
-            out_mp4 = cv2.VideoWriter(os.path.join(mp4_dir, "moment_0.mp4"),cv2.VideoWriter_fourcc(*'mp4v'),fps,(width, height),isColor=False)
+            out_mp4 = cv2.VideoWriter(
+                os.path.join(mp4_dir, "moment_0.mp4"),
+                cv2.VideoWriter_fourcc(*"mp4v"),
+                fps,
+                (width, height),
+                isColor=False,
+            )
             for i in range(num_batch):
                 frame = vid_norm[:, :, i]
                 out_mp4.write(frame)
             out_mp4.release()
             # save mp4
-            out_avi = cv2.VideoWriter(os.path.join(mp4_dir, "moment_0.avi"),cv2.VideoWriter_fourcc(*'XVID'),fps,(width, height),isColor=False)
+            out_avi = cv2.VideoWriter(
+                os.path.join(mp4_dir, "moment_0.avi"),
+                cv2.VideoWriter_fourcc(*"XVID"),
+                fps,
+                (width, height),
+                isColor=False,
+            )
             for i in range(num_batch):
                 frame = vid_norm[:, :, i]
                 out_avi.write(frame)
@@ -794,12 +889,17 @@ class Holodoppler:
             with open(os.path.join(json_dir, "parameters.json"), "w") as f:
                 json.dump(parameters, f, indent=4)
             # save h5
-            save_to_h5path(os.path.join(h5_dir, f"{holodoppler_dir_name}_output.h5"), np.permute_dims(v, (3, 1, 0, 2)), parameters, reg_list if parameters["image_registration"] else None)
+            save_to_h5path(
+                os.path.join(h5_dir, f"{holodoppler_dir_name}_output.h5"),
+                np.permute_dims(v, (3, 1, 0, 2)),
+                parameters,
+                reg_list if parameters["image_registration"] else None,
+            )
             # add a version.txt file with the version of the holodoppler pipeline used
             with open(os.path.join(holodoppler_path, "version.txt"), "w") as f:
                 f.write(f"Python:\n")
                 f.write(f"Holodoppler pipeline version: {self.pipeline_version}\n")
-                f.write(f"Holodoppler backend: {self.backend}\n") 
+                f.write(f"Holodoppler backend: {self.backend}\n")
 
         if return_numpy:
             return self._to_numpy(vid)
