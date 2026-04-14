@@ -81,7 +81,7 @@ class Holodoppler:
 
     def _init_backend(self):
 
-        if self.backend == "cupy" or self.backend == "cupy_ramdisk" or self.backend == "cupy_diagnostic":
+        if "cupy" in self.backend:
             if not _cupy_available:
                 raise RuntimeError("CuPy backend requested but CuPy is not available.")
             self.xp = cp
@@ -98,12 +98,12 @@ class Holodoppler:
             self.fftpack = np_fftpack
             
     def _to_backend(self, arr):
-        if self.backend == "cupy" or self.backend == "cupy_diagnostic" or self.backend == "cupy_ramdisk":
+        if "cupy" in self.backend:
             return cp.asarray(arr)
         return arr
 
     def _to_numpy(self, arr):
-        if self.backend == "cupy" or self.backend == "cupy_diagnostic" or self.backend == "cupy_ramdisk":
+        if "cupy" in self.backend:
             if isinstance(arr, cp.ndarray):
                 return arr.get() 
             return arr  # already NumPy or other type
@@ -1228,7 +1228,7 @@ class Holodoppler:
             )
 
             with stream_h2d:
-                d_frames_next = cp.asarray(frames_next)  # async if pinned
+                d_frames_next = cp.asarray(frames_next) 
 
             for i in tqdm(range(num_batch)):
 
@@ -1274,6 +1274,223 @@ class Holodoppler:
             stream_h2d.synchronize()
 
             cp.cuda.Device().synchronize()
+
+        elif self.backend == "cupyRAM":
+            import queue
+            import threading
+            import time
+            from collections import deque
+            
+            # Profiling data collection
+            profile_data = {
+                'read_times': deque(maxlen=100),  # Keep last 100 reads
+                'transfer_times': deque(maxlen=100),
+                'compute_times': deque(maxlen=100),
+                'registration_times': deque(maxlen=100),
+                'queue_wait_times': deque(maxlen=100),
+                'total_batch_times': deque(maxlen=100),
+                'queue_sizes': deque(maxlen=100),
+            }
+            
+            # Create queues for frames and results
+            frame_queue = queue.Queue(maxsize=4)  # Configurable queue depth
+            result_queue = queue.Queue()
+            
+            # Control flags
+            stop_reader = threading.Event()
+            reader_done = threading.Event()
+            
+            # Reader thread function - continuously reads frames
+            def reader_thread_func():
+                frame_idx = first_frame
+                batch_num = 0
+                
+                while batch_num < num_batch and not stop_reader.is_set():
+                    read_start = time.perf_counter()
+                    
+                    # Read frames
+                    frames = self.read_frames(frame_idx, batch_size)
+                    
+                    read_time = time.perf_counter() - read_start
+                    profile_data['read_times'].append(read_time)
+                    
+                    # Put into queue (will block if queue is full)
+                    queue_start = time.perf_counter()
+                    frame_queue.put((batch_num, frame_idx, frames))
+                    queue_time = time.perf_counter() - queue_start
+                    profile_data['queue_wait_times'].append(queue_time)
+                    
+                    # Track queue size
+                    profile_data['queue_sizes'].append(frame_queue.qsize())
+                    
+                    batch_num += 1
+                    frame_idx += batch_stride
+                
+                reader_done.set()
+            
+            # Start reader thread
+            reader_thread = threading.Thread(target=reader_thread_func, daemon=True)
+            reader_thread.start()
+            
+            # CUDA streams for async operations
+            stream_h2d = cp.cuda.Stream(non_blocking=True)
+            stream_compute = cp.cuda.Stream(non_blocking=True)
+            stream_registration = cp.cuda.Stream(non_blocking=True) if parameters["image_registration"] else None
+            
+            # Pre-start with first batch
+            first_batch_num, first_frame_idx, first_frames = frame_queue.get()
+            
+            # Async transfer to GPU
+            transfer_start = time.perf_counter()
+            with stream_h2d:
+                d_frames_current = cp.asarray(first_frames)
+            stream_h2d.synchronize()
+            transfer_time = time.perf_counter() - transfer_start
+            profile_data['transfer_times'].append(transfer_time)
+            
+            current_batch_num = first_batch_num
+            current_frame_idx = first_frame_idx
+            d_frames = d_frames_current
+            
+            # Main processing loop
+            processed_batches = 0
+            next_batch_prefetched = False
+            
+            for i in tqdm(range(num_batch)):
+                batch_start_time = time.perf_counter()
+                
+                # Check if we need to get next batch from queue
+                if not next_batch_prefetched and i > 0:
+                    queue_wait_start = time.perf_counter()
+                    next_batch_num, next_frame_idx, next_frames = frame_queue.get()
+                    queue_wait_time = time.perf_counter() - queue_wait_start
+                    profile_data['queue_wait_times'].append(queue_wait_time)
+                    
+                    # Async transfer next batch
+                    transfer_start = time.perf_counter()
+                    with stream_h2d:
+                        d_frames_next = cp.asarray(next_frames)
+                    stream_h2d.synchronize()
+                    transfer_time = time.perf_counter() - transfer_start
+                    profile_data['transfer_times'].append(transfer_time)
+                    
+                    next_batch_prefetched = True
+                
+                # Compute current batch
+                compute_start = time.perf_counter()
+                with stream_compute:
+                    res = self.render_moments(parameters, frames=d_frames)
+                
+                if res is None:
+                    break
+                
+                M0, M1, M2, *debug_imgs = res
+                compute_time = time.perf_counter() - compute_start
+                profile_data['compute_times'].append(compute_time)
+                
+                # Registration processing (if enabled)
+                if parameters["image_registration"]:
+                    reg_start = time.perf_counter()
+                    with stream_registration:
+                        M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
+                        (shift_y, shift_x) = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
+                        M0 = self._roll2d(M0, shift_y, shift_x, self.xp)
+                        M1 = self._roll2d(M1, shift_y, shift_x, self.xp)
+                        M2 = self._roll2d(M2, shift_y, shift_x, self.xp)
+                        reg_list.append((shift_y, shift_x))
+                    
+                    if stream_registration:
+                        stream_registration.synchronize()
+                    reg_time = time.perf_counter() - reg_start
+                    profile_data['registration_times'].append(reg_time)
+                
+                # Ensure compute is done
+                stream_compute.synchronize()
+                
+                # Store result
+                out_list.append(cp.stack([M0, M1, M2], axis=2))
+                debug_list[i] = debug_imgs
+                
+                # Swap buffers for next iteration
+                if next_batch_prefetched and i + 1 < num_batch:
+                    d_frames = d_frames_next
+                    current_batch_num = next_batch_num
+                    next_batch_prefetched = False
+                    processed_batches += 1
+                
+                # Profile total batch time
+                batch_time = time.perf_counter() - batch_start_time
+                profile_data['total_batch_times'].append(batch_time)
+            
+            # Signal reader to stop and wait for completion
+            stop_reader.set()
+            reader_thread.join(timeout=5)
+            
+            # Ensure all CUDA operations complete
+            stream_h2d.synchronize()
+            stream_compute.synchronize()
+            if stream_registration:
+                stream_registration.synchronize()
+            cp.cuda.Device().synchronize()
+            
+            # Print profiling summary
+            if parameters.get("enable_profiling", True):
+                print("\n" + "="*60)
+                print("PROFILING SUMMARY - cupyRAM Backend")
+                print("="*60)
+
+                import numpy as np
+                
+                def print_stats(name, times):
+                    if len(times) > 0:
+                        avg = np.mean(times) * 1000  # Convert to ms
+                        std = np.std(times) * 1000
+                        min_t = np.min(times) * 1000
+                        max_t = np.max(times) * 1000
+                        print(f"{name:20s}: Avg={avg:6.2f}ms ±{std:5.2f}ms, Min={min_t:6.2f}ms, Max={max_t:6.2f}ms")
+                    else:
+                        print(f"{name:20s}: No data")
+                
+                print_stats("File Read Time", profile_data['read_times'])
+                print_stats("Queue Wait Time", profile_data['queue_wait_times'])
+                print_stats("H2D Transfer Time", profile_data['transfer_times'])
+                print_stats("Compute Time", profile_data['compute_times'])
+                print_stats("Registration Time", profile_data['registration_times'])
+                print_stats("Total Batch Time", profile_data['total_batch_times'])
+                
+                if len(profile_data['queue_sizes']) > 0:
+                    avg_queue = np.mean(profile_data['queue_sizes'])
+                    max_queue = np.max(profile_data['queue_sizes'])
+                    print(f"\nQueue Statistics:")
+                    print(f"  Average Queue Size: {avg_queue:.1f}")
+                    print(f"  Max Queue Size: {max_queue}")
+                
+                # Calculate throughput
+                if len(profile_data['total_batch_times']) > 0:
+                    total_time = np.sum(profile_data['total_batch_times'])
+                    total_batches = len(profile_data['total_batch_times'])
+                    total_frames = total_batches * batch_size
+                    print(f"\nThroughput:")
+                    print(f"  Batches/sec: {total_batches/total_time:.2f}")
+                    print(f"  Frames/sec: {total_frames/total_time:.2f}")
+                    
+                    # Utilization metrics
+                    compute_total = np.sum(profile_data['compute_times'])
+                    read_total = np.sum(profile_data['read_times'])
+                    transfer_total = np.sum(profile_data['transfer_times'])
+                    
+                    if total_time > 0:
+                        print(f"\nUtilization (of total time):")
+                        print(f"  Compute: {compute_total/total_time*100:.1f}%")
+                        print(f"  File I/O: {read_total/total_time*100:.1f}%")
+                        print(f"  H2D Transfer: {transfer_total/total_time*100:.1f}%")
+                        
+                        # Overlap efficiency
+                        ideal_time = max(compute_total, read_total + transfer_total)
+                        overlap_efficiency = ideal_time / total_time * 100 if total_time > 0 else 0
+                        print(f"  Overlap Efficiency: {overlap_efficiency:.1f}%")
+                
+                print("="*60 + "\n")
 
         elif self.backend == "numpy multiprocessing":
             
