@@ -104,7 +104,9 @@ class Holodoppler:
 
     def _to_numpy(self, arr):
         if self.backend == "cupy" or self.backend == "cupy_diagnostic" or self.backend == "cupy_ramdisk":
-            return cp.asnumpy(arr)
+            if isinstance(arr, cp.ndarray):
+                return arr.get() 
+            return arr  # already NumPy or other type
         return arr
 
     def _init_pipeline(self):
@@ -182,7 +184,6 @@ class Holodoppler:
     
     def read_frames_holo(self, first_frame, frame_size, fid = None):
         
-
         try:
 
             if fid is None:
@@ -657,12 +658,9 @@ class Holodoppler:
             shifts_y[iy, ix] = shift_y
             shifts_x[iy, ix] = shift_x
             
-        # plot_shifts(shifts_y, shifts_x, nx_subabs, ny_subabs, title = "Wavefront Slopes from Sub-aperture Shifts", scale=50)
-
         shifts_y, shifts_x = filter_shifts_pupil(shifts_y, shifts_x, U_subabs.shape[-2], U_subabs.shape[-1], ny_subabs, nx_subabs, radius=1)
         shifts_y, shifts_x = filter_shifts_threshold(shifts_y, shifts_x, U_subabs.shape[-2], U_subabs.shape[-1], ny_subabs, nx_subabs, threshold=3)
         
-        # plot_shifts(shifts_y, shifts_x, nx_subabs, ny_subabs, title = "Wavefront Slopes from Sub-aperture Shifts", scale=50)
         return shifts_y, shifts_x
     
     def _get_zernike_mode2(self, mode_index, Nx, Ny, radius = 2.0):
@@ -1156,7 +1154,6 @@ class Holodoppler:
 
         spectrum_f = self._fourier_time_transform(holograms_f)
 
-        # idxs, freqs = self._frequency_symmetric_filtering(frames.shape[-1], parameters["sampling_freq"], parameters["low_freq"])
         idxs, freqs = self._frequency_symmetric_filtering(frames.shape[0], parameters["sampling_freq"], parameters["low_freq"], parameters["high_freq"])
 
         psd = self.xp.abs(spectrum_f[idxs,:,:]) ** 2
@@ -1166,13 +1163,12 @@ class Holodoppler:
         M2 = self._moment(psd, freqs, 2)
         
         if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel":
-            hologramsnotfixed
             hologramsnotfixed_f = self._svd_filter(hologramsnotfixed, parameters["svd_threshold"])
             spectrumnotfixed_f = self._fourier_time_transform(hologramsnotfixed_f)
             psdnotfixed = self.xp.abs(spectrumnotfixed_f[idxs,:,:]) ** 2
             M0notfixed = self._moment(psdnotfixed, freqs, 0)
             
-        c = self._to_numpy(coefs) if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and parameters["shack_hartmann_zernike_fit"] else None
+        c = coefs if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and parameters["shack_hartmann_zernike_fit"] else None
         if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" :
             if parameters["debug"]:
                 res = (M0, M1, M2, montage_img, shifts_img, phase_img, self._to_numpy(M0notfixed), [c])
@@ -1356,7 +1352,8 @@ class Holodoppler:
 
             if len(out_list) == 0:
                 return None
-        zernike_coefs = [tup[4][0] for tup in debug_list if tup is not None and tup[4] is not None]
+        import numpy as np
+        zernike_coefs = np.array([self._to_numpy(tup[4][0]) for tup in debug_list if tup is not None and tup[4] is not None])
         
         vid = self.xp.stack(out_list, axis=3) # TODO improve this part for coefs zernike that ae not really debug images
         if debug_list[0][0] is not None:
@@ -1377,7 +1374,7 @@ class Holodoppler:
             vid = self.xp.reshape(vid[:,:,:,:(nt//acc)*acc],(ny, nx, nimgs, nt//acc, acc)) @ self.xp.ones(acc)
 
         if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel":
-            zernike_coefs = self._to_numpy(zernike_coefs) if zernike_coefs else None
+            zernike_coefs = zernike_coefs
         else:
             zernike_coefs = None
 
