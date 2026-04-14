@@ -16,7 +16,7 @@ uv sync
 uv pip install -e .
 ```
 
-GPU acceleration uses the CUDA 12 CuPy wheel (`cupy-cuda12x`). If the CUDA 12 runtime DLLs are not available on your machine, keep the backend on `numpy`.
+GPU acceleration uses the CUDA 13 CuPy wheel (`cupy-cuda13x`). If the CUDA 13 runtime DLLs are not available on your machine, keep the backend on `numpy`.
 
 ## Builtin Settings Library
 
