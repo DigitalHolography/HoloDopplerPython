@@ -27,5 +27,5 @@
   "flip_y": false,
   "accumulation": 1,
   
-  "debug" : false
+  "debug" : true
 }
