@@ -1,18 +1,19 @@
 from holodoppler.Holodoppler import Holodoppler
 import json
 import os
+import numpy as np
 import matplotlib.pyplot as plt
 
-with open("C:\\Users\\Ivashka\\Documents\\Python\\HolodopplerPython\\src\\holodoppler\\default_parameters.json") as f :
+with open(r"./src/holodoppler/default_parameters.json") as f :
     x = f.read()
     parameters = json.loads(x)
     
 print("Using parameters :", parameters)
 
-HD = Holodoppler(backend = "cupy", pipeline_version = "old")
+HD = Holodoppler(backend = "cupyRAM", pipeline_version = "old")
 
 
-listpath = "path/to/list.txt"
+listpath = "C:\Users\Ivashka\Desktop\list_for_zernike.txt"
 
 for line in open(listpath, 'r'):
     file_path = line.strip()
