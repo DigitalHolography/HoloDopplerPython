@@ -1,6 +1,6 @@
 {
   "batch_size": 256,
-  "batch_stride": 256,
+  "batch_stride": 25600,
   "image_registration": true,
   "registration_disc_ratio": 0.8,
   "registration_flatfield_gw": 35,

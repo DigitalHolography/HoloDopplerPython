@@ -1359,7 +1359,13 @@ class Holodoppler:
                 if res is None:
                     break
                 
-                M0, M1, M2, *debug_imgs = res
+                M0, M1, M2 = res["M0"], res["M1"], res["M2"]
+                if parameters["debug"]:
+                    # debug_imgs = {k: res[k] for k in res if k not in ["M0", "M1", "M2"]}
+                    debugin_queue.put((i, res))
+                if "coefs" in res:
+                    coefs_list[i] = res["coefs"]
+                    
                 compute_time = time.perf_counter() - compute_start
                 profile_data['compute_times'].append(compute_time)
                 
@@ -1372,7 +1378,7 @@ class Holodoppler:
                         M0 = self._roll2d(M0, shift_y, shift_x, self.xp)
                         M1 = self._roll2d(M1, shift_y, shift_x, self.xp)
                         M2 = self._roll2d(M2, shift_y, shift_x, self.xp)
-                        reg_list.append((shift_y, shift_x))
+                        reg_list[i] = (shift_y, shift_x)
                     
                     if stream_registration:
                         stream_registration.synchronize()
@@ -1384,7 +1390,6 @@ class Holodoppler:
                 
                 # Store result
                 out_list.append(cp.stack([M0, M1, M2], axis=2))
-                debug_list[i] = debug_imgs
                 
                 # Swap buffers for next iteration
                 if next_batch_prefetched and i + 1 < num_batch:
@@ -1479,7 +1484,12 @@ class Holodoppler:
                     res = self_state.render_moments(parameters, frames=frames)
                     if res is None:
                         return i, None
-                    M0, M1, M2, *debug_imgs = res
+                    M0, M1, M2 = res["M0"], res["M1"], res["M2"]
+                    if parameters["debug"]:
+                        # debug_imgs = {k: res[k] for k in res if k not in ["M0", "M1", "M2"]}
+                        debugin_queue.put((i, res))
+                    if "coefs" in res:
+                        coefs_list[i] = res["coefs"]
                     shift_y = shift_x = None
                     if parameters["image_registration"]:
                         M0_ff = self_state._flatfield(M0, parameters["registration_flatfield_gw"])
@@ -1506,7 +1516,7 @@ class Holodoppler:
                     out_list[i] = np.stack([M0, M1, M2], axis=2)
                     debug_list[i] = debug_imgs
                     if shift_y is not None:
-                        reg_list.append((shift_y, shift_x))
+                        reg_list[i] = (shift_y, shift_x)
 
             out_list = [x for x in out_list if x is not None]
             debug_list = {i: v for i, v in enumerate(debug_list) if v is not None}
@@ -1523,7 +1533,12 @@ class Holodoppler:
                     if res is None:
                         break
 
-                    M0, M1, M2, *debug_imgs = res
+                    M0, M1, M2 = res["M0"], res["M1"], res["M2"]
+                    if parameters["debug"]:
+                        # debug_imgs = {k: res[k] for k in res if k not in ["M0", "M1", "M2"]}
+                        debugin_queue.put((i, res))
+                    if "coefs" in res:
+                        coefs_list[i] = res["coefs"]
 
                     if parameters["image_registration"]:
                         M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
@@ -1531,7 +1546,7 @@ class Holodoppler:
                         M0 = self._roll2d(M0, shift_y, shift_x, self.xp)
                         M1 = self._roll2d(M1, shift_y, shift_x, self.xp)
                         M2 = self._roll2d(M2, shift_y, shift_x, self.xp)
-                        reg_list.append((shift_y, shift_x))
+                        reg_list[i] = (shift_y, shift_x)
 
                     out_list.append(
                         self.xp.stack([M0, M1, M2], axis=2)
@@ -1600,16 +1615,18 @@ class Holodoppler:
         if (h5_path is not None) or (mp4_path is not None) or holodoppler_path:
             vid = self._to_numpy(vid)
             
-        def save_to_h5path(h5_path, v, parameters, reg_list = None, zernike_coefs = None):
+        def save_to_h5path(h5_path, v, parameters, reg_list = None, zernike_coefs = None, git_commit = None):
             with h5py.File(h5_path, "w") as f:
                 f.create_dataset("moment0", data=v[:, :, :, 0])
                 f.create_dataset("moment1", data=v[:, :, :, 1])
                 f.create_dataset("moment2", data=v[:, :, :, 2])
                 f.create_dataset("HD_parameters", data=json.dumps(parameters))
                 if parameters["image_registration"]:
+                    print("Saving registration data...", reg_list)
                     f.create_dataset("registration", data=self._to_numpy(self.xp.array(reg_list)))
                     
                 if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and zernike_coefs is not None:
+                    print("Saving Zernike coefficients...", zernike_coefs)
                     f.create_dataset("zernike_coefs_radians", data=self._to_numpy((zernike_coefs).astype(np.float64)))
 
                 def json_serializer(obj):
@@ -1622,6 +1639,8 @@ class Holodoppler:
                     f.create_dataset("holo_footer", data=json.dumps(self.file_footer, default=json_serializer))
                 elif self.ext == ".cine":
                     f.create_dataset("cine_metadata", data=json.dumps(self.cine_metadata_json, default=json_serializer))
+                if git_commit is not None:
+                    f.create_dataset("git_commit", data=git_commit)
 
         if holodoppler_path is True:
             # make the new directory at the same level as the input file with its name then _HD{idx} where idx is the max index of existing holodoppler output directories for this file + 1
@@ -1686,25 +1705,27 @@ class Holodoppler:
             # save json
             with open(os.path.join(json_dir, "parameters.json"), "w") as f:
                 json.dump(parameters, f, indent=4)
+                
+            # get git info 
+            # if git is available write the current commit hash
+            try:
+                import subprocess
+                git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
+                git_txt = "Git commit hash: " + git_commit + "\n"
+                # check if there are uncommited changes and add a warning if there are
+                git_status = subprocess.check_output(["git", "status", "--porcelain"]).decode("utf-8").strip()
+                if git_status:
+                    git_txt += "Warning: There are uncommited changes in the repository, the results may not be reproducible\n"
+            except Exception:
+                git_txt = "Git commit hash: Not available\n"
             # save h5
-            save_to_h5path(os.path.join(h5_dir, f"{holodoppler_dir_name}_output.h5"), np.permute_dims(vid, (3, 1, 0, 2)), parameters, reg_list if parameters["image_registration"] else None, zernike_coefs)
+            save_to_h5path(os.path.join(h5_dir, f"{holodoppler_dir_name}_output.h5"), np.permute_dims(vid, (3, 1, 0, 2)), parameters, reg_list if parameters["image_registration"] else None, zernike_coefs, git_commit=git_txt)
             # add a version.txt file with the version of the holodoppler pipeline used
             with open(os.path.join(holodoppler_path, "version.txt"), "w") as f:
                 f.write(f"Python:\n")
                 f.write(f"Holodoppler pipeline version: {self.pipeline_version}\n")
                 f.write(f"Holodoppler backend: {self.backend}\n") 
-                
-                # if git is available write the current commit hash
-                try:
-                    import subprocess
-                    git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
-                    f.write(f"Git commit hash: {git_commit}\n")
-                    # check if there are uncommited changes and add a warning if there are
-                    git_status = subprocess.check_output(["git", "status", "--porcelain"]).decode("utf-8").strip()
-                    if git_status:
-                        f.write("Warning: There are uncommited changes in the repository, the results may not be reproducible\n")
-                except Exception:
-                    f.write("Git commit hash: Not available\n")
+                f.write(f"{git_txt}")
 
         if return_numpy:
             return self._to_numpy(vid)
