@@ -15,13 +15,15 @@ HD.load_file(r"D:\PROJETS\DATA\260113_AUZ0752_2.holo")
 
 print("file header :", HD.file_header)
 
-# frames = HD.read_frames(0, 1)
+frames = HD.read_frames(0, 1)
 
-# plt.imshow(frames[:,:,0])
-# plt.show()
+res = HD.render_moments(parameters)
 
-# HD.render_moments(parameters)
+plt.imshow(frames[0,:,:].get())
+plt.show()
+plt.imshow(res["M0"].get())
+plt.show()
 
-desktop = os.path.join(os.path.join(os.path.expanduser('~')), 'Desktop') 
+# desktop = os.path.join(os.path.join(os.path.expanduser('~')), 'Desktop') 
 
-HD.process_moments_(parameters, holodoppler_path = True)
+# HD.process_moments_(parameters, holodoppler_path = True)

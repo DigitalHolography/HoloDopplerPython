@@ -218,7 +218,7 @@ class Holodoppler:
                 order="C"
             )
             
-            return self._to_backend(out)
+            return self._to_backend(out).astype(self.xp.float32)
 
         except Exception:
             traceback.print_exc()
@@ -547,138 +547,145 @@ class Holodoppler:
     # Shack-Hartmann wavefront reconstruction
     # ------------------------------------------------------------
 
-    def _shack_hartmann_constructsubapsimages(self, U0, dx, dy, wavelength, z_prop, f0, f1, fs, time_window, nx_subabs, ny_subabs, svd_threshold):
+    def _svd_filter_shack_hartmann(self, U_subaps, svd_threshold):
+        """Batched SVD filter for all subapertures at once (ny_sub, nx_sub, sub_ny, sub_nx, Nz)."""
+        xp = self.xp
+        if svd_threshold < 0:
+            return U_subaps
+
+        ny_s, nx_s, sub_ny, sub_nx, nz = U_subaps.shape
+        B = ny_s * nx_s
+
+        # (B, ny*nx, nz)
+        H2 = U_subaps.reshape(B, sub_ny * sub_nx, nz)
+
+        eps = 1e-12
+        # Batched covariance (B, nz, nz)
+        cov = xp.einsum('bpi,bpj->bij', H2.conj(), H2) + eps * xp.eye(nz, dtype=H2.dtype)
+
+        # eigh per subaperture (CuPy does not support batched eigh)
+        V_list = []
+        for b in range(B):
+            _, Vb = xp.linalg.eigh(cov[b])   # ascending order, (nz, nz)
+            V_list.append(Vb[:, ::-1])        # flip to descending, keep top-k
+        Vt = xp.stack([Vb[:, :svd_threshold] for Vb in V_list], axis=0)  # (B, nz, k)
+
+        # Project out tissue: H2 - (H2 @ Vt) @ Vt^H
+        H2_Vt = xp.einsum('bpi,bik->bpk', H2, Vt)            # (B, sub_ny*sub_nx, k)
+        proj   = xp.einsum('bpk,bjk->bpj', H2_Vt, Vt.conj()) # (B, sub_ny*sub_nx, nz)
+
+        return (H2 - proj).reshape(ny_s, nx_s, sub_ny, sub_nx, nz)
+
+    def _shack_hartmann_constructsubapsimages(self, U0, dx, dy, wavelength, z_prop, f0, f1, fs,
+                                           time_window, nx_subabs, ny_subabs, svd_threshold):
         RangePush("Shack-Hartmann subaperture construction")
         xp = self.xp
         Nz, Ny, Nx = U0.shape
-        nb_iter = Nz // time_window
-        idxs, _ = self._frequency_symmetric_filtering(time_window, fs, f0, high_freq = f1)
-        U_subaps_stack = xp.zeros((nb_iter, ny_subabs, nx_subabs, Ny // ny_subabs, Nx // nx_subabs), dtype=xp.float32)
+        sub_ny, sub_nx = Ny // ny_subabs, Nx // nx_subabs
+
+        idxs, _ = self._frequency_symmetric_filtering(time_window, fs, f0, high_freq=f1)
+
+        # --- Fresnel kernel (cached) ---
+        if "Fresnel" not in self.kernels:
+            self._build_fresnel_kernel(z_prop, dx, wavelength, Ny, Nx)
         Qin = self.kernels["Fresnel"]
-        for i in range(nb_iter):
-            start_idx = i * time_window
-            end_idx = start_idx + time_window
-            U_chunk = U0[start_idx:end_idx]     
-            U_prop_qin = U_chunk * Qin # if zernike_phase is None else U_filter * Qin * xp.exp(- 1j * zernike_phase)
-            U_subaps = xp.zeros((ny_subabs, nx_subabs, Ny // ny_subabs, Nx // nx_subabs), dtype=xp.float32)
-            for (iy, ix) in [(iy, ix) for iy in range(ny_subabs) for ix in range(nx_subabs)]:
-                y_start = iy * (Ny // ny_subabs)
-                y_end = y_start + (Ny // ny_subabs)
-                x_start = ix * (Nx // nx_subabs)
-                x_end = x_start + (Nx // nx_subabs)
-                U_subap = U_prop_qin[:, y_start:y_end, x_start:x_end]
-                U_subap_filtered = self._svd_filter(U_subap, svd_threshold)
-                U_prop_filtered = xp.fft.fft2(U_subap_filtered, axes=(-2, -1))
-                U_prop_filtered = xp.fft.fftshift(U_prop_filtered, axes=(-2, -1))
-                U_fourier = xp.fft.fft(U_prop_filtered, axis=0)
-                U_filter = U_fourier[idxs,:,:]
-                S = xp.abs(U_filter)**2
-                M0 = xp.mean(S, axis=0)
-                U_subaps[iy, ix] = (M0.astype(xp.float32)) #flatfield(M0.astype(xp.float32),15)
-            U_subaps_stack[i] = U_subaps
-        U_subaps = xp.mean(U_subaps_stack, axis=0)
+
+        # Fresnel-multiply once on full field
+        U_prop_qin = U0 * Qin  # (Nz, Ny, Nx)
+
+        # --- Crop to central region that tiles exactly into subapertures ---
+        crop_ny, crop_nx = sub_ny * ny_subabs, sub_nx * nx_subabs
+        y0, x0 = (Ny - crop_ny) // 2, (Nx - crop_nx) // 2
+        U_prop_qin = U_prop_qin[:, y0:y0 + crop_ny, x0:x0 + crop_nx]  # (Nz, crop_ny, crop_nx)
+
+        # Reshape into subapertures: (ny_s, nx_s, sub_ny, sub_nx, Nz)
+        U_subap_all = (U_prop_qin
+                    .reshape(Nz, ny_subabs, sub_ny, nx_subabs, sub_nx)
+                    .transpose(1, 3, 2, 4, 0))
+
+        # Batched SVD filter across all subapertures
+        U_subap_all = self._svd_filter_shack_hartmann(U_subap_all, svd_threshold)
+        # (ny_s, nx_s, sub_ny, sub_nx, Nz) -> (B, Nz, sub_ny, sub_nx)
+        B = ny_subabs * nx_subabs
+        U_subap_all = U_subap_all.reshape(B, sub_ny, sub_nx, Nz).transpose(0, 3, 1, 2)
+
+        # Batched FFT2 + temporal FFT
+        U_f2 = xp.fft.fftshift(xp.fft.fft2(U_subap_all, axes=(-2, -1)), axes=(-2, -1))  # (B, Nz, sub_ny, sub_nx)
+        U_ft = xp.fft.fft(U_f2, axis=1)[:, idxs, :, :]                                  # (B, |idxs|, sub_ny, sub_nx)
+
+        # Power spectrum mean over frequency band
+        M0 = xp.mean(xp.abs(U_ft) ** 2, axis=1)                                          # (B, sub_ny, sub_nx)
+        U_subaps = M0.reshape(ny_subabs, nx_subabs, sub_ny, sub_nx).astype(xp.float32)
+
         RangePop()
         return U_subaps
 
     def _shack_hartmann_registration(self, fixed, moving, radius):
+        """Phase-correlation registration with sub-pixel parabolic refinement."""
         RangePush("Shack-Hartmann registration")
         xp = self.xp
-        def parabolic_peak_1d(line, peak_idx):
-            v_m = line[peak_idx - 1]
-            v_0 = line[peak_idx]
-            v_p = line[peak_idx + 1]
-            denom = v_m - 2.0 * v_0 + v_p
-            delta = 0.5 * (v_m - v_p) / denom
-            return peak_idx + delta
-        def _elliptical_mask(ny, nx, radius_frac, xp):
-            radius_frac = max(0.0, min(2.0, float(radius_frac)))
-            a = (nx / 2) * radius_frac
-            b = (ny / 2) * radius_frac
+
+        def parabolic_peak_1d(line, idx):
+            vm, v0, vp = line[idx - 1], line[idx], line[idx + 1]
+            return idx + 0.5 * (vm - vp) / (vm - 2*v0 + vp)
+
+        def elliptical_mask(ny, nx, r, xp):
+            r = max(0.0, min(2.0, float(r)))
             Y, X = xp.ogrid[:ny, :nx]
-            cy, cx = ny / 2, nx / 2
-            mask = ((X - cx) / a) ** 2 + ((Y - cy) / b) ** 2 <= 1.0
-            return mask
-        def _xcorr2d(fixed, moving, xp):
-            f_fixed = xp.fft.fft2(fixed)
-            f_moving = xp.fft.fft2(moving)
-            cross_power = f_moving * f_fixed.conj()
-            # Normalize to avoid division by zero
-            cross_power /= (xp.abs(cross_power) + 1e-12)
-            return xp.fft.fftshift(xp.fft.ifft2(cross_power))
-        RangePush("Preprocessing for xcorr2D")
+            return ((X - nx/2) / (nx/2 * r))**2 + ((Y - ny/2) / (ny/2 * r))**2 <= 1.0
+
         ny, nx = fixed.shape
-        mask = _elliptical_mask(ny, nx, radius, xp) if radius else xp.ones((ny, nx), dtype=bool)
-        # lo_f, hi_f = xp.percentile(fixed[mask], (0.2, 99.8))
-        # _fixed = xp.clip(fixed, lo_f, hi_f)
-        # lo_m, hi_m = xp.percentile(moving[mask], (0.2, 99.8))
-        # _moving = xp.clip(moving, lo_m, hi_m)
-        # _moving = xp.clip(moving, lo_m, hi_m)
-        _fixed = fixed
-        _moving = moving
-        fixed_c = (_fixed - xp.mean(_fixed[mask])) * mask
-        moving_c = (_moving - xp.mean(_moving[mask])) * mask
-        RangePop()
-        RangePush("xcorr2D")
-        xcorr = xp.abs(_xcorr2d(fixed_c, moving_c, xp))
-        RangePop()
-        RangePush("ending registration")
-        peak_idx = xp.argmax(xcorr)	
-        peak_y, peak_x = xp.unravel_index(peak_idx, fixed.shape)
-        refined_y = parabolic_peak_1d(xcorr[:, peak_x], peak_y)
-        refined_x = parabolic_peak_1d(xcorr[peak_y, :], peak_x)
-        center_x = nx/2
-        center_y = ny/2
-        shift_x = refined_x - center_x
-        shift_y = refined_y - center_y
-        RangePop()
+        mask = elliptical_mask(ny, nx, radius, xp) if radius else xp.ones((ny, nx), dtype=bool)
+
+        # Zero-mean masked cross-correlation
+        fc = (fixed  - xp.mean(fixed [mask])) * mask
+        mc = (moving - xp.mean(moving[mask])) * mask
+        cp = xp.fft.fft2(mc) * xp.fft.fft2(fc).conj()
+        xcorr = xp.abs(xp.fft.fftshift(xp.fft.ifft2(cp / (xp.abs(cp) + 1e-12))))
+
+        py, px = xp.unravel_index(xp.argmax(xcorr), fixed.shape)
+        shift_y = parabolic_peak_1d(xcorr[:, px], py) - ny/2
+        shift_x = parabolic_peak_1d(xcorr[py, :], px) - nx/2
+
         RangePop()
         return xcorr, (shift_y, shift_x)
 
     def _shack_hartmann_displacement_calculation(self, U_subabs, xp, ref=None):
         RangePush("Shack-Hartmann displacement calculation")
-        
-                
-        def filter_shifts_pupil(shifts_y, shifts_x, Ny, Nx, sub_ny, sub_nx, radius=0.9):
-            shifts_y_c = xp.copy(shifts_y)
-            shifts_x_c = xp.copy(shifts_x)
-            x = xp.linspace(-1, 1, Nx)
-            y = xp.linspace(-1, 1, Ny)
-            for (iy, ix) in [(iy, ix) for iy in range(sub_ny) for ix in range(sub_nx)]:
-                if x[ix*(Nx//sub_nx) + (Nx//sub_nx)//2]**2+y[iy*(Ny//sub_ny) + (Ny//sub_ny)//2]**2 > radius**2:
-                    shifts_y_c[iy,ix], shifts_x_c[iy,ix] = xp.nan, xp.nan
-            return shifts_y_c, shifts_x_c	
-
-        def filter_shifts_threshold(shifts_y, shifts_x, Ny, Nx, sub_ny, sub_nx, threshold=0.9):
-            shifts_y_c = xp.copy(shifts_y)
-            shifts_x_c = xp.copy(shifts_x)
-
-            meanx = xp.nanmean(shifts_x,axis=(0,1))
-            meany = xp.nanmean(shifts_y,axis=(0,1))
-            stdx = xp.nanstd(shifts_x,axis=(0,1))
-            stdy = xp.nanstd(shifts_y,axis=(0,1))
-            for (iy, ix) in [(iy, ix) for iy in range(sub_ny) for ix in range(sub_nx)]:
-                if abs(shifts_x[iy, ix] - meanx) > threshold * stdx or abs(shifts_y[iy, ix] - meany) > threshold * stdy:
-                    shifts_y_c[iy,ix], shifts_x_c[iy,ix] = xp.nan, xp.nan
-            return shifts_y_c, shifts_x_c
         xp = self.xp
-        ny_subabs, nx_subabs, _, _ = U_subabs.shape
-        shifts_y = xp.zeros((ny_subabs, nx_subabs), dtype=xp.float32)
-        shifts_x = xp.zeros((ny_subabs, nx_subabs), dtype=xp.float32)
-        if (ref is None):
-            if not (ny_subabs % 2 == 1 and nx_subabs % 2 == 1):
-                print("Warning : Number of sub-apertures must be odd.")
-            ref_subap = U_subabs[ny_subabs // 2, nx_subabs // 2] 
-        else:
-            ref_subap = ref
-        for (iy, ix) in [(iy, ix) for iy in range(ny_subabs) for ix in range(nx_subabs)]:
-            curr_subap = U_subabs[iy, ix]
-            xcorr, (shift_y, shift_x) = self._shack_hartmann_registration(ref_subap, curr_subap, radius=None)
-            shifts_y[iy, ix] = shift_y
-            shifts_x[iy, ix] = shift_x
-            
-        shifts_y, shifts_x = filter_shifts_pupil(shifts_y, shifts_x, U_subabs.shape[-2], U_subabs.shape[-1], ny_subabs, nx_subabs, radius=1)
-        shifts_y, shifts_x = filter_shifts_threshold(shifts_y, shifts_x, U_subabs.shape[-2], U_subabs.shape[-1], ny_subabs, nx_subabs, threshold=3)
-        
+        ny_s, nx_s, Ny, Nx = U_subabs.shape
+
+        def filter_pupil(sy, sx, r=1.0):
+            """Nullify shifts outside elliptical pupil."""
+            sy_c, sx_c = xp.copy(sy), xp.copy(sx)
+            xs = xp.linspace(-1, 1, nx_s)
+            ys = xp.linspace(-1, 1, ny_s)
+            for iy, ix in [(iy, ix) for iy in range(ny_s) for ix in range(nx_s)]:
+                if xs[ix]**2 + ys[iy]**2 > r**2:
+                    sy_c[iy, ix] = sx_c[iy, ix] = xp.nan
+            return sy_c, sx_c
+
+        def filter_threshold(sy, sx, t=3.0):
+            """Nullify shifts beyond t*std from mean."""
+            sy_c, sx_c = xp.copy(sy), xp.copy(sx)
+            for s_c, s in [(sy_c, sy), (sx_c, sx)]:
+                bad = xp.abs(s - xp.nanmean(s)) > t * xp.nanstd(s)
+                s_c[bad] = xp.nan
+            return sy_c, sx_c
+
+        if ref is None:
+            if not (ny_s % 2 == nx_s % 2 == 1):
+                print("Warning: number of sub-apertures must be odd.")
+            ref = U_subabs[ny_s // 2, nx_s // 2]
+
+        shifts_y = xp.zeros((ny_s, nx_s), dtype=xp.float32)
+        shifts_x = xp.zeros((ny_s, nx_s), dtype=xp.float32)
+        for iy, ix in [(iy, ix) for iy in range(ny_s) for ix in range(nx_s)]:
+            _, (shifts_y[iy, ix], shifts_x[iy, ix]) = self._shack_hartmann_registration(ref, U_subabs[iy, ix], radius=None)
+
+        shifts_y, shifts_x = filter_pupil(shifts_y, shifts_x)
+        shifts_y, shifts_x = filter_threshold(shifts_y, shifts_x)
+
         RangePop()
         return shifts_y, shifts_x
     
@@ -1080,13 +1087,15 @@ class Holodoppler:
             if (not "Fresnel" in self.kernels):
                 self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
             
-            U_subaps = self._shack_hartmann_constructsubapsimages(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], parameters["batch_size"], parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
-            
+            U_subaps = self._shack_hartmann_constructsubapsimages(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], nt, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
+            print(U_subaps.dtype)
             if parameters["debug"]:
                 res["U_subaps"] = U_subaps
+
+            print(U_subaps.shape)
             
             shifts_y, shifts_x = self._shack_hartmann_displacement_calculation(U_subaps, self.xp, ref = None) # get the shifts in pixels in the subapertures images
-            
+            print(shifts_y.dtype)
             if parameters["debug"]:
                 res["shifts_y"] = shifts_y
                 res["shifts_x"] = shifts_x
