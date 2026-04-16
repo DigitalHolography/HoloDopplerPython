@@ -10,6 +10,7 @@ import threading
 import queue
 import time
 import cinereader
+from cupy.cuda.nvtx import RangePush, RangePop
 
 import matplotlib.pyplot as plt
 
@@ -300,7 +301,7 @@ class Holodoppler:
     # ------------------------------------------------------------
 
     def _svd_filter(self, H, svd_threshold):
-        
+        RangePush("SVD filtering")
         xp = self.xp
 
         if svd_threshold < 0:
@@ -322,8 +323,10 @@ class Holodoppler:
 
         tissue = H2 @ Vt @ Vt.conj().T
 
-        return (H2 - tissue).T.reshape(sz)
-
+        res =  (H2 - tissue).T.reshape(sz)
+        RangePop()
+        return res
+    
     # ------------------------------------------------------------
     # Frequency axis and masks
     # ------------------------------------------------------------
@@ -545,6 +548,7 @@ class Holodoppler:
     # ------------------------------------------------------------
 
     def _shack_hartmann_constructsubapsimages(self, U0, dx, dy, wavelength, z_prop, f0, f1, fs, time_window, nx_subabs, ny_subabs, svd_threshold):
+        RangePush("Shack-Hartmann subaperture construction")
         xp = self.xp
         Nz, Ny, Nx = U0.shape
         nb_iter = Nz // time_window
@@ -573,9 +577,11 @@ class Holodoppler:
                 U_subaps[iy, ix] = (M0.astype(xp.float32)) #flatfield(M0.astype(xp.float32),15)
             U_subaps_stack[i] = U_subaps
         U_subaps = xp.mean(U_subaps_stack, axis=0)
-        return U_subaps   
+        RangePop()
+        return U_subaps
 
     def _shack_hartmann_registration(self, fixed, moving, radius):
+        RangePush("Shack-Hartmann registration")
         xp = self.xp
         def parabolic_peak_1d(line, peak_idx):
             v_m = line[peak_idx - 1]
@@ -599,15 +605,23 @@ class Holodoppler:
             # Normalize to avoid division by zero
             cross_power /= (xp.abs(cross_power) + 1e-12)
             return xp.fft.fftshift(xp.fft.ifft2(cross_power))
+        RangePush("Preprocessing for xcorr2D")
         ny, nx = fixed.shape
         mask = _elliptical_mask(ny, nx, radius, xp) if radius else xp.ones((ny, nx), dtype=bool)
-        lo_f, hi_f = xp.percentile(fixed[mask], (0.2, 99.8))
-        _fixed = xp.clip(fixed, lo_f, hi_f)
-        lo_m, hi_m = xp.percentile(moving[mask], (0.2, 99.8))
-        _moving = xp.clip(moving, lo_m, hi_m)
+        # lo_f, hi_f = xp.percentile(fixed[mask], (0.2, 99.8))
+        # _fixed = xp.clip(fixed, lo_f, hi_f)
+        # lo_m, hi_m = xp.percentile(moving[mask], (0.2, 99.8))
+        # _moving = xp.clip(moving, lo_m, hi_m)
+        # _moving = xp.clip(moving, lo_m, hi_m)
+        _fixed = fixed
+        _moving = moving
         fixed_c = (_fixed - xp.mean(_fixed[mask])) * mask
         moving_c = (_moving - xp.mean(_moving[mask])) * mask
+        RangePop()
+        RangePush("xcorr2D")
         xcorr = xp.abs(_xcorr2d(fixed_c, moving_c, xp))
+        RangePop()
+        RangePush("ending registration")
         peak_idx = xp.argmax(xcorr)	
         peak_y, peak_x = xp.unravel_index(peak_idx, fixed.shape)
         refined_y = parabolic_peak_1d(xcorr[:, peak_x], peak_y)
@@ -616,9 +630,12 @@ class Holodoppler:
         center_y = ny/2
         shift_x = refined_x - center_x
         shift_y = refined_y - center_y
+        RangePop()
+        RangePop()
         return xcorr, (shift_y, shift_x)
 
     def _shack_hartmann_displacement_calculation(self, U_subabs, xp, ref=None):
+        RangePush("Shack-Hartmann displacement calculation")
         
                 
         def filter_shifts_pupil(shifts_y, shifts_x, Ny, Nx, sub_ny, sub_nx, radius=0.9):
@@ -662,6 +679,7 @@ class Holodoppler:
         shifts_y, shifts_x = filter_shifts_pupil(shifts_y, shifts_x, U_subabs.shape[-2], U_subabs.shape[-1], ny_subabs, nx_subabs, radius=1)
         shifts_y, shifts_x = filter_shifts_threshold(shifts_y, shifts_x, U_subabs.shape[-2], U_subabs.shape[-1], ny_subabs, nx_subabs, threshold=3)
         
+        RangePop()
         return shifts_y, shifts_x
     
     def _get_zernike_mode2(self, mode_index, Nx, Ny, radius = 2.0):
@@ -1047,6 +1065,7 @@ class Holodoppler:
     # ------------------------------------------------------------
 
     def render_moments(self, parameters, frames = None):
+        RangePush("render_moments")
 
         if frames is None:
             frames = self.read_frames(parameters["first_frame"], parameters["batch_size"])
@@ -1085,7 +1104,8 @@ class Holodoppler:
             phase_term = self.xp.exp(- 1j * phase) 
             phase_term = self.xp.nan_to_num(phase_term, nan=0.0) # completely mask the nan zone where the phase could'nt be estimated
             holograms = self._fresnel_transform_phase(frames, phase_term)
-            hologramsnotfixed = self._fresnel_transform(frames)
+            if parameters["debug"]:
+                hologramsnotfixed = self._fresnel_transform(frames)
         elif parameters["spatial_propagation"] == "Fresnel":
             if (not "Fresnel" in self.kernels):
                 self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
@@ -1117,6 +1137,7 @@ class Holodoppler:
         res["M0"] = M0
         res["M1"] = M1
         res["M2"] = M2
+        RangePop()
         return res
 
     # ------------------------------------------------------------
@@ -1622,11 +1643,9 @@ class Holodoppler:
                 f.create_dataset("moment2", data=v[:, :, :, 2])
                 f.create_dataset("HD_parameters", data=json.dumps(parameters))
                 if parameters["image_registration"]:
-                    print("Saving registration data...", reg_list)
                     f.create_dataset("registration", data=self._to_numpy(self.xp.array(reg_list)))
                     
                 if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and zernike_coefs is not None:
-                    print("Saving Zernike coefficients...", zernike_coefs)
                     f.create_dataset("zernike_coefs_radians", data=self._to_numpy((zernike_coefs).astype(np.float64)))
 
                 def json_serializer(obj):

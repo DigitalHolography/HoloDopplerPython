@@ -9,7 +9,7 @@ with open(r"./src/holodoppler/default_parameters.json") as f :
     
 print("parameters :", parameters)
 
-HD = Holodoppler(backend = "cupyRAM", pipeline_version = "latest")
+HD = Holodoppler(backend = "cupy", pipeline_version = "latest")
 
 HD.load_file(r"D:\STAGE\260113_AUZ0752_2.holo")
 

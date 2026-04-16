@@ -13,9 +13,10 @@ print("Using parameters :", parameters)
 HD = Holodoppler(backend = "cupyRAM", pipeline_version = "old")
 
 
-listpath = "C:\Users\Ivashka\Desktop\list_for_zernike.txt"
+listpath = r"C:\Users\Ivashka\Desktop\list_for_zernike - Copy.txt"
 
 for line in open(listpath, 'r'):
+    print("Processing file :", line.strip())
     file_path = line.strip()
     HD.load_file(file_path)
     HD.process_moments_(parameters, holodoppler_path = True)
