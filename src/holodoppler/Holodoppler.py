@@ -307,7 +307,6 @@ class Holodoppler:
 
         if svd_threshold < 0:
             return H
-        H = H.astype(xp.float32)
         
         sz = H.shape
         H2 = H.reshape((sz[0],sz[-1] * sz[-2])).T
@@ -359,7 +358,7 @@ class Holodoppler:
         H2 = H.reshape(sz[0], -1).T   # (131072, 320)
 
         # --- SVD (GPU optimized) ---
-        U, S, Vh = self.randomized_svd(H2, svd_threshold, xp)
+        U, S, Vh = xp.linalg.svd(H2, full_matrices=False)
 
         # keep only leading components
         Vh_t = Vh[:svd_threshold]
@@ -754,7 +753,7 @@ class Holodoppler:
         shift_x[bad] = xp.nan
         
         RangePop()
-        return shift_y, shift_x
+        return shift_y.astype(xp.float32), shift_x.astype(xp.float32)
     
     def _get_zernike_mode2(self, mode_index, Nx, Ny, radius = 2.0):
         xp = self.xp
@@ -1149,12 +1148,14 @@ class Holodoppler:
         def tic():
             if tictoc:
                 return time.perf_counter(), time.process_time()
-        def toc(t1, name=""):
+        def toc(t1, name="", arr=None):
             if tictoc:
                 print(name)
                 t2 = time.perf_counter(), time.process_time()
                 print(f" Real time: {t2[0] - t1[0]:.2f} seconds")
                 print(f" CPU time: {t2[1] - t1[1]:.2f} seconds")
+                if arr is not None : 
+                    print(arr.dtype)
             
         
         
@@ -1176,16 +1177,13 @@ class Holodoppler:
             toc(t2, "Fresnel kernel build time")
             t2 = tic()
             U_subaps = self._shack_hartmann_constructsubapsimages(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], nt, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
-            toc(t2, "Shack-Hartmann sub-aperture construction time")
-            # print(U_subaps.dtype)
+            toc(t2, "Shack-Hartmann sub-aperture construction time", U_subaps)
             if parameters["debug"]:
                 res["U_subaps"] = U_subaps
 
-            # print(U_subaps.shape)
             t2 = tic()
             shifts_y, shifts_x = self._shack_hartmann_displacement_calculation(U_subaps, self.xp, ref = None) # get the shifts in pixels in the subapertures images
-            toc(t2, "Shack-Hartmann displacement calculation time")
-            # print(shifts_y.dtype)
+            toc(t2, "Shack-Hartmann displacement calculation time", shifts_y)
             if parameters["debug"]:
                 res["shifts_y"] = shifts_y
                 res["shifts_x"] = shifts_x
@@ -1199,19 +1197,18 @@ class Holodoppler:
                 phase = self._shack_hartmann_southwell(ny, nx, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], shifts_y, shifts_x)
                 if parameters["debug"]:
                     res["phase"] = phase
-            toc(t2, "Shack-Hartmann phase reconstruction time")
+            toc(t2, "Shack-Hartmann phase reconstruction time",phase)
             
             t2 = tic()
-            print(phase.dtype)
             phase_term = self.xp.exp(- 1j * phase) 
             phase_term = self.xp.nan_to_num(phase_term, nan=0.0) # completely mask the nan zone where the phase could'nt be estimated
-            print(phase_term)
             holograms = self._fresnel_transform_phase(frames, phase_term)
-            toc(t2, "Shack-Hartmann phase correction and Fresnel transform time")
-            t2 = tic()
+            toc(t2, "Shack-Hartmann phase correction and Fresnel transform time", holograms)
+            
             if parameters["debug"]:
+                t2 = tic()
                 hologramsnotfixed = self._fresnel_transform(frames)
-            toc(t2, "Fresnel transform without phase correction time")
+                toc(t2, "Fresnel transform without phase correction time", hologramsnotfixed)
         elif parameters["spatial_propagation"] == "Fresnel":
             if (not "Fresnel" in self.kernels):
                 self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
@@ -1221,23 +1218,23 @@ class Holodoppler:
                 self._build_angular_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
             holograms = self._angular_spectrum_transform(frames)
         t2 = tic()   
-        holograms_f = self._svd_filter2(holograms, parameters["svd_threshold"])
-        toc(t2, "SVD filtering time")
+        holograms_f = self._svd_filter(holograms, parameters["svd_threshold"])
+        toc(t2, "SVD filtering time", holograms_f)
 
         t2 = tic()
         spectrum_f = self._fourier_time_transform(holograms_f)
 
         idxs, freqs = self._frequency_symmetric_filtering(frames.shape[0], parameters["sampling_freq"], parameters["low_freq"], parameters["high_freq"])
-        toc(t2, "Frequency filtering time")
+        toc(t2, "Frequency filtering time",freqs)
         t2 = tic()
         psd = self.xp.abs(spectrum_f[idxs,:,:]) ** 2
-        toc(t2, "PSD computation time")
+        toc(t2, "PSD computation time",psd)
 
         t2 = tic()
         M0 = self._moment(psd, freqs, 0)
         M1 = self._moment(psd, freqs, 1)
         M2 = self._moment(psd, freqs, 2)
-        toc(t2, "Moment computation time")
+        toc(t2, "Moment computation time",M0)
         
         if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and parameters["debug"]: # to compute the res without the phase correction for debug purposes
             t2 = tic()
@@ -1254,6 +1251,7 @@ class Holodoppler:
         RangePop()
         
         toc(t1, "total render_moments time")
+        
         
         return res
 
