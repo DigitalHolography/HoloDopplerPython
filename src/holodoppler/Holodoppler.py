@@ -1203,7 +1203,12 @@ class Holodoppler:
         if "M0notfixed" in res:
             M0notfixedimg = (res["M0notfixed"] - np.min(res["M0notfixed"])) / (np.max(res["M0notfixed"]) - np.min(res["M0notfixed"])) * 255
             # cv2.imshow("M0 without Phase Correction", M0notfixed_img)
-        return { "montage": montage_img, "shifts": shifts_img, "phase": phase_img, "M0notfixed": M0notfixedimg }
+        try :
+            return { "montage": montage_img, "shifts": shifts_img, "phase": phase_img, "M0notfixed": M0notfixedimg }
+        except(NameError):
+            print("Some debug images were not generated due to missing data in res.")
+            return {}
+        
         
     # ------------------------------------------------------------
     # One batch full pipeline
@@ -1305,6 +1310,7 @@ class Holodoppler:
             spectrum_f.append(self._fourier_time_transform(holograms_f[it]))
 
         idxs, freqs = self._frequency_symmetric_filtering(parameters["time_window"], parameters["sampling_freq"], parameters["low_freq"], parameters["high_freq"])
+        
         toc(t2, "Frequency filtering time",freqs)
         t2 = tic()
         psd = []
@@ -1322,7 +1328,10 @@ class Holodoppler:
         
         if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and parameters["debug"]: # to compute the res without the phase correction for debug purposes
             t2 = tic()
-            hologramsnotfixed_f=spectrumnotfixed_f=psdnotfixed=M0notfixed= []
+            hologramsnotfixed_f= []
+            spectrumnotfixed_f=[]
+            psdnotfixed=[]
+            M0notfixed= []            
             for it in range(niter):
                 hologramsnotfixed_f.append(self._svd_filter(hologramsnotfixed[it], parameters["svd_threshold"]))
                 spectrumnotfixed_f.append(self._fourier_time_transform(hologramsnotfixed_f[it]))
