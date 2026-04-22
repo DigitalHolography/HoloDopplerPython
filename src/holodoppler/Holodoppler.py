@@ -229,10 +229,7 @@ class Holodoppler:
     # Calculation kernels
     # ------------------------------------------------------------
 
-    def _build_fresnel_kernel(self,
-                              z,
-                              pixel_pitch,
-                              wavelength, ny, nx):
+    def _build_fresnel_kernel_in(self, z, pixel_pitch, wavelength, ny, nx):
 
         if isinstance(pixel_pitch, (float, int)):
             pixel_pitch = (pixel_pitch, pixel_pitch)
@@ -250,7 +247,34 @@ class Holodoppler:
             1j * xp.pi / (wavelength * z) * (X ** 2 + Y ** 2)
         ).astype(xp.complex64)
 
-        self.kernels["Fresnel"] = kernel[xp.newaxis, ...]
+        self.kernels["Fresnel_in"] = kernel[xp.newaxis, ...]
+    
+    def _build_fresnel_kernel_out(self, z, pixel_pitch, wavelength, ny, nx):
+
+        if isinstance(pixel_pitch, (float, int)):
+            pixel_pitch = (pixel_pitch, pixel_pitch)
+
+        ppy, ppx = pixel_pitch
+
+        xp = self.xp 
+
+        fx = xp.fft.fftfreq(nx, d=ppx)
+        fx = xp.fft.fftshift(fx)
+        fy = xp.fft.fftfreq(ny, d=ppy)
+        fy = xp.fft.fftshift(fy)
+        FX, FY = xp.meshgrid(fx, fy)
+
+        X = wavelength * z * FX
+        Y = wavelength * z * FY
+        k = 2 * xp.pi / wavelength
+        phase = 1j * xp.pi / (wavelength * z) * (X**2 + Y**2)
+        kernel = (xp.exp(1j * k * z) / (1j * wavelength * z) * xp.exp(phase)).astype(xp.complex64)
+        self.kernels["Fresnel_out"] = Qout[xp.newaxis, ...]
+
+    def _build_fresnel_kernel(self, z, pixel_pitch, wavelength, ny, nx):
+        _build_fresnel_kernel_in(z, pixel_pitch, wavelength, ny, nx)
+        _build_fresnel_kernel_out(z, pixel_pitch, wavelength, ny, nx)
+
 
     def _build_angular_kernel(self,
                               z,
@@ -282,9 +306,15 @@ class Holodoppler:
 
     def _fresnel_transform(self, frames):
 
-        return self.fft.fftshift(
-            self.fft.fft2(frames *self.kernels["Fresnel"], axes=(-1, -2), norm="ortho"), axes=(-1, -2)
-        )
+        if self.pipeline_version == "latest" : 
+
+            return self.fft.fftshift(
+                self.fft.fft2(frames *self.kernels["Fresnel_in"], axes=(-1, -2), norm="ortho"), axes=(-1, -2)
+            ) *self.kernels["Fresnel_out"]
+        else :
+            return self.fft.fftshift(
+                self.fft.fft2(frames *self.kernels["Fresnel_in"], axes=(-1, -2), norm="ortho"), axes=(-1, -2)
+            )
     
     def _angular_spectrum_transform(self, frames):
 
@@ -369,8 +399,6 @@ class Holodoppler:
 
         RangePop()
         return H2.T.reshape(sz)
-    
-    
     
     # ------------------------------------------------------------
     # Frequency axis and masks
@@ -631,9 +659,9 @@ class Holodoppler:
         idxs, _ = self._frequency_symmetric_filtering(time_window, fs, f0, high_freq=f1)
 
         # --- Fresnel kernel (cached) ---
-        if "Fresnel" not in self.kernels:
+        if "Fresnel_in" not in self.kernels:
             self._build_fresnel_kernel(z_prop, dx, wavelength, Ny, Nx)
-        Qin = self.kernels["Fresnel"]
+        Qin = self.kernels["Fresnel_in"]
 
         # Fresnel-multiply once on full field
         U_prop_qin = U0 * Qin  # (Nz, Ny, Nx)
@@ -665,7 +693,7 @@ class Holodoppler:
         RangePop()
         return U_subaps
 
-    def _shack_hartmann_displacement_calculation(self, U_subabs, xp, ref=None):
+    def _shack_hartmann_displacement_calculation(self, U_subabs, xp, ref=None, spatial_propagation="Fresnel"):
         """Vectorized Shack-Hartmann displacement with single FFT2 call."""
         RangePush("Shack-Hartmann displacement calculation")
         ny_s, nx_s, Ny, Nx = U_subabs.shape
@@ -1035,9 +1063,16 @@ class Holodoppler:
         return southwell_fourier_phase
     
     def _fresnel_transform_phase(self, frames, phase_term):
-        return self.fft.fftshift(
-            self.fft.fft2(frames * self.kernels["Fresnel"] * phase_term, axes=(-1, -2), norm="ortho"), axes=(-1, -2)
-        )
+        if self.pipeline_version == "latest" : 
+
+            return self.fft.fftshift(
+                self.fft.fft2(frames *self.kernels["Fresnel_in"] * phase_term, axes=(-1, -2), norm="ortho"), axes=(-1, -2)
+            ) *self.kernels["Fresnel_out"]
+        else :
+            return self.fft.fftshift(
+            self.fft.fft2(frames * self.kernels["Fresnel_in"] * phase_term, axes=(-1, -2), norm="ortho"), axes=(-1, -2)
+            )
+        
 
     # ------------------------------------------------------------
     # Render tools for debug and visualization
@@ -1172,7 +1207,7 @@ class Holodoppler:
         
         if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel":
             t2 = tic()
-            if (not "Fresnel" in self.kernels):
+            if (not "Fresnel_in" in self.kernels):
                 self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
             toc(t2, "Fresnel kernel build time")
             t2 = tic()
@@ -1210,7 +1245,7 @@ class Holodoppler:
                 hologramsnotfixed = self._fresnel_transform(frames)
                 toc(t2, "Fresnel transform without phase correction time", hologramsnotfixed)
         elif parameters["spatial_propagation"] == "Fresnel":
-            if (not "Fresnel" in self.kernels):
+            if (not "Fresnel_in" in self.kernels):
                 self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
             holograms = self._fresnel_transform(frames)
         elif parameters["spatial_propagation"] == "AngularSpectrum":
