@@ -1242,9 +1242,9 @@ class Holodoppler:
                 self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
             toc(t2, "Fresnel kernel build time")
             t2 = tic()
-            U_subaps = []
+            U_subaps = 0
             for it in range(niter):
-                U_subaps .append(self._shack_hartmann_constructsubapsimages(frames[it* parameters["time_window"]:(it+1)* parameters["time_window"]], parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], nt, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"])) # construct small images from the sub apertures of the Shack-Hartmann sensor
+                U_subaps += self._shack_hartmann_constructsubapsimages(frames[it* parameters["time_window"]:(it+1)* parameters["time_window"]], parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], parameters["time_window"], parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
             toc(t2, "Shack-Hartmann sub-aperture construction time", U_subaps)
             if parameters["debug"]:
                 res["U_subaps"] = U_subaps
@@ -1372,9 +1372,6 @@ class Holodoppler:
                 num_batch = 0
         else:
             num_batch = int((end_frame-first_frame) / batch_stride)
-            
-        if parameters["accumulation"] > 1:
-            num_batch = int(num_batch / parameters["accumulation"])
             
 
         out_list = []
