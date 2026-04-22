@@ -341,7 +341,10 @@ class Holodoppler:
                 self.fft.fft2(frames *self.kernels["Fresnel_in"], axes=(-1, -2), norm="ortho"), axes=(-1, -2)
             )
     
-    def _angular_spectrum_transform(self, frames):
+    def _angular_spectrum_transform(self, frames, zero_padding = False):
+        
+        if zero_padding:
+            frames = self.pad_array_centrally(frames, zero_padding)
 
         tmp = self.fft.fft2(frames,axes=(-1, -2), norm="ortho") * self.fft.fftshift(self.kernels["AngularSpectrum"],axes=(-1, -2))
 
