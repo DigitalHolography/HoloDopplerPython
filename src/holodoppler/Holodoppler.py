@@ -1223,10 +1223,9 @@ class Holodoppler:
                 print(f" CPU time: {t2[1] - t1[1]:.2f} seconds")
                 if arr is not None : 
                     print(arr.dtype)
+                    
+        niter = parameters["batch_size"] // parameters["time_window"]
             
-        
-        
-        
         t1 = tic()
         if frames is None:
             frames = self.read_frames(parameters["first_frame"], parameters["batch_size"])
@@ -1243,7 +1242,9 @@ class Holodoppler:
                 self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
             toc(t2, "Fresnel kernel build time")
             t2 = tic()
-            U_subaps = self._shack_hartmann_constructsubapsimages(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], nt, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
+            U_subaps = []
+            for it in range(niter):
+                U_subaps .append(self._shack_hartmann_constructsubapsimages(frames[it* parameters["time_window"]:(it+1)* parameters["time_window"]], parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], nt, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"])) # construct small images from the sub apertures of the Shack-Hartmann sensor
             toc(t2, "Shack-Hartmann sub-aperture construction time", U_subaps)
             if parameters["debug"]:
                 res["U_subaps"] = U_subaps
@@ -1269,46 +1270,66 @@ class Holodoppler:
             t2 = tic()
             phase_term = self.xp.exp(- 1j * phase) 
             phase_term = self.xp.nan_to_num(phase_term, nan=0.0) # completely mask the nan zone where the phase could'nt be estimated
-            holograms = self._fresnel_transform_phase(frames, phase_term)
+            holograms = []
+            for it in range(niter):
+                holograms.append(self._fresnel_transform_phase(frames[it* parameters["time_window"]:(it+1)* parameters["time_window"]], phase_term))
             toc(t2, "Shack-Hartmann phase correction and Fresnel transform time", holograms)
             
             if parameters["debug"]:
                 t2 = tic()
-                hologramsnotfixed = self._fresnel_transform(frames)
+                hologramsnotfixed = []
+                for it in range(niter):
+                    hologramsnotfixed.append(self._fresnel_transform(frames[it* parameters["time_window"]:(it+1)* parameters["time_window"]]))
                 toc(t2, "Fresnel transform without phase correction time", hologramsnotfixed)
         elif parameters["spatial_propagation"] == "Fresnel":
             if (not "Fresnel_in" in self.kernels):
                 self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
-            holograms = self._fresnel_transform(frames)
+            holograms = []
+            for it in range(niter):
+                holograms.append(self._fresnel_transform(frames[it* parameters["time_window"]:(it+1)* parameters["time_window"]]))
         elif parameters["spatial_propagation"] == "AngularSpectrum":
             if (not "AngularSpectrum" in self.kernels):
                 self._build_angular_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
-            holograms = self._angular_spectrum_transform(frames)
-        t2 = tic()   
-        holograms_f = self._svd_filter(holograms, parameters["svd_threshold"])
+            holograms = []
+            for it in range(niter):
+                holograms.append(self._angular_spectrum_transform(frames[it* parameters["time_window"]:(it+1)* parameters["time_window"]]))
+        t2 = tic()
+        holograms_f = []
+        for it in range(niter):
+            holograms_f.append(self._svd_filter(holograms[it], parameters["svd_threshold"]))
         toc(t2, "SVD filtering time", holograms_f)
 
         t2 = tic()
-        spectrum_f = self._fourier_time_transform(holograms_f)
+        spectrum_f = []
+        for it in range(niter):
+            spectrum_f.append(self._fourier_time_transform(holograms_f[it]))
 
-        idxs, freqs = self._frequency_symmetric_filtering(frames.shape[0], parameters["sampling_freq"], parameters["low_freq"], parameters["high_freq"])
+        idxs, freqs = self._frequency_symmetric_filtering(parameters["time_window"], parameters["sampling_freq"], parameters["low_freq"], parameters["high_freq"])
         toc(t2, "Frequency filtering time",freqs)
         t2 = tic()
-        psd = self.xp.abs(spectrum_f[idxs,:,:]) ** 2
-        toc(t2, "PSD computation time",psd)
+        psd = []
+        for it in range(niter):
+            psd.append(self.xp.abs(spectrum_f[it][idxs,:,:]) ** 2)
+        toc(t2, "PSD computation time", psd)
 
         t2 = tic()
-        M0 = self._moment(psd, freqs, 0)
-        M1 = self._moment(psd, freqs, 1)
-        M2 = self._moment(psd, freqs, 2)
+        M0 = M1 = M2 = []
+        for it in range(niter):
+            M0.append(self._moment(psd[it], freqs, 0))
+            M1.append(self._moment(psd[it], freqs, 1))
+            M2.append(self._moment(psd[it], freqs, 2))
         toc(t2, "Moment computation time",M0)
         
         if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and parameters["debug"]: # to compute the res without the phase correction for debug purposes
             t2 = tic()
-            hologramsnotfixed_f = self._svd_filter(hologramsnotfixed, parameters["svd_threshold"])
-            spectrumnotfixed_f = self._fourier_time_transform(hologramsnotfixed_f)
-            psdnotfixed = self.xp.abs(spectrumnotfixed_f[idxs,:,:]) ** 2
-            M0notfixed = self._moment(psdnotfixed, freqs, 0)
+            hologramsnotfixed_f=spectrumnotfixed_f=psdnotfixed=M0notfixed= []
+            for it in range(niter):
+                hologramsnotfixed_f.append(self._svd_filter(hologramsnotfixed[it], parameters["svd_threshold"]))
+                spectrumnotfixed_f.append(self._fourier_time_transform(hologramsnotfixed_f[it]))
+                psdnotfixed.append(self.xp.abs(spectrumnotfixed_f[it][idxs,:,:]) ** 2)
+                M0notfixed.append(self._moment(psdnotfixed[it], freqs, 0))
+                
+            
             res["M0notfixed"] = M0notfixed
             toc(t2, "Moment computation svd fourier without phase correction time")
             
@@ -1318,6 +1339,10 @@ class Holodoppler:
         RangePop()
         
         toc(t1, "total render_moments time")
+        
+        for k in res:
+            if isinstance(res[k], list):
+                res[k] = self.xp.stack(res[k], axis=0).sum(axis=0) # sum over time batches
         
         
         return res
@@ -1347,6 +1372,10 @@ class Holodoppler:
                 num_batch = 0
         else:
             num_batch = int((end_frame-first_frame) / batch_stride)
+            
+        if parameters["accumulation"] > 1:
+            num_batch = int(num_batch / parameters["accumulation"])
+            
 
         out_list = []
 
@@ -1381,7 +1410,7 @@ class Holodoppler:
             debug_thread.start()
         
         if parameters["image_registration"]:
-            frames = self.read_frames(first_frame, parameters["batch_size_registration"]) # the first frame to be rendered
+            frames = self.read_frames(parameters["first_frame_registration"], parameters["batch_size_registration"]) # the first frame to be rendered
             M0_reg = self.render_moments(parameters, frames = frames)["M0"] # render the first frame to be used as reference for the registration
             M0_reg = self._flatfield(M0_reg, parameters["registration_flatfield_gw"])
             reg_list = [None] * num_batch
@@ -1794,10 +1823,10 @@ class Holodoppler:
         else:
             vid_debug = None
 
-        if parameters["accumulation"] > 1:
-            acc = parameters["accumulation"] 
-            ny, nx, nimgs, nt = vid.shape
-            vid = self.xp.reshape(vid[:,:,:,:(nt//acc)*acc],(ny, nx, nimgs, nt//acc, acc)) @ self.xp.ones(acc) # / acc
+        # if parameters["accumulation"] > 1:
+        #     acc = parameters["accumulation"] 
+        #     ny, nx, nimgs, nt = vid.shape
+        #     vid = self.xp.reshape(vid[:,:,:,:(nt//acc)*acc],(ny, nx, nimgs, nt//acc, acc)) @ self.xp.ones(acc) # / acc
 
         if parameters["square"]:
             m = max(vid.shape[0], vid.shape[1])
