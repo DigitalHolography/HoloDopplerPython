@@ -269,11 +269,11 @@ class Holodoppler:
         k = 2 * xp.pi / wavelength
         phase = 1j * xp.pi / (wavelength * z) * (X**2 + Y**2)
         kernel = (xp.exp(1j * k * z) / (1j * wavelength * z) * xp.exp(phase)).astype(xp.complex64)
-        self.kernels["Fresnel_out"] = Qout[xp.newaxis, ...]
+        self.kernels["Fresnel_out"] = kernel[xp.newaxis, ...]
 
     def _build_fresnel_kernel(self, z, pixel_pitch, wavelength, ny, nx):
-        _build_fresnel_kernel_in(z, pixel_pitch, wavelength, ny, nx)
-        _build_fresnel_kernel_out(z, pixel_pitch, wavelength, ny, nx)
+        self._build_fresnel_kernel_in(z, pixel_pitch, wavelength, ny, nx)
+        self._build_fresnel_kernel_out(z, pixel_pitch, wavelength, ny, nx)
 
 
     def _build_angular_kernel(self,
@@ -303,11 +303,36 @@ class Holodoppler:
     # ------------------------------------------------------------
     # Calculation processing
     # ------------------------------------------------------------
+    
+    def pad_array_centrally(self, arr, new_shape):
+        
+        xp = self.xp
+        if isinstance(new_shape, int):
+            new_shape = (new_shape, new_shape)
 
-    def _fresnel_transform(self, frames):
+        ny, nx = arr.shape[-2:]
+        new_ny, new_nx = new_shape
+
+        if new_ny < ny or new_nx < nx:
+            raise ValueError("new_shape must be greater than or equal to the current last two dimensions")
+
+        pad_y0 = (new_ny - ny) // 2
+        pad_y1 = new_ny - ny - pad_y0
+        pad_x0 = (new_nx - nx) // 2
+        pad_x1 = new_nx - nx - pad_x0
+
+        pad_width = [(0, 0)] * arr.ndim
+        pad_width[-2] = (pad_y0, pad_y1)
+        pad_width[-1] = (pad_x0, pad_x1)
+
+        return xp.pad(arr, pad_width, mode="constant")
+
+    def _fresnel_transform(self, frames, zero_padding = False):
+        
+        if zero_padding:
+            frames = self.pad_array_centrally(frames, zero_padding)
 
         if self.pipeline_version == "latest" : 
-
             return self.fft.fftshift(
                 self.fft.fft2(frames *self.kernels["Fresnel_in"], axes=(-1, -2), norm="ortho"), axes=(-1, -2)
             ) *self.kernels["Fresnel_out"]
@@ -1062,7 +1087,11 @@ class Holodoppler:
         southwell_fourier_phase = resize_phase_nan(southwell_fourier_phase, ny, nx)
         return southwell_fourier_phase
     
-    def _fresnel_transform_phase(self, frames, phase_term):
+    def _fresnel_transform_phase(self, frames, phase_term, zero_padding = False):
+        
+        if zero_padding:
+            frames = self.pad_array_centrally(frames, zero_padding)
+            
         if self.pipeline_version == "latest" : 
 
             return self.fft.fftshift(
