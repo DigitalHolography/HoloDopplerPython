@@ -55,14 +55,31 @@ def _calculate_batch_count(processor: Holodoppler, parameters: ProcessingParamet
     return int(frame_span / parameters.batch_stride)
 
 
-def _next_output_bundle(output_parent: Path, stem: str) -> Path:
-    output_parent.mkdir(parents=True, exist_ok=True)
-    index = 1
-    while True:
-        candidate = output_parent / f"{stem}_HD_{index}"
-        if not candidate.exists():
-            return candidate
-        index += 1
+def default_output_root(input_path: str | Path) -> Path:
+    source = Path(input_path)
+    if source.is_dir():
+        return source
+    return source.parent
+
+
+def output_bundle_path(output_parent: str | Path, stem: str) -> Path:
+    root = Path(output_parent)
+    return root / stem / f"{stem}_HD"
+
+
+def _prepare_output_bundle(output_parent: Path, stem: str) -> Path:
+    intermediate_dir = output_parent / stem
+    if intermediate_dir.exists() and not intermediate_dir.is_dir():
+        raise FileExistsError(f"Cannot create output folder because a file exists: {intermediate_dir}")
+
+    output_dir = output_bundle_path(output_parent, stem)
+    if output_dir.exists():
+        if not output_dir.is_dir():
+            raise FileExistsError(f"Cannot overwrite output folder because a file exists: {output_dir}")
+        shutil.rmtree(output_dir)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return output_dir
 
 
 def _write_video(video_path: Path, frames: np.ndarray, fps: float, codec: str) -> None:
@@ -140,7 +157,7 @@ def _process_single_file(
     backend: str,
     pipeline_version: str,
 ) -> Path:
-    output_dir = _next_output_bundle(output_parent, source_file.stem)
+    output_dir = _prepare_output_bundle(output_parent, source_file.stem)
 
     processor = Holodoppler(backend=backend, pipeline_version=pipeline_version)
     try:
@@ -191,18 +208,25 @@ def _extract_zip_member(archive: ZipFile, member_name: str, temp_root: Path) -> 
 
 def process_inputs(
     input_path: str | Path,
-    output_root: str | Path,
-    parameters: ProcessingParameters,
+    output_root: str | Path | ProcessingParameters | None = None,
+    parameters: ProcessingParameters | None = None,
     backend: str = "numpy",
     pipeline_version: str = "latest",
     progress: ProgressCallback | None = None,
 ) -> BatchProcessingSummary:
+    if isinstance(output_root, ProcessingParameters) and parameters is None:
+        parameters = output_root
+        output_root = None
+
     source = Path(input_path)
-    destination_root = Path(output_root)
     reporter = progress or _noop
 
     if not source.exists():
         raise FileNotFoundError(f"Input path does not exist: {source}")
+    if parameters is None:
+        raise TypeError("parameters is required.")
+
+    destination_root = Path(output_root) if output_root is not None else default_output_root(source)
 
     processed: list[ProcessedItem] = []
     failed: list[FailedItem] = []

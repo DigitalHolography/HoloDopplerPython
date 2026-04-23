@@ -11,7 +11,7 @@ import numpy as np
 
 from holodoppler.Holodoppler import Holodoppler
 from holodoppler.config import ProcessingParameters, available_builtin_settings, load_builtin_parameters
-from holodoppler.runner import process_inputs
+from holodoppler.runner import _prepare_output_bundle, default_output_root, output_bundle_path, process_inputs
 
 
 class ProcessingParametersTests(unittest.TestCase):
@@ -69,6 +69,70 @@ class HolodopplerExportTests(unittest.TestCase):
 
 
 class RunnerRoutingTests(unittest.TestCase):
+    def test_default_output_root_uses_file_parent_and_folder_itself(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            holo_file = root / "sample.holo"
+            holo_file.write_bytes(b"")
+            folder = root / "dataset"
+            folder.mkdir()
+
+            self.assertEqual(default_output_root(holo_file), root)
+            self.assertEqual(default_output_root(folder), folder)
+
+    def test_output_bundle_path_uses_intermediate_folder_without_number(self) -> None:
+        self.assertEqual(
+            output_bundle_path(Path("out"), "sample"),
+            Path("out") / "sample" / "sample_HD",
+        )
+
+    def test_prepare_output_bundle_overwrites_existing_bundle_folder(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            old_file = root / "sample" / "sample_HD" / "old.txt"
+            old_file.parent.mkdir(parents=True)
+            old_file.write_text("old", encoding="utf-8")
+
+            output_dir = _prepare_output_bundle(root, "sample")
+
+            self.assertEqual(output_dir, root / "sample" / "sample_HD")
+            self.assertTrue(output_dir.is_dir())
+            self.assertFalse(old_file.exists())
+
+    def test_single_file_processing_defaults_to_input_parent(self) -> None:
+        parameters = load_builtin_parameters()
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "one.holo"
+            source.write_bytes(b"")
+            calls: list[Path] = []
+
+            def fake_process_single_file(**kwargs):
+                calls.append(kwargs["output_parent"])
+                return output_bundle_path(kwargs["output_parent"], kwargs["source_file"].stem)
+
+            with patch("holodoppler.runner._process_single_file", side_effect=fake_process_single_file):
+                summary = process_inputs(source, parameters=parameters)
+
+        self.assertEqual(len(summary.processed), 1)
+        self.assertEqual(calls, [root])
+        self.assertEqual(summary.processed[0].output_dir, root / "one" / "one_HD")
+
+    def test_single_file_processing_accepts_parameters_as_second_argument(self) -> None:
+        parameters = load_builtin_parameters()
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            source = root / "one.holo"
+            source.write_bytes(b"")
+
+            def fake_process_single_file(**kwargs):
+                return output_bundle_path(kwargs["output_parent"], kwargs["source_file"].stem)
+
+            with patch("holodoppler.runner._process_single_file", side_effect=fake_process_single_file):
+                summary = process_inputs(source, parameters)
+
+        self.assertEqual(summary.processed[0].output_dir, root / "one" / "one_HD")
+
     def test_folder_processing_preserves_relative_parents(self) -> None:
         parameters = load_builtin_parameters()
         with TemporaryDirectory() as source_dir, TemporaryDirectory() as output_dir:
@@ -83,7 +147,7 @@ class RunnerRoutingTests(unittest.TestCase):
 
             def fake_process_single_file(**kwargs):
                 calls.append((kwargs["source_file"], kwargs["output_parent"]))
-                return kwargs["output_parent"] / f"{kwargs['source_file'].stem}_HD_1"
+                return output_bundle_path(kwargs["output_parent"], kwargs["source_file"].stem)
 
             with patch("holodoppler.runner._process_single_file", side_effect=fake_process_single_file):
                 summary = process_inputs(root, output_dir, parameters)
@@ -92,6 +156,8 @@ class RunnerRoutingTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
         output_parents = {output_parent for _, output_parent in calls}
         self.assertEqual(output_parents, {Path(output_dir), Path(output_dir) / "nested"})
+        output_dirs = {item.output_dir.relative_to(output_dir) for item in summary.processed}
+        self.assertEqual(output_dirs, {Path("one") / "one_HD", Path("nested") / "two" / "two_HD"})
 
     def test_zip_processing_scopes_outputs_under_zip_stem(self) -> None:
         parameters = load_builtin_parameters()
@@ -108,7 +174,7 @@ class RunnerRoutingTests(unittest.TestCase):
 
             def fake_process_single_file(**kwargs):
                 calls.append((kwargs["source_file"], kwargs["output_parent"]))
-                return kwargs["output_parent"] / f"{kwargs['source_file'].stem}_HD_1"
+                return output_bundle_path(kwargs["output_parent"], kwargs["source_file"].stem)
 
             with patch("holodoppler.runner._process_single_file", side_effect=fake_process_single_file):
                 summary = process_inputs(zip_path, output_dir, parameters)

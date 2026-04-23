@@ -39,28 +39,28 @@ uv run holodoppler settings export --name default_parameters --output .\paramete
 Process a single `.holo` file:
 
 ```bash
-uv run holodoppler run --input .\sample.holo --output .\output
+uv run holodoppler run --input .\sample.holo
 ```
 
 Process a folder recursively with a custom JSON parameter file:
 
 ```bash
-uv run holodoppler run --input .\dataset --output .\output --parameters .\parameters.json
+uv run holodoppler run --input .\dataset --parameters .\parameters.json
 ```
 
 Process a zip archive with the builtin default preset:
 
 ```bash
-uv run holodoppler run --input .\dataset.zip --output .\output --setting default_parameters
+uv run holodoppler run --input .\dataset.zip --setting default_parameters
 ```
 
 Optional runtime controls:
 
 ```bash
-uv run holodoppler run --input .\sample.holo --output .\output --backend cupy --pipeline-version old
+uv run holodoppler run --input .\sample.holo --backend cupy --pipeline-version old
 ```
 
-For folder inputs, the output mirrors the input relative directory structure. For zip inputs, the output is mirrored under a top-level folder named after the zip file stem.
+Use `--output` to choose a different output root. By default, a file input writes beside the file, a folder input writes inside that folder, and a zip input writes beside the zip. Each input file overwrites its deterministic bundle at `<output-root>/<stem>/<stem>_HD`.
 
 ## UI Usage
 
@@ -75,7 +75,7 @@ The UI only offers the `cupy` backend when the CUDA FFT runtime is available.
 The `Run` tab lets you:
 
 - select a `.holo` file, folder, or zip archive
-- choose an output folder
+- choose an output root, or use the path filled from the selected input
 - run with a builtin preset, a JSON file, or the values from the advanced form
 
 The `Advanced` tab lets you:
@@ -89,6 +89,7 @@ The `Advanced` tab lets you:
 
 Each processed input generates a Holodoppler bundle:
 
+- `<stem>/<stem>_HD/`
 - `png/`
 - `mp4/`
 - `json/parameters.json`

@@ -31,7 +31,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser("run", help="Run processing on a file, folder, or zip archive.")
     run_parser.add_argument("--input", required=True, help="Path to a .holo file, folder, or .zip archive.")
-    run_parser.add_argument("--output", required=True, help="Output directory for generated Holodoppler bundles.")
+    run_parser.add_argument(
+        "--output",
+        help="Output root for generated bundles. Defaults to the input folder, or to the input file parent.",
+    )
     run_parser.add_argument("--parameters", help="Path to a JSON parameter file.")
     run_parser.add_argument("--setting", help="Builtin setting name, for example 'default_parameters'.")
     run_parser.add_argument("--backend", choices=("numpy", "cupy"), default="numpy")

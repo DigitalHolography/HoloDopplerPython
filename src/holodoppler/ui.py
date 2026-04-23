@@ -17,7 +17,7 @@ from holodoppler.config import (
     parameter_definitions,
     ProcessingParameters,
 )
-from holodoppler.runner import BatchProcessingSummary, process_inputs
+from holodoppler.runner import BatchProcessingSummary, default_output_root, process_inputs
 
 
 class ParameterForm(ttk.Frame):
@@ -422,6 +422,7 @@ class HolodopplerApp(tk.Tk):
             )
         if selected_path:
             self.input_path_var.set(selected_path)
+            self.output_path_var.set(str(default_output_root(selected_path)))
 
     def _browse_output(self) -> None:
         selected_path = filedialog.askdirectory(title="Select Output Folder")
@@ -466,8 +467,8 @@ class HolodopplerApp(tk.Tk):
             messagebox.showerror("Missing Input", "Select an input path first.")
             return
         if not output_path:
-            messagebox.showerror("Missing Output", "Select an output folder first.")
-            return
+            output_path = str(default_output_root(input_path))
+            self.output_path_var.set(output_path)
 
         try:
             parameters = self._resolve_parameters()
