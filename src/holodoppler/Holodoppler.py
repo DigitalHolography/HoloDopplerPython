@@ -34,6 +34,7 @@ except Exception as exc:
     cp = None
     cp_fft = None
     cp_gaussian_filter = None
+<<<<<<< HEAD
     cp_ndi = None
 
     def RangePush(_: str) -> None:
@@ -42,6 +43,8 @@ except Exception as exc:
     def RangePop() -> None:
         return None
 
+=======
+>>>>>>> 05ec124201966ad8c616ee9375696e5afd84c476
     _cupy_available = False
     _cupy_import_error = exc
 
@@ -125,7 +128,11 @@ class Holodoppler:
 
     def _init_backend(self):
 
+<<<<<<< HEAD
         if "cupy" in self.backend:
+=======
+        if self.backend == "cupy":
+>>>>>>> 05ec124201966ad8c616ee9375696e5afd84c476
             cupy_ready, cupy_error = cupy_backend_status()
             if not cupy_ready:
                 raise RuntimeError(cupy_error or "CuPy backend requested but CuPy is not available.")
@@ -565,6 +572,11 @@ class Holodoppler:
         else:
             xp = np
             fft = np_fft
+<<<<<<< HEAD
+=======
+
+        img = img.astype(xp.float32)
+>>>>>>> 05ec124201966ad8c616ee9375696e5afd84c476
 
         img = img.astype(xp.float32)
         h, w = img.shape[:2]

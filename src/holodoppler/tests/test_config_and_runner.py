@@ -6,10 +6,13 @@ import unittest
 from unittest.mock import patch
 from zipfile import ZipFile
 
+<<<<<<< HEAD
 import h5py
 import numpy as np
 
 from holodoppler.Holodoppler import Holodoppler
+=======
+>>>>>>> 05ec124201966ad8c616ee9375696e5afd84c476
 from holodoppler.config import ProcessingParameters, available_builtin_settings, load_builtin_parameters
 from holodoppler.runner import process_inputs
 
@@ -31,6 +34,7 @@ class ProcessingParametersTests(unittest.TestCase):
             ProcessingParameters.from_mapping({"unknown": 1})
 
 
+<<<<<<< HEAD
 class HolodopplerExportTests(unittest.TestCase):
     def test_process_moments_writes_explicit_h5_path(self) -> None:
         parameters = load_builtin_parameters().to_dict()
@@ -68,6 +72,8 @@ class HolodopplerExportTests(unittest.TestCase):
                 self.assertIn("HD_parameters", output_file)
 
 
+=======
+>>>>>>> 05ec124201966ad8c616ee9375696e5afd84c476
 class RunnerRoutingTests(unittest.TestCase):
     def test_folder_processing_preserves_relative_parents(self) -> None:
         parameters = load_builtin_parameters()
