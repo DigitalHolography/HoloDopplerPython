@@ -59,6 +59,12 @@ def save_debug_images(debug_dict, save_dir, prefix="debug"):
 
         img_np = HD._to_numpy(img)
 
+        if img_np.ndim == 2 and parameters["square"]:
+            H, W = img_np.shape
+            L = max(H, W)
+            # --- Resize ---
+            img_np = imresize(img_np, output_shape=(L, L))
+
         if img_np.dtype != np.uint8:
             img_min = np.min(img_np)
             img_max = np.max(img_np)
