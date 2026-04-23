@@ -29,5 +29,5 @@
   "flip_x": false,
   "flip_y": false,
   
-  "debug" : false
+  "debug" : true
 }
