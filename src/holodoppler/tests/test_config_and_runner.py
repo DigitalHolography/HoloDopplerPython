@@ -6,6 +6,10 @@ import unittest
 from unittest.mock import patch
 from zipfile import ZipFile
 
+import h5py
+import numpy as np
+
+from holodoppler.Holodoppler import Holodoppler
 from holodoppler.config import ProcessingParameters, available_builtin_settings, load_builtin_parameters
 from holodoppler.runner import process_inputs
 
@@ -25,6 +29,43 @@ class ProcessingParametersTests(unittest.TestCase):
     def test_unknown_key_is_rejected(self) -> None:
         with self.assertRaises(ValueError):
             ProcessingParameters.from_mapping({"unknown": 1})
+
+
+class HolodopplerExportTests(unittest.TestCase):
+    def test_process_moments_writes_explicit_h5_path(self) -> None:
+        parameters = load_builtin_parameters().to_dict()
+        parameters.update(
+            {
+                "batch_size": 1,
+                "batch_stride": 1,
+                "end_frame": 1,
+                "image_registration": False,
+                "shack_hartmann": False,
+                "square": False,
+                "debug": False,
+            }
+        )
+
+        processor = Holodoppler(backend="numpy")
+        processor.ext = ".holo"
+        processor.file_header = {"num_frames": 1}
+        processor.file_footer = {}
+        processor.read_frames = lambda first_frame, frame_size: np.zeros((frame_size, 2, 3), dtype=np.float32)
+        processor.render_moments = lambda parameters, frames=None: {
+            "M0": np.ones((2, 3), dtype=np.float32),
+            "M1": np.ones((2, 3), dtype=np.float32) * 2,
+            "M2": np.ones((2, 3), dtype=np.float32) * 3,
+        }
+
+        with TemporaryDirectory() as temp_dir:
+            h5_path = Path(temp_dir) / "output.h5"
+            video = processor.process_moments_(parameters, h5_path=str(h5_path), return_numpy=True)
+
+            self.assertIsNotNone(video)
+            self.assertTrue(h5_path.is_file())
+            with h5py.File(h5_path, "r") as output_file:
+                self.assertIn("moment0", output_file)
+                self.assertIn("HD_parameters", output_file)
 
 
 class RunnerRoutingTests(unittest.TestCase):

@@ -1374,7 +1374,7 @@ class Holodoppler:
     # ------------------------------------------------------------
 
     def process_moments_(self, parameters, h5_path = None, mp4_path = None, return_numpy = False, holodoppler_path = False):
-        
+        import numpy as np
         
         batch_size = parameters["batch_size"]
         batch_stride = parameters["batch_stride"]
@@ -1801,7 +1801,6 @@ class Holodoppler:
                     out_list.append(
                         self.xp.stack([M0, M1, M2], axis=2)
                     )
-                    debug_list[i] = debug_imgs
 
                 except Exception:
                     traceback.print_exc()
@@ -1889,6 +1888,17 @@ class Holodoppler:
                     f.create_dataset("cine_metadata", data=json.dumps(self.cine_metadata_json, default=json_serializer))
                 if git_commit is not None:
                     f.create_dataset("git_commit", data=git_commit)
+
+        if h5_path is not None:
+            h5_dir = os.path.dirname(os.path.abspath(h5_path))
+            os.makedirs(h5_dir, exist_ok=True)
+            save_to_h5path(
+                h5_path,
+                np.permute_dims(vid, (3, 1, 0, 2)),
+                parameters,
+                reg_list if parameters["image_registration"] else None,
+                zernike_coefs,
+            )
 
         if holodoppler_path is True:
             # make the new directory at the same level as the input file with its name then _HD{idx} where idx is the max index of existing holodoppler output directories for this file + 1

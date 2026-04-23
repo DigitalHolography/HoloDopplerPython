@@ -157,6 +157,8 @@ def _process_single_file(
             )
             if video is None:
                 raise RuntimeError(f"Processing failed for {source_label}.")
+            if not temp_h5_path.is_file():
+                raise RuntimeError(f"Processing did not create expected H5 output: {temp_h5_path}")
             _export_bundle(processor, parameters, video, output_dir, output_dir.name, temp_h5_path)
         return output_dir
     finally:
