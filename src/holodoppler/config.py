@@ -4,11 +4,7 @@ from dataclasses import MISSING, asdict, dataclass, field, fields
 from importlib import resources
 import json
 from pathlib import Path
-<<<<<<< HEAD
 from typing import Any, get_args, get_origin, get_type_hints
-=======
-from typing import Any, get_type_hints
->>>>>>> 05ec124201966ad8c616ee9375696e5afd84c476
 
 
 def _bool_from_value(value: Any) -> bool:
@@ -24,7 +20,6 @@ def _bool_from_value(value: Any) -> bool:
 
 
 def _coerce_value(field_name: str, value: Any, target_type: type[Any]) -> Any:
-<<<<<<< HEAD
     origin = get_origin(target_type)
     if origin is list:
         item_type = get_args(target_type)[0]
@@ -36,8 +31,6 @@ def _coerce_value(field_name: str, value: Any, target_type: type[Any]) -> Any:
         if not isinstance(value, list):
             raise ValueError(f"{field_name!r} must be a list.")
         return [_coerce_value(field_name, item, item_type) for item in value]
-=======
->>>>>>> 05ec124201966ad8c616ee9375696e5afd84c476
     if target_type is bool:
         return _bool_from_value(value)
     if target_type is int:
@@ -73,7 +66,6 @@ class ProcessingParameters:
         default="Fresnel",
         metadata={"label": "Spatial propagation", "choices": ("Fresnel", "AngularSpectrum")},
     )
-<<<<<<< HEAD
     zero_padding: int = field(default=512, metadata={"label": "Zero padding"})
     z: float = field(default=0.480, metadata={"label": "Propagation distance"})
     shack_hartmann: bool = field(default=True, metadata={"label": "Shack-Hartmann correction"})
@@ -92,18 +84,10 @@ class ProcessingParameters:
     low_freq: float = field(default=6000.0, metadata={"label": "Low frequency"})
     high_freq: float = field(default=18300.0, metadata={"label": "High frequency"})
     svd_threshold: int = field(default=16, metadata={"label": "SVD threshold"})
-=======
-    z: float = field(default=0.489, metadata={"label": "Propagation distance"})
-    sampling_freq: float = field(default=37037.0, metadata={"label": "Sampling frequency"})
-    low_freq: float = field(default=6000.0, metadata={"label": "Low frequency"})
-    high_freq: float = field(default=18300.0, metadata={"label": "High frequency"})
-    svd_threshold: int = field(default=64, metadata={"label": "SVD threshold"})
->>>>>>> 05ec124201966ad8c616ee9375696e5afd84c476
     square: bool = field(default=True, metadata={"label": "Square output"})
     transpose: bool = field(default=False, metadata={"label": "Transpose"})
     flip_x: bool = field(default=False, metadata={"label": "Flip X"})
     flip_y: bool = field(default=False, metadata={"label": "Flip Y"})
-<<<<<<< HEAD
     accumulation: int = field(default=1, metadata={"label": "Accumulation"})
     debug: bool = field(default=False, metadata={"label": "Debug"})
 
@@ -114,8 +98,6 @@ class ProcessingParameters:
             "shack_hartmann_southwell_phase_integration"
         )
         return parameter_dict
-=======
->>>>>>> 05ec124201966ad8c616ee9375696e5afd84c476
 
     def validate(self) -> None:
         if self.batch_size <= 0:
@@ -148,7 +130,6 @@ class ProcessingParameters:
             raise ValueError("registration_flatfield_gw must be greater than 0.")
         if self.spatial_propagation not in {"Fresnel", "AngularSpectrum"}:
             raise ValueError("spatial_propagation must be 'Fresnel' or 'AngularSpectrum'.")
-<<<<<<< HEAD
         if self.zero_padding < 0:
             raise ValueError("zero_padding cannot be negative.")
         if self.shack_hartmann_ny_subap <= 0:
@@ -161,12 +142,6 @@ class ProcessingParameters:
             raise ValueError("shack_hartmann_zernike_fit_modes cannot contain negative values.")
         if self.accumulation <= 0:
             raise ValueError("accumulation must be greater than 0.")
-=======
-
-    def to_dict(self) -> dict[str, Any]:
-        self.validate()
-        return asdict(self)
->>>>>>> 05ec124201966ad8c616ee9375696e5afd84c476
 
     def save_json(self, path: str | Path) -> Path:
         destination = Path(path)
@@ -178,14 +153,11 @@ class ProcessingParameters:
     def from_mapping(cls, values: dict[str, Any]) -> "ProcessingParameters":
         field_defs = {item.name: item for item in fields(cls)}
         type_hints = get_type_hints(cls)
-<<<<<<< HEAD
         if "shack_hartmann_southwell_phase_integration " in values:
             values = dict(values)
             values["shack_hartmann_southwell_phase_integration"] = values.pop(
                 "shack_hartmann_southwell_phase_integration "
             )
-=======
->>>>>>> 05ec124201966ad8c616ee9375696e5afd84c476
         unknown_keys = sorted(set(values) - set(field_defs))
         if unknown_keys:
             unknown = ", ".join(unknown_keys)

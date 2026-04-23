@@ -1,10 +1,7 @@
 from __future__ import annotations
 
 import queue
-<<<<<<< HEAD
 import json
-=======
->>>>>>> 05ec124201966ad8c616ee9375696e5afd84c476
 import threading
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
@@ -124,16 +121,10 @@ class ParameterForm(ttk.Frame):
         self._canvas.yview_scroll(step, "units")
 
     def set_parameters(self, parameters: ProcessingParameters) -> None:
-<<<<<<< HEAD
         for definition in self._definitions:
             value = getattr(parameters, definition.name)
             if isinstance(value, list):
                 value = json.dumps(value)
-=======
-        parameter_dict = parameters.to_dict()
-        for definition in self._definitions:
-            value = parameter_dict[definition.name]
->>>>>>> 05ec124201966ad8c616ee9375696e5afd84c476
             self._variables[definition.name].set(value)
 
     def get_parameters(self) -> ProcessingParameters:
