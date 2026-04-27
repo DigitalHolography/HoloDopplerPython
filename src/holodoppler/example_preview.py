@@ -12,17 +12,30 @@ print("parameters :", parameters)
 
 HD = Holodoppler(backend = "cupy", pipeline_version = "latest")
 
-HD.load_file(r"D:\STAGE\260113_AUZ0752_2.holo")
+HD.load_file(r"D:\DATA_JULES\260423_EYE_TEST_9.holo")
 
 print("file header :", HD.file_header)
 
 frames = HD.read_frames(0, 1)
-res = HD.render_moments(parameters, tictoc= True)
+res = HD.render_moments(parameters, tictoc= False)
 
-fig, ax = plt.subplots(1,1, figsize=(20,10))
-
+# main image
+fig, ax = plt.subplots(1, 1, figsize=(20, 10))
 ax.imshow(res["M0"].get())
+ax.set_aspect('equal', adjustable='box')
 plt.show()
-# desktop = os.path.join(os.path.join(os.path.expanduser('~')), 'Desktop') 
 
-# HD.process_moments_(parameters, holodoppler_path = True)
+HD.init_plot_debug()
+dbg = HD.plot_debug(res, 0)
+
+for key, img in dbg.items():
+    dbg[key] = img.get() if hasattr(img, "get") else img
+
+print("Debug images keys :", dbg.keys())
+for k, img in dbg.items():
+    plt.figure()
+    plt.title(k)
+    plt.imshow(img if img.ndim == 3 else img, cmap=None if img.ndim == 3 else "gray")
+    plt.axis("off")
+    plt.savefig(f"{k}.png", bbox_inches="tight")
+    plt.close()

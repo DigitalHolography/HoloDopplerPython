@@ -11,7 +11,7 @@ print("parameters :", parameters)
 
 HD = Holodoppler(backend = "cupy", pipeline_version = "latest")
 
-HD.load_file(r"D:\STAGE\260113_AUZ0752_2.holo")
+HD.load_file(r"D:\STAGE\ABERRATIONS\260316_AUZ0752_7.holo")
 
 print("file header :", HD.file_header)
 
