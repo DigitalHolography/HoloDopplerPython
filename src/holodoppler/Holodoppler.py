@@ -271,9 +271,13 @@ class Holodoppler:
         kernel = (xp.exp(1j * k * z) / (1j * wavelength * z) * xp.exp(phase)).astype(xp.complex64)
         self.kernels["Fresnel_out"] = kernel[xp.newaxis, ...]
 
-    def _build_fresnel_kernel(self, z, pixel_pitch, wavelength, ny, nx):
+    def _build_fresnel_kernel(self, z, pixel_pitch, wavelength, ny, nx, zero_padding = None):
         self._build_fresnel_kernel_in(z, pixel_pitch, wavelength, ny, nx)
         self._build_fresnel_kernel_out(z, pixel_pitch, wavelength, ny, nx)
+        
+        if zero_padding:
+            self.kernels["Fresnel_in"] = self.pad_array_centrally(self.kernels["Fresnel_in"], zero_padding)
+            self.kernels["Fresnel_out"] = self.xp.ones_like(self.kernels["Fresnel_in"])
 
 
     def _build_angular_kernel(self,
@@ -1095,6 +1099,7 @@ class Holodoppler:
         if zero_padding:
             frames = self.pad_array_centrally(frames, zero_padding)
             
+            
         if self.pipeline_version == "latest" : 
 
             return self.fft.fftshift(
@@ -1244,7 +1249,7 @@ class Holodoppler:
         if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel":
             t2 = tic()
             if (not "Fresnel_in" in self.kernels):
-                self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
+                self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx, zero_padding = parameters["zero_padding"])
             toc(t2, "Fresnel kernel build time")
             t2 = tic()
             U_subaps = 0
@@ -1277,27 +1282,27 @@ class Holodoppler:
             phase_term = self.xp.nan_to_num(phase_term, nan=0.0) # completely mask the nan zone where the phase could'nt be estimated
             holograms = []
             for it in range(niter):
-                holograms.append(self._fresnel_transform_phase(frames[it* parameters["time_window"]:(it+1)* parameters["time_window"]], phase_term))
+                holograms.append(self._fresnel_transform_phase(frames[it* parameters["time_window"]:(it+1)* parameters["time_window"]], phase_term, zero_padding = parameters["zero_padding"]))
             toc(t2, "Shack-Hartmann phase correction and Fresnel transform time", holograms)
             
             if parameters["debug"]:
                 t2 = tic()
                 hologramsnotfixed = []
                 for it in range(niter):
-                    hologramsnotfixed.append(self._fresnel_transform(frames[it* parameters["time_window"]:(it+1)* parameters["time_window"]]))
+                    hologramsnotfixed.append(self._fresnel_transform(frames[it* parameters["time_window"]:(it+1)* parameters["time_window"]], zero_padding = parameters["zero_padding"]))
                 toc(t2, "Fresnel transform without phase correction time", hologramsnotfixed)
         elif parameters["spatial_propagation"] == "Fresnel":
             if (not "Fresnel_in" in self.kernels):
-                self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
+                self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx, zero_padding = parameters["zero_padding"])
             holograms = []
             for it in range(niter):
-                holograms.append(self._fresnel_transform(frames[it* parameters["time_window"]:(it+1)* parameters["time_window"]]))
+                holograms.append(self._fresnel_transform(frames[it* parameters["time_window"]:(it+1)* parameters["time_window"]], zero_padding = parameters["zero_padding"]))
         elif parameters["spatial_propagation"] == "AngularSpectrum":
             if (not "AngularSpectrum" in self.kernels):
                 self._build_angular_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
             holograms = []
             for it in range(niter):
-                holograms.append(self._angular_spectrum_transform(frames[it* parameters["time_window"]:(it+1)* parameters["time_window"]]))
+                holograms.append(self._angular_spectrum_transform(frames[it* parameters["time_window"]:(it+1)* parameters["time_window"]], zero_padding = parameters["zero_padding"]))
         t2 = tic()
         holograms_f = []
         for it in range(niter):

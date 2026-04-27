@@ -10,12 +10,12 @@ with open(r"./src/holodoppler/default_parameters.json") as f :
     
 print("Using parameters :", parameters)
 
-HD = Holodoppler(backend = "cupyRAM", pipeline_version = "old")
 
-
-listpath = r"C:\Users\Ivashka\Desktop\list_for_zernike - Copy.txt"
+listpath = r"C:\Users\Ivashka\Desktop\list_for_zernike.txt"
 
 for line in open(listpath, 'r'):
+    HD = Holodoppler(backend = "cupyRAM", pipeline_version = "latest") # temp because of memory leak 
+
     print("Processing file :", line.strip())
     file_path = line.strip()
     HD.load_file(file_path)
