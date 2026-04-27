@@ -577,7 +577,6 @@ class Holodoppler:
         f_fixed = xp.fft.fft2(fixed)
         f_moving = xp.fft.fft2(moving)
         cross_power = f_moving * f_fixed.conj()
-        # Normalize to avoid division by zero
         cross_power /= (xp.abs(cross_power) + 1e-12)
         return xp.fft.ifft2(cross_power)
 
@@ -597,6 +596,9 @@ class Holodoppler:
         xp = self.xp
 
         mask = self._elliptical_mask(ny, nx, radius, xp) if radius else xp.ones((ny, nx), dtype=bool)
+        
+        # _fixed = self.gaussian_filter(fixed,1.5)
+        # _moving = self.gaussian_filter(moving,1.5)
 
         # lo_f, hi_f = xp.percentile(fixed[mask], (0.2, 99.8))
         # _fixed = xp.clip(fixed, lo_f, hi_f)
@@ -1922,11 +1924,17 @@ class Holodoppler:
             # save h5
             save_to_h5path(os.path.join(h5_dir, f"{holodoppler_dir_name}_output.h5"), np.permute_dims(vid, (3, 1, 0, 2)), parameters, reg_list if parameters["image_registration"] else None, zernike_coefs, git_commit=git_txt)
             # add a version.txt file with the version of the holodoppler pipeline used
-            with open(os.path.join(holodoppler_path, "version.txt"), "w") as f:
+            with open(os.path.join(holodoppler_path, "git_version.txt"), "w") as f:
                 f.write(f"Python:\n")
                 f.write(f"Holodoppler pipeline version: {self.pipeline_version}\n")
                 f.write(f"Holodoppler backend: {self.backend}\n") 
                 f.write(f"{git_txt}")
+                
+            with open(os.path.join(holodoppler_path, "version_holodoppler.txt"), "w") as f:
+                f.write(f"py 0.1.0")
+            if self.ext == ".holo":
+                with open(os.path.join(holodoppler_path, "version_holovibes.txt"), "w") as f:
+                    f.write(f"{self.file_footer.get('holovibes_version',"unknown")}")
 
         if return_numpy:
             return self._to_numpy(vid)
