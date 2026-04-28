@@ -690,7 +690,7 @@ class Holodoppler:
 
         # --- Fresnel kernel (cached) ---
         if "Fresnel_in" not in self.kernels:
-            self._build_fresnel_kernel(z_prop, dx, wavelength, Ny, Nx)
+            self._build_fresnel_kernel(z_prop, (dy, dx), wavelength, Ny, Nx)
         Qin = self.kernels["Fresnel_in"]
 
         # Fresnel-multiply once on full field
@@ -715,6 +715,66 @@ class Holodoppler:
         # Batched FFT2 + temporal FFT
         U_f2 = xp.fft.fftshift(xp.fft.fft2(U_subap_all, axes=(-2, -1)), axes=(-2, -1))  # (B, Nz, sub_ny, sub_nx)
         U_ft = xp.fft.fft(U_f2, axis=1)[:, idxs, :, :]                                  # (B, |idxs|, sub_ny, sub_nx)
+
+        # Power spectrum mean over frequency band
+        M0 = xp.mean(xp.abs(U_ft) ** 2, axis=1)                                          # (B, sub_ny, sub_nx)
+        U_subaps = M0.reshape(ny_subabs, nx_subabs, sub_ny, sub_nx).astype(xp.float32)
+
+        RangePop()
+        return U_subaps
+    
+    def _shack_hartmann_constructsubapsimages_angular_spectrum(self, U0, dx, dy, wavelength, z_prop, f0, f1, fs,
+                                           time_window, nx_subabs, ny_subabs, svd_threshold):
+        RangePush("Shack-Hartmann subaperture construction")
+        xp = self.xp
+        Nz, Ny, Nx = U0.shape
+        sub_ny, sub_nx = Ny // ny_subabs, Nx // nx_subabs
+
+        idxs, _ = self._frequency_symmetric_filtering(time_window, fs, f0, high_freq=f1)
+
+        # --- Angular Spectrum kernel (cached) ---
+        if "AngularSpectrum" not in self.kernels:
+            self._build_angular_kernel(z_prop, (dy, dx), wavelength, Ny, Nx)
+        Qin = self.fft.fftshift(self.kernels["AngularSpectrum"], axes=(-2, -1))
+        
+        plt.imshow(self.fft.fftshift(xp.angle(Qin[0]), axes=(-2, -1)).get(), cmap="jet")
+        plt.colorbar()  
+        plt.show()
+
+        # Angular Spectrum-multiply once on full field
+        U_prop_qin = self.fft.fft2(U0, axes=(-2, -1))   # (Nz, Ny, Nx)
+
+        # --- Crop to central region that tiles exactly into subapertures ---
+        crop_ny, crop_nx = sub_ny * ny_subabs, sub_nx * nx_subabs
+        y0, x0 = (Ny - crop_ny) // 2, (Nx - crop_nx) // 2
+        U_prop_qin = U_prop_qin[:, y0:y0 + crop_ny, x0:x0 + crop_nx]  # (Nz, crop_ny, crop_nx)
+        Qin = Qin[:,y0:y0 + crop_ny, x0:x0 + crop_nx]  # (1, crop_ny, crop_nx)
+        
+        U_prop_qin = U_prop_qin * Qin
+        
+        # Reshape into subapertures: (Nz, ny_s, nx_s, sub_ny, sub_nx)
+        U_subap_all = (U_prop_qin
+                    .reshape(Nz, ny_subabs, sub_ny, nx_subabs, sub_nx)
+                    .transpose(0, 1, 3, 2, 4))
+        
+        # Qin_subap_all = (Qin
+        #             .reshape(ny_subabs, sub_ny, nx_subabs, sub_nx)
+        #             .transpose(0, 2, 1, 3))  # (ny_s, nx_s, sub_ny, sub_nx)
+        
+        # U_subap_all = self.fft.fft2(U_subap_all, axes=(-2, -1)) #* self.fft.fftshift(Qin_subap_all, axes=(-2, -1))
+        
+        U_subap_all = self.fft.ifft2(U_subap_all, axes=(-2, -1))  # back to spatial domain after angular spectrum multiplication
+        
+        U_subap_all = U_subap_all.transpose(1, 2, 3, 4, 0)  # (ny_s, nx_s, sub_ny, sub_nx, Nz)
+
+        # Batched SVD filter across all subapertures
+        U_subap_all = self._svd_filter_shack_hartmann(U_subap_all, svd_threshold)
+        # (ny_s, nx_s, sub_ny, sub_nx, Nz) -> (B, Nz, sub_ny, sub_nx)
+        B = ny_subabs * nx_subabs
+        U_subap_all = U_subap_all.reshape(B, sub_ny, sub_nx, Nz).transpose(0, 3, 1, 2)
+
+        # temporal FFT
+        U_ft = xp.fft.fft(U_subap_all, axis=1)[:, idxs, :, :]                                  # (B, |idxs|, sub_ny, sub_nx)
 
         # Power spectrum mean over frequency band
         M0 = xp.mean(xp.abs(U_ft) ** 2, axis=1)                                          # (B, sub_ny, sub_nx)
@@ -1106,7 +1166,15 @@ class Holodoppler:
             return self.fft.fftshift(
             self.fft.fft2(frames * self.kernels["Fresnel_in"] * phase_term, axes=(-1, -2), norm="ortho"), axes=(-1, -2)
             )
+            
+    def _angular_spectrum_transform_phase(self, frames, phase_term, zero_padding = False):
         
+        if zero_padding:
+            frames = self.pad_array_centrally(frames, zero_padding)
+            
+        return self.fft.ifft2(
+            self.fft.fft2(frames, axes=(-1, -2)) * self.fft.fftshift(self.kernels["AngularSpectrum"] * phase_term, axes=(-1, -2)) 
+        )
 
     # ------------------------------------------------------------
     # Render tools for debug and visualization
@@ -1239,13 +1307,19 @@ class Holodoppler:
         
         res = {} # intitialze result dict
         
-        if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel":
+        if parameters["shack_hartmann"] :
             t2 = tic()
-            if (not "Fresnel_in" in self.kernels):
-                self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
+            
             toc(t2, "Fresnel kernel build time")
             t2 = tic()
-            U_subaps = self._shack_hartmann_constructsubapsimages(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], nt, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
+            if parameters["spatial_propagation"] == "Fresnel" :
+                if (not "Fresnel_in" in self.kernels):
+                    self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
+                U_subaps = self._shack_hartmann_constructsubapsimages(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], nt, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
+            elif parameters["spatial_propagation"] == "AngularSpectrum" :
+                if (not "AngularSpectrum" in self.kernels):
+                    self._build_angular_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
+                U_subaps = self._shack_hartmann_constructsubapsimages_angular_spectrum(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], nt, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
             toc(t2, "Shack-Hartmann sub-aperture construction time", U_subaps)
             if parameters["debug"]:
                 res["U_subaps"] = U_subaps
@@ -1271,12 +1345,20 @@ class Holodoppler:
             t2 = tic()
             phase_term = self.xp.exp(- 1j * phase) 
             phase_term = self.xp.nan_to_num(phase_term, nan=0.0) # completely mask the nan zone where the phase could'nt be estimated
-            holograms = self._fresnel_transform_phase(frames, phase_term)
+            if parameters["spatial_propagation"] == "Fresnel" :
+                holograms = self._fresnel_transform_phase(frames, phase_term)            
+            elif parameters["spatial_propagation"] == "AngularSpectrum" :
+                holograms = self._angular_spectrum_transform_phase(frames, phase_term)   
+            
             toc(t2, "Shack-Hartmann phase correction and Fresnel transform time", holograms)
             
             if parameters["debug"]:
                 t2 = tic()
-                hologramsnotfixed = self._fresnel_transform(frames)
+                if parameters["spatial_propagation"] == "Fresnel" :
+                    hologramsnotfixed = self._fresnel_transform(frames)
+                elif parameters["spatial_propagation"] == "AngularSpectrum" :
+                    hologramsnotfixed = self._angular_spectrum_transform(frames) 
+                
                 toc(t2, "Fresnel transform without phase correction time", hologramsnotfixed)
         elif parameters["spatial_propagation"] == "Fresnel":
             if (not "Fresnel_in" in self.kernels):
@@ -1305,7 +1387,7 @@ class Holodoppler:
         M2 = self._moment(psd, freqs, 2)
         toc(t2, "Moment computation time",M0)
         
-        if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and parameters["debug"]: # to compute the res without the phase correction for debug purposes
+        if parameters["shack_hartmann"] and parameters["debug"]: # to compute the res without the phase correction for debug purposes
             t2 = tic()
             hologramsnotfixed_f = self._svd_filter(hologramsnotfixed, parameters["svd_threshold"])
             spectrumnotfixed_f = self._fourier_time_transform(hologramsnotfixed_f)
@@ -1848,12 +1930,9 @@ class Holodoppler:
         if holodoppler_path is True:
             # make the new directory at the same level as the input file with its name then _HD{idx} where idx is the max index of existing holodoppler output directories for this file + 1
             base_name = os.path.splitext(os.path.basename(self.file_path))[0]
-            dir_name = f"{base_name}_HD_"
+            dir_name = f"{base_name}_HD"
             parent_dir = os.path.dirname(self.file_path)
-            existing_dirs = [d for d in os.listdir(parent_dir) if os.path.isdir(os.path.join(parent_dir, d)) and d.startswith(dir_name)]
-            existing_indices = [int(directory.split('_')[-1]) for directory in existing_dirs]
-            idx = max(existing_indices) + 1 if len(existing_dirs) > 0 else 1 
-            holodoppler_dir_name = f"{dir_name}{idx}"
+            holodoppler_dir_name = f"{dir_name}"
             holodoppler_path = os.path.join(parent_dir, holodoppler_dir_name)
             os.makedirs(holodoppler_path, exist_ok=True)
             # make a png, mp4 json and h5 sub directories with their respective content
