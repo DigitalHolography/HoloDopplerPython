@@ -1270,6 +1270,7 @@ class Holodoppler:
             montage_plotter = self.SubapertureMontagePlotter()
             montage_img = montage_plotter.plot(res["U_subaps"])
             montage_plotter.close()
+                
             # cv2.imshow("Sub-aperture Montage", montage_img)
         if "shifts_y" in res and "shifts_x" in res:
             shifts_plotter = self.ShiftsPlotter()
@@ -1880,6 +1881,9 @@ class Holodoppler:
                 for i in range(len(debug_results)):
                     dic = debug_results[i]
                     for key, img in dic.items():
+                        if parameters["square"] and key in ["montage", "M0notfixed"]:
+                            m = max(img.shape[0], img.shape[1])
+                            img = self._resize(img, m, m)
                         streams[key].append(img)
                 import numpy as np
                 vid_debug = [np.stack(stream, axis=2) for stream in streams.values() if len(stream) > 0]
@@ -1982,6 +1986,7 @@ class Holodoppler:
             def save_pair(stem, frames, fps, mp4_dir, avi_dir, sigma = 4.0, is_color=False):
                 # frames = temporal_gaussian(frames, sigma) # removing for clarity only raw output
                 frames = normalize(frames)
+                
                 # print(frames.shape, frames.dtype, type(frames))
                 write_video(os.path.join(mp4_dir, f"{stem}.mp4"), frames, min(fps, 65), "mp4v", is_color)
                 write_video(os.path.join(avi_dir, f"{stem}.avi"), frames, min(fps, 65), "XVID", is_color)
