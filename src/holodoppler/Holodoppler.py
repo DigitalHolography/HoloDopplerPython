@@ -271,15 +271,19 @@ class Holodoppler:
         kernel = (xp.exp(1j * k * z) / (1j * wavelength * z) * xp.exp(phase)).astype(xp.complex64)
         self.kernels["Fresnel_out"] = kernel[xp.newaxis, ...]
 
-    def _build_fresnel_kernel(self, z, pixel_pitch, wavelength, ny, nx):
+    def _build_fresnel_kernel(self, z, pixel_pitch, wavelength, ny, nx, zero_padding = None):
         self._build_fresnel_kernel_in(z, pixel_pitch, wavelength, ny, nx)
         self._build_fresnel_kernel_out(z, pixel_pitch, wavelength, ny, nx)
+        
+        if zero_padding:
+            self.kernels["Fresnel_in"] = self.pad_array_centrally(self.kernels["Fresnel_in"], zero_padding)
+            self.kernels["Fresnel_out"] = self.xp.ones_like(self.kernels["Fresnel_in"])
 
 
     def _build_angular_kernel(self,
                               z,
                               pixel_pitch,
-                              wavelength, ny, nx):
+                              wavelength, ny, nx, zero_padding = None):
 
         if isinstance(pixel_pitch, (float, int)):
             pixel_pitch = (pixel_pitch, pixel_pitch)
@@ -299,6 +303,9 @@ class Holodoppler:
         )
 
         self.kernels["AngularSpectrum"] = kernel[xp.newaxis, ...]
+        
+        if zero_padding:
+            self.kernels["AngularSpectrum"] = self.pad_array_centrally(self.kernels["AngularSpectrum"], zero_padding)
 
     # ------------------------------------------------------------
     # Calculation processing
@@ -680,9 +687,11 @@ class Holodoppler:
         return (H2 - proj).reshape(ny_s, nx_s, sub_ny, sub_nx, nz)
 
     def _shack_hartmann_constructsubapsimages(self, U0, dx, dy, wavelength, z_prop, f0, f1, fs,
-                                           time_window, nx_subabs, ny_subabs, svd_threshold):
+                                           time_window, nx_subabs, ny_subabs, svd_threshold, zero_padding = None):
         RangePush("Shack-Hartmann subaperture construction")
         xp = self.xp
+        if zero_padding:
+            U0 = self.pad_array_centrally(U0, zero_padding)
         Nz, Ny, Nx = U0.shape
         sub_ny, sub_nx = Ny // ny_subabs, Nx // nx_subabs
 
@@ -690,7 +699,7 @@ class Holodoppler:
 
         # --- Fresnel kernel (cached) ---
         if "Fresnel_in" not in self.kernels:
-            self._build_fresnel_kernel(z_prop, (dy, dx), wavelength, Ny, Nx)
+            self._build_fresnel_kernel(z_prop, (dy, dx), wavelength, Ny, Nx, zero_padding=zero_padding)
         Qin = self.kernels["Fresnel_in"]
 
         # Fresnel-multiply once on full field
@@ -719,11 +728,11 @@ class Holodoppler:
         # Power spectrum mean over frequency band
         M0 = xp.mean(xp.abs(U_ft) ** 2, axis=1)                                          # (B, sub_ny, sub_nx)
         U_subaps = M0.reshape(ny_subabs, nx_subabs, sub_ny, sub_nx).astype(xp.float32)
-
+        print(U_subaps.shape)
         RangePop()
         return U_subaps
     
-    def _shack_hartmann_constructsubapsimages_angular_spectrum(self,U0,dx,dy,wavelength,z_prop,f0,f1,fs,time_window,nx_subabs,ny_subabs,svd_threshold):
+    def _shack_hartmann_constructsubapsimages_angular_spectrum(self,U0,dx,dy,wavelength,z_prop,f0,f1,fs,time_window,nx_subabs,ny_subabs,svd_threshold, zero_padding = None):
 
         xp = self.xp
         Nz, Ny, Nx = U0.shape
@@ -745,7 +754,10 @@ class Holodoppler:
 
         # Global angular-spectrum multiplication in the Fourier plane.
         if "AngularSpectrum" not in self.kernels:
-            self._build_angular_kernel(z_prop, (dy, dx), wavelength, Ny, Nx)
+            self._build_angular_kernel(z_prop, (dy, dx), wavelength, Ny, Nx, zero_padding=zero_padding  )
+            
+        if zero_padding:
+            U0 = self.pad_array_centrally(U0, zero_padding)
 
         H = self.kernels["AngularSpectrum"]
         if H.ndim == 2:
@@ -1326,12 +1338,12 @@ class Holodoppler:
             t2 = tic()
             if parameters["spatial_propagation"] == "Fresnel" :
                 if (not "Fresnel_in" in self.kernels):
-                    self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
-                U_subaps = self._shack_hartmann_constructsubapsimages(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], nt, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
+                    self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx, zero_padding = parameters["zero_padding"])
+                U_subaps = self._shack_hartmann_constructsubapsimages(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], nt, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"], zero_padding = parameters["zero_padding"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
             elif parameters["spatial_propagation"] == "AngularSpectrum" :
                 if (not "AngularSpectrum" in self.kernels):
-                    self._build_angular_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
-                U_subaps = self._shack_hartmann_constructsubapsimages_angular_spectrum(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], nt, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
+                    self._build_angular_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx, zero_padding = parameters["zero_padding"])
+                U_subaps = self._shack_hartmann_constructsubapsimages_angular_spectrum(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], nt, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"], zero_padding = parameters["zero_padding"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
             toc(t2, "Shack-Hartmann sub-aperture construction time", U_subaps)
             if parameters["debug"]:
                 res["U_subaps"] = U_subaps
@@ -1357,29 +1369,31 @@ class Holodoppler:
             t2 = tic()
             phase_term = self.xp.exp(- 1j * phase) 
             phase_term = self.xp.nan_to_num(phase_term, nan=0.0) # completely mask the nan zone where the phase could'nt be estimated
+            if parameters["zero_padding"]:
+                phase_term = self.pad_array_centrally(phase_term, parameters["zero_padding"])
             if parameters["spatial_propagation"] == "Fresnel" :
-                holograms = self._fresnel_transform_phase(frames, phase_term)            
+                holograms = self._fresnel_transform_phase(frames, phase_term, zero_padding = parameters["zero_padding"])            
             elif parameters["spatial_propagation"] == "AngularSpectrum" :
-                holograms = self._angular_spectrum_transform_phase(frames, phase_term)   
+                holograms = self._angular_spectrum_transform_phase(frames, phase_term, zero_padding = parameters["zero_padding"])   
             
             toc(t2, "Shack-Hartmann phase correction and Fresnel transform time", holograms)
             
             if parameters["debug"]:
                 t2 = tic()
                 if parameters["spatial_propagation"] == "Fresnel" :
-                    hologramsnotfixed = self._fresnel_transform(frames)
+                    hologramsnotfixed = self._fresnel_transform(frames, zero_padding = parameters["zero_padding"])
                 elif parameters["spatial_propagation"] == "AngularSpectrum" :
-                    hologramsnotfixed = self._angular_spectrum_transform(frames) 
-                
+                    hologramsnotfixed = self._angular_spectrum_transform(frames, zero_padding = parameters["zero_padding"]) 
+                    
                 toc(t2, "Fresnel transform without phase correction time", hologramsnotfixed)
         elif parameters["spatial_propagation"] == "Fresnel":
             if (not "Fresnel_in" in self.kernels):
-                self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
-            holograms = self._fresnel_transform(frames)
+                self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx, zero_padding = parameters["zero_padding"])
+            holograms = self._fresnel_transform(frames, zero_padding = parameters["zero_padding"])
         elif parameters["spatial_propagation"] == "AngularSpectrum":
             if (not "AngularSpectrum" in self.kernels):
-                self._build_angular_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx)
-            holograms = self._angular_spectrum_transform(frames)
+                self._build_angular_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx, zero_padding = parameters["zero_padding"])
+            holograms = self._angular_spectrum_transform(frames, zero_padding = parameters["zero_padding"])
         t2 = tic()   
         holograms_f = self._svd_filter(holograms, parameters["svd_threshold"])
         toc(t2, "SVD filtering time", holograms_f)
