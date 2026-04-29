@@ -333,6 +333,29 @@ class Holodoppler:
         pad_width[-1] = (pad_x0, pad_x1)
 
         return xp.pad(arr, pad_width, mode="constant")
+    
+    def crop_array_centrally(self, arr, target_shape):
+        xp = self.xp
+
+        if isinstance(target_shape, int):
+            target_shape = (target_shape, target_shape)
+
+        ny, nx = arr.shape[-2:]
+        tgt_ny, tgt_nx = target_shape
+
+        if tgt_ny > ny or tgt_nx > nx:
+            raise ValueError("target_shape must be smaller than or equal to current shape")
+
+        crop_y0 = (ny - tgt_ny) // 2
+        crop_y1 = crop_y0 + tgt_ny
+        crop_x0 = (nx - tgt_nx) // 2
+        crop_x1 = crop_x0 + tgt_nx
+
+        slices = [slice(None)] * arr.ndim
+        slices[-2] = slice(crop_y0, crop_y1)
+        slices[-1] = slice(crop_x0, crop_x1)
+
+        return arr[tuple(slices)]
 
     def _fresnel_transform(self, frames, zero_padding = False):
         
@@ -687,11 +710,10 @@ class Holodoppler:
         return (H2 - proj).reshape(ny_s, nx_s, sub_ny, sub_nx, nz)
 
     def _shack_hartmann_constructsubapsimages(self, U0, dx, dy, wavelength, z_prop, f0, f1, fs,
-                                           time_window, nx_subabs, ny_subabs, svd_threshold, zero_padding = None):
+                                           time_window, nx_subabs, ny_subabs, svd_threshold):
         RangePush("Shack-Hartmann subaperture construction")
         xp = self.xp
-        if zero_padding:
-            U0 = self.pad_array_centrally(U0, zero_padding)
+        
         Nz, Ny, Nx = U0.shape
         sub_ny, sub_nx = Ny // ny_subabs, Nx // nx_subabs
 
@@ -699,8 +721,9 @@ class Holodoppler:
 
         # --- Fresnel kernel (cached) ---
         if "Fresnel_in" not in self.kernels:
-            self._build_fresnel_kernel(z_prop, (dy, dx), wavelength, Ny, Nx, zero_padding=zero_padding)
-        Qin = self.kernels["Fresnel_in"]
+            self._build_fresnel_kernel(z_prop, (dy, dx), wavelength, Ny, Nx)
+            
+        Qin = self.crop_array_centrally(self.kernels["Fresnel_in"], (Ny, Nx))
 
         # Fresnel-multiply once on full field
         U_prop_qin = U0 * Qin  # (Nz, Ny, Nx)
@@ -728,11 +751,10 @@ class Holodoppler:
         # Power spectrum mean over frequency band
         M0 = xp.mean(xp.abs(U_ft) ** 2, axis=1)                                          # (B, sub_ny, sub_nx)
         U_subaps = M0.reshape(ny_subabs, nx_subabs, sub_ny, sub_nx).astype(xp.float32)
-        print(U_subaps.shape)
         RangePop()
         return U_subaps
     
-    def _shack_hartmann_constructsubapsimages_angular_spectrum(self,U0,dx,dy,wavelength,z_prop,f0,f1,fs,time_window,nx_subabs,ny_subabs,svd_threshold, zero_padding = None):
+    def _shack_hartmann_constructsubapsimages_angular_spectrum(self,U0,dx,dy,wavelength,z_prop,f0,f1,fs,time_window,nx_subabs,ny_subabs,svd_threshold):
 
         xp = self.xp
         Nz, Ny, Nx = U0.shape
@@ -754,12 +776,9 @@ class Holodoppler:
 
         # Global angular-spectrum multiplication in the Fourier plane.
         if "AngularSpectrum" not in self.kernels:
-            self._build_angular_kernel(z_prop, (dy, dx), wavelength, Ny, Nx, zero_padding=zero_padding  )
-            
-        if zero_padding:
-            U0 = self.pad_array_centrally(U0, zero_padding)
+            self._build_angular_kernel(z_prop, (dy, dx), wavelength, Ny, Nx)
 
-        H = self.kernels["AngularSpectrum"]
+        H = self.crop_array_centrally(self.kernels["AngularSpectrum"], (Ny, Nx))
         if H.ndim == 2:
             H = H[None, :, :]
 
@@ -1339,11 +1358,11 @@ class Holodoppler:
             if parameters["spatial_propagation"] == "Fresnel" :
                 if (not "Fresnel_in" in self.kernels):
                     self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx, zero_padding = parameters["zero_padding"])
-                U_subaps = self._shack_hartmann_constructsubapsimages(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], nt, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"], zero_padding = parameters["zero_padding"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
+                U_subaps = self._shack_hartmann_constructsubapsimages(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], nt, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
             elif parameters["spatial_propagation"] == "AngularSpectrum" :
                 if (not "AngularSpectrum" in self.kernels):
                     self._build_angular_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx, zero_padding = parameters["zero_padding"])
-                U_subaps = self._shack_hartmann_constructsubapsimages_angular_spectrum(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], nt, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"], zero_padding = parameters["zero_padding"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
+                U_subaps = self._shack_hartmann_constructsubapsimages_angular_spectrum(frames, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], nt, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
             toc(t2, "Shack-Hartmann sub-aperture construction time", U_subaps)
             if parameters["debug"]:
                 res["U_subaps"] = U_subaps

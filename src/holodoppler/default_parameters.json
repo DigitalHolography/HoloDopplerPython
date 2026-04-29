@@ -10,7 +10,7 @@
   "wavelength": 8.52e-7,
   "pixel_pitch": 2e-5,
   "spatial_propagation": "Fresnel",
-  "zero_padding": 512,
+  "zero_padding": false,
   "z": 0.480,
   "shack_hartmann": true,
   "shack_hartmann_ny_subap": 5,
