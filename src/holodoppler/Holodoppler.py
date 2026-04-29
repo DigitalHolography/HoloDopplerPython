@@ -723,65 +723,76 @@ class Holodoppler:
         RangePop()
         return U_subaps
     
-    def _shack_hartmann_constructsubapsimages_angular_spectrum(self, U0, dx, dy, wavelength, z_prop, f0, f1, fs,
-                                           time_window, nx_subabs, ny_subabs, svd_threshold):
-        RangePush("Shack-Hartmann subaperture construction")
+    def _shack_hartmann_constructsubapsimages_angular_spectrum(self,U0,dx,dy,wavelength,z_prop,f0,f1,fs,time_window,nx_subabs,ny_subabs,svd_threshold):
+
         xp = self.xp
         Nz, Ny, Nx = U0.shape
-        sub_ny, sub_nx = Ny // ny_subabs, Nx // nx_subabs
 
-        idxs, _ = self._frequency_symmetric_filtering(time_window, fs, f0, high_freq=f1)
+        sub_ny = Ny // ny_subabs
+        sub_nx = Nx // nx_subabs
 
-        # --- Angular Spectrum kernel (cached) ---
+        crop_ny = sub_ny * ny_subabs
+        crop_nx = sub_nx * nx_subabs
+        y0 = (Ny - crop_ny) // 2
+        x0 = (Nx - crop_nx) // 2
+
+        idxs, _ = self._frequency_symmetric_filtering(
+            time_window,
+            fs,
+            f0,
+            high_freq=f1,
+        )
+
+        # Global angular-spectrum multiplication in the Fourier plane.
         if "AngularSpectrum" not in self.kernels:
             self._build_angular_kernel(z_prop, (dy, dx), wavelength, Ny, Nx)
-        Qin = self.fft.fftshift(self.kernels["AngularSpectrum"], axes=(-2, -1))
-        
-        plt.imshow(self.fft.fftshift(xp.angle(Qin[0]), axes=(-2, -1)).get(), cmap="jet")
-        plt.colorbar()  
-        plt.show()
 
-        # Angular Spectrum-multiply once on full field
-        U_prop_qin = self.fft.fft2(U0, axes=(-2, -1))   # (Nz, Ny, Nx)
+        H = self.kernels["AngularSpectrum"]
+        if H.ndim == 2:
+            H = H[None, :, :]
 
-        # --- Crop to central region that tiles exactly into subapertures ---
-        crop_ny, crop_nx = sub_ny * ny_subabs, sub_nx * nx_subabs
-        y0, x0 = (Ny - crop_ny) // 2, (Nx - crop_nx) // 2
-        U_prop_qin = U_prop_qin[:, y0:y0 + crop_ny, x0:x0 + crop_nx]  # (Nz, crop_ny, crop_nx)
-        Qin = Qin[:,y0:y0 + crop_ny, x0:x0 + crop_nx]  # (1, crop_ny, crop_nx)
-        
-        U_prop_qin = U_prop_qin * Qin
-        
-        # Reshape into subapertures: (Nz, ny_s, nx_s, sub_ny, sub_nx)
-        U_subap_all = (U_prop_qin
-                    .reshape(Nz, ny_subabs, sub_ny, nx_subabs, sub_nx)
-                    .transpose(0, 1, 3, 2, 4))
-        
-        # Qin_subap_all = (Qin
-        #             .reshape(ny_subabs, sub_ny, nx_subabs, sub_nx)
-        #             .transpose(0, 2, 1, 3))  # (ny_s, nx_s, sub_ny, sub_nx)
-        
-        # U_subap_all = self.fft.fft2(U_subap_all, axes=(-2, -1)) #* self.fft.fftshift(Qin_subap_all, axes=(-2, -1))
-        
-        U_subap_all = self.fft.ifft2(U_subap_all, axes=(-2, -1))  # back to spatial domain after angular spectrum multiplication
-        
-        U_subap_all = U_subap_all.transpose(1, 2, 3, 4, 0)  # (ny_s, nx_s, sub_ny, sub_nx, Nz)
+        U_fft = self.fft.fft2(U0, axes=(-2, -1)) * self.fft.fftshift(H, axes=(-2, -1))
 
-        # Batched SVD filter across all subapertures
-        U_subap_all = self._svd_filter_shack_hartmann(U_subap_all, svd_threshold)
-        # (ny_s, nx_s, sub_ny, sub_nx, Nz) -> (B, Nz, sub_ny, sub_nx)
+        # Crop the global Fourier plane so it tiles exactly into subapertures.
+        U_fft = U_fft[:, y0 : y0 + crop_ny, x0 : x0 + crop_nx]
+        
+        U_fft = self.fft.fftshift(U_fft, axes=(-2, -1)) # fft shift to get low freq in the center now
+
+        # Split Fourier plane into local subaperture tiles:
+        # (Nz, crop_ny, crop_nx) -> (Nz, ny_subabs, nx_subabs, sub_ny, sub_nx)
+        U_subap_all = (
+            U_fft.reshape(Nz, ny_subabs, sub_ny, nx_subabs, sub_nx)
+            .transpose(0, 1, 3, 2, 4)
+        )
+
+        # Local inverse FFT per subaperture.
+        
+        U_subap_all = self.fft.ifftshift(U_subap_all, axes=(-2, -1)) #ifft shift to prepare for ifft2 to correct the previous global fftshift
+        U_subap_all = self.fft.ifft2(U_subap_all, axes=(-2, -1))
+
+        # SVD expects: (ny_subabs, nx_subabs, sub_ny, sub_nx, Nz)
+        U_subap_all = U_subap_all.transpose(1, 2, 3, 4, 0)
+        U_subap_all = xp.ascontiguousarray(U_subap_all)
+
+        # U_subap_all = self._svd_filter_shack_hartmann(
+        #     U_subap_all,
+        #     svd_threshold,
+        # )
+
+        # Temporal FFT expects: (B, Nz, sub_ny, sub_nx)
         B = ny_subabs * nx_subabs
-        U_subap_all = U_subap_all.reshape(B, sub_ny, sub_nx, Nz).transpose(0, 3, 1, 2)
+        U_subap_all = (
+            U_subap_all.reshape(B, sub_ny, sub_nx, Nz)
+            .transpose(0, 3, 1, 2)
+        )
 
-        # temporal FFT
-        U_ft = xp.fft.fft(U_subap_all, axis=1)[:, idxs, :, :]                                  # (B, |idxs|, sub_ny, sub_nx)
+        U_ft = self.fft.fft(U_subap_all, axis=1)[:, idxs, :, :]
+        M0 = xp.mean(xp.abs(U_ft) ** 2, axis=1)
 
-        # Power spectrum mean over frequency band
-        M0 = xp.mean(xp.abs(U_ft) ** 2, axis=1)                                          # (B, sub_ny, sub_nx)
-        U_subaps = M0.reshape(ny_subabs, nx_subabs, sub_ny, sub_nx).astype(xp.float32)
-
-        RangePop()
-        return U_subaps
+        return M0.reshape(ny_subabs, nx_subabs, sub_ny, sub_nx).astype(
+            xp.float32,
+            copy=False,
+        )
 
     def _shack_hartmann_displacement_calculation(self, U_subabs, xp, ref=None, spatial_propagation="Fresnel"):
         """Vectorized Shack-Hartmann displacement with single FFT2 call."""
