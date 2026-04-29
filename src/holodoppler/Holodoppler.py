@@ -1282,7 +1282,7 @@ class Holodoppler:
             phase_plotter.close()
             # cv2.imshow("Reconstructed Phase", phase_img)
         if "M0notfixed" in res:
-            M0notfixedimg = (res["M0notfixed"] - np.min(res["M0notfixed"])) / (np.max(res["M0notfixed"]) - np.min(res["M0notfixed"])) * 255
+            M0notfixedimg = self._to_numpy((res["M0notfixed"] - np.min(res["M0notfixed"])) / (np.max(res["M0notfixed"]) - np.min(res["M0notfixed"])) * 255)
             # cv2.imshow("M0 without Phase Correction", M0notfixed_img)
         return { "montage": montage_img, "shifts": shifts_img, "phase": phase_img, "M0notfixed": M0notfixedimg }
         
@@ -1876,7 +1876,7 @@ class Holodoppler:
                 debug_results[i] = res
 
             if any(res is not None for res in debug_results.values()):
-                streams = {"montage": [], "shifts": [], "phase": []}
+                streams = {"montage": [], "shifts": [], "phase": [], "M0notfixed": []}
                 for i in range(len(debug_results)):
                     dic = debug_results[i]
                     for key, img in dic.items():
@@ -1982,6 +1982,7 @@ class Holodoppler:
             def save_pair(stem, frames, fps, mp4_dir, avi_dir, sigma = 4.0, is_color=False):
                 # frames = temporal_gaussian(frames, sigma) # removing for clarity only raw output
                 frames = normalize(frames)
+                # print(frames.shape, frames.dtype, type(frames))
                 write_video(os.path.join(mp4_dir, f"{stem}.mp4"), frames, min(fps, 65), "mp4v", is_color)
                 write_video(os.path.join(avi_dir, f"{stem}.avi"), frames, min(fps, 65), "XVID", is_color)
 
@@ -2024,7 +2025,7 @@ class Holodoppler:
                 f.write(f"py 0.1.0")
             if self.ext == ".holo":
                 with open(os.path.join(holodoppler_path, "version_holovibes.txt"), "w") as f:
-                    f.write(f"{self.file_footer.get('holovibes_version',"unknown")}")
+                    f.write(f"{self.file_footer.get('info',{}).get('holovibes_version', 'unknown')}")
 
         if return_numpy:
             return self._to_numpy(vid)
