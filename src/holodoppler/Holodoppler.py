@@ -794,7 +794,7 @@ class Holodoppler:
             copy=False,
         )
 
-    def _shack_hartmann_displacement_calculation(self, U_subabs, xp, ref=None, spatial_propagation="Fresnel"):
+    def _shack_hartmann_displacement_calculation(self, U_subabs, xp, pupil_threshold = 1.0, deviation_threshold = 3.0, ref = None):
         """Vectorized Shack-Hartmann displacement with single FFT2 call."""
         RangePush("Shack-Hartmann displacement calculation")
         ny_s, nx_s, Ny, Nx = U_subabs.shape
@@ -857,7 +857,7 @@ class Holodoppler:
         xs = xp.linspace(-1, 1, nx_s)
         ys = xp.linspace(-1, 1, ny_s)
         YY, XX = xp.meshgrid(ys, xs, indexing='ij')
-        pupil_mask = (XX**2 + YY**2) <= 1.0
+        pupil_mask = (XX**2 + YY**2) <= pupil_threshold
 
         # --- Filtering ---
         shift_y_flat = shift_y[pupil_mask]
@@ -869,8 +869,8 @@ class Holodoppler:
         std_y = xp.std(shift_y_flat)
         std_x = xp.std(shift_x_flat)
 
-        thresh_y = 3.0 * std_y
-        thresh_x = 3.0 * std_x
+        thresh_y = deviation_threshold * std_y
+        thresh_x = deviation_threshold * std_x
 
         bad = (
             (xp.abs(shift_y - mean_y) > thresh_y) |
@@ -1337,7 +1337,7 @@ class Holodoppler:
                 res["U_subaps"] = U_subaps
 
             t2 = tic()
-            shifts_y, shifts_x = self._shack_hartmann_displacement_calculation(U_subaps, self.xp, ref = None) # get the shifts in pixels in the subapertures images
+            shifts_y, shifts_x = self._shack_hartmann_displacement_calculation(U_subaps, self.xp, pupil_threshold = parameters["shack_hartmann_pupil_threshold"], deviation_threshold = parameters["shack_hartmann_deviation_threshold"], ref = None) # get the shifts in pixels in the subapertures images
             toc(t2, "Shack-Hartmann displacement calculation time", shifts_y)
             if parameters["debug"]:
                 res["shifts_y"] = shifts_y
@@ -1962,9 +1962,7 @@ class Holodoppler:
             os.makedirs(avi_dir, exist_ok=True)
             os.makedirs(json_dir, exist_ok=True)
             os.makedirs(h5_dir, exist_ok=True)
-            # save pngs
-            for i in range(vid.shape[2]):
-                plt.imsave(os.path.join(png_dir, f"moment_{i}.png"), np.mean(vid[:, :, i, :],axis=2), cmap="gray")
+            
             # save m0 as mp4 and avi
             def normalize(arr):
                 arr = arr.astype(np.float32)
@@ -1983,23 +1981,37 @@ class Holodoppler:
                     out.write(frames[:, :, i] if frames.ndim == 3 else frames[:, :, i, :])
                 out.release()
 
-            def save_pair(stem, frames, fps, mp4_dir, avi_dir, sigma = 4.0, is_color=False):
-                # frames = temporal_gaussian(frames, sigma) # removing for clarity only raw output
+            def save_pair(stem, frames, fps, mp4_dir, avi_dir, sigma = 4.0, is_color=False, save_png=True):
+                frames = temporal_gaussian(frames, sigma) # removing for clarity only raw output
                 frames = normalize(frames)
                 
                 # print(frames.shape, frames.dtype, type(frames))
                 write_video(os.path.join(mp4_dir, f"{stem}.mp4"), frames, min(fps, 65), "mp4v", is_color)
                 write_video(os.path.join(avi_dir, f"{stem}.avi"), frames, min(fps, 65), "XVID", is_color)
+                if save_png:
+                    plt.imsave(os.path.join(png_dir, f"{stem}.png"), np.mean(frames, axis=2), cmap="gray")
 
             fps = num_batch / (end_frame - first_frame) * parameters["sampling_freq"]
 
-            save_pair("moment_0", vid[:, :, 0, :], fps, mp4_dir, avi_dir)
-            save_pair("moment_1", vid[:, :, 1, :], fps, mp4_dir, avi_dir)
-            save_pair("moment_2", vid[:, :, 2, :], fps, mp4_dir, avi_dir)
+            save_pair("moment_0", vid[:, :, 0, :], fps, mp4_dir, avi_dir, sigma=0)
+            save_pair("moment_1", vid[:, :, 1, :], fps, mp4_dir, avi_dir, sigma=0)
+            save_pair("moment_2", vid[:, :, 2, :], fps, mp4_dir, avi_dir, sigma=0)
+
+            if parameters["debug"]:
+                def flatfield3D(arr, gw):
+                    if arr.ndim != 3:
+                        raise ValueError("Input array must be 3D")
+                    if gw <= 1:
+                        return arr
+                    blurred = np_gaussian_filter(arr, sigma=(gw, gw, 1))
+                    blurred[blurred == 0] = 1
+                    return arr / blurred
+                save_pair("moment_0_slidingavg_flatfield", flatfield3D(vid[:, :, 0, :], parameters["registration_flatfield_gw"]), fps, mp4_dir, avi_dir, sigma=1.50)
+            
 
             if parameters["debug"] and vid_debug is not None:
                 for idx, v in enumerate(vid_debug):
-                    save_pair(f"debug_{idx}", v, fps, mp4_dir, avi_dir, sigma=0, is_color=v.ndim == 4)
+                    save_pair(f"debug_{idx}", v, fps, mp4_dir, avi_dir, sigma=0, is_color=v.ndim == 4, save_png=False)
 
             # save json
             with open(os.path.join(json_dir, "parameters.json"), "w") as f:
