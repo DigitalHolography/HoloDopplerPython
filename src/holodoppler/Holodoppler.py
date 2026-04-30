@@ -825,7 +825,7 @@ class Holodoppler:
             copy=False,
         )
 
-    def _shack_hartmann_displacement_calculation(self, U_subabs, xp, pupil_threshold = 1.0, deviation_threshold = 3.0, ref = None):
+    def _shack_hartmann_displacement_calculation(self, U_subabs, xp, pupil_threshold = 1.0, deviation_threshold = 3.0, shifts_pixel_range_threshold = 20.0, ref = None):
         """Vectorized Shack-Hartmann displacement with single FFT2 call."""
         RangePush("Shack-Hartmann displacement calculation")
         ny_s, nx_s, Ny, Nx = U_subabs.shape
@@ -903,9 +903,12 @@ class Holodoppler:
         thresh_y = deviation_threshold * std_y
         thresh_x = deviation_threshold * std_x
 
+        # --- Pixel range filtering ---
         bad = (
             (xp.abs(shift_y - mean_y) > thresh_y) |
             (xp.abs(shift_x - mean_x) > thresh_x) |
+            (xp.abs(shift_y) > shifts_pixel_range_threshold) |
+            (xp.abs(shift_x) > shifts_pixel_range_threshold) |
             (~pupil_mask)
         )
 
@@ -1368,7 +1371,7 @@ class Holodoppler:
                 res["U_subaps"] = U_subaps
 
             t2 = tic()
-            shifts_y, shifts_x = self._shack_hartmann_displacement_calculation(U_subaps, self.xp, pupil_threshold = parameters["shack_hartmann_pupil_threshold"], deviation_threshold = parameters["shack_hartmann_deviation_threshold"], ref = None) # get the shifts in pixels in the subapertures images
+            shifts_y, shifts_x = self._shack_hartmann_displacement_calculation(U_subaps, self.xp, pupil_threshold = parameters["shack_hartmann_pupil_threshold"], deviation_threshold = parameters["shack_hartmann_deviation_threshold"], shifts_pixel_range_threshold = parameters["shack_hartmann_shifts_pixel_range_threshold"], ref = None) # get the shifts in pixels in the subapertures images
             toc(t2, "Shack-Hartmann displacement calculation time", shifts_y)
             if parameters["debug"]:
                 res["shifts_y"] = shifts_y
