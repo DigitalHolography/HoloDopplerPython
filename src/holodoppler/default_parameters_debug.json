@@ -1,6 +1,6 @@
 {
-  "batch_size": 256,
-  "batch_stride": 25600,
+  "batch_size": 512,
+  "batch_stride": 512,
   "image_registration": true,
   "registration_disc_ratio": 0.8,
   "registration_flatfield_gw": 35,
@@ -11,7 +11,7 @@
   "pixel_pitch": 2e-5,
   "spatial_propagation": "Fresnel",
   "zero_padding": false,
-  "z": 0.480,
+  "z": 0.452,
   "shack_hartmann": true,
   "shack_hartmann_ny_subap": 5,
   "shack_hartmann_nx_subap": 5,
