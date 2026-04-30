@@ -117,11 +117,13 @@ class Holodoppler:
             self._frequency_symmetric_filtering = self._new_frequency_symmetric_filtering
             self._resize = self.resize_fft2_slicewise
             self._registration = self.new_registration
+            self.applyshifts = self.applyshifts_subpix
             return
         elif self.pipeline_version == "old":
             self._frequency_symmetric_filtering = self._old_frequency_symmetric_filtering
             self._resize = self.resize_matlab_slicewise
             self._registration = self.old_registration
+            self.applyshifts = self._roll2d
             self._moment = self._momentkHz
 
     # ------------------------------------------------------------
@@ -620,20 +622,47 @@ class Holodoppler:
     def _roll2d(img, peak_y, peak_x, xp):
         return xp.roll(xp.roll(img, peak_y, axis = -2), peak_x, axis = -1)
 
+    @staticmethod
+    def _signed_shift_from_peak(peak_y, peak_x, ny, nx):
+        if peak_y > ny // 2:
+            peak_y -= ny
+        if peak_x > nx // 2:
+            peak_x -= nx
+        return float(peak_y), float(peak_x)
+
+
+    @staticmethod
+    def _subpixel_peak_1d(v_minus, v_0, v_plus):
+        denom = v_minus - 2.0 * v_0 + v_plus
+        if abs(float(denom)) < 1e-12:
+            return 0.0
+        return 0.5 * float(v_minus - v_plus) / float(denom)
+
+
+    @staticmethod
+    def applyshifts_subpix(img, shift_y, shift_x, xp):
+        ny, nx = img.shape[-2:]
+
+        fy = xp.fft.fftfreq(ny).reshape(ny, 1)
+        fx = xp.fft.fftfreq(nx).reshape(1, nx)
+
+        phase = xp.exp(-2j * xp.pi * (fy * shift_y + fx * shift_x))
+
+        f_img = xp.fft.fft2(img, axes=(-2, -1))
+        shifted = xp.fft.ifft2(f_img * phase, axes=(-2, -1))
+
+        if xp.isrealobj(img):
+            shifted = shifted.real
+
+        return shifted.astype(img.dtype, copy=False)
+
+
     def new_registration(self, fixed, moving, radius):
         ny, nx = fixed.shape
-
         xp = self.xp
 
         mask = self._elliptical_mask(ny, nx, radius, xp) if radius else xp.ones((ny, nx), dtype=bool)
-        
-        # _fixed = self.gaussian_filter(fixed,1.5)
-        # _moving = self.gaussian_filter(moving,1.5)
 
-        # lo_f, hi_f = xp.percentile(fixed[mask], (0.2, 99.8))
-        # _fixed = xp.clip(fixed, lo_f, hi_f)
-        # lo_m, hi_m = xp.percentile(moving[mask], (0.2, 99.8))
-        # _moving = xp.clip(moving, lo_m, hi_m)
         _fixed = fixed
         _moving = moving
 
@@ -641,14 +670,34 @@ class Holodoppler:
         moving_c = (_moving - xp.mean(_moving[mask])) * mask
 
         xcorr = self._xcorr2d(fixed_c, moving_c, xp)
-
         mag = xp.abs(xcorr)
 
         ky0, kx0 = xp.unravel_index(xp.argmax(mag), mag.shape)
-        peak_y, peak_x = int(ky0), int(kx0)
+        ky0, kx0 = int(ky0), int(kx0)
 
-        # moving_reg = self._roll2d(moving, -peak_y, -peak_x, xp)
-        return (-peak_y, -peak_x)
+        # Integer FFT peak -> signed shift close to zero.
+        peak_y, peak_x = self._signed_shift_from_peak(ky0, kx0, ny, nx)
+
+        # Subpixel refinement by fitting a parabola around the peak.
+        ym = mag[(ky0 - 1) % ny, kx0]
+        y0 = mag[ky0, kx0]
+        yp = mag[(ky0 + 1) % ny, kx0]
+
+        xm = mag[ky0, (kx0 - 1) % nx]
+        x0 = mag[ky0, kx0]
+        xp1 = mag[ky0, (kx0 + 1) % nx]
+
+        sub_y = self._subpixel_peak_1d(ym, y0, yp)
+        sub_x = self._subpixel_peak_1d(xm, x0, xp1)
+
+        peak_y += sub_y
+        peak_x += sub_x
+
+        # Shift to apply to moving to align it with fixed.
+        shift_y = -peak_y
+        shift_x = -peak_x
+
+        return shift_y, shift_x
 
     def old_registration(self, fixed, moving, radius):
         ny, nx = fixed.shape
@@ -1566,9 +1615,9 @@ class Holodoppler:
                     if parameters["image_registration"]:
                         M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
                         (shift_y, shift_x) = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
-                        M0 = self._roll2d(M0, shift_y, shift_x, self.xp)
-                        M1 = self._roll2d(M1, shift_y, shift_x, self.xp)
-                        M2 = self._roll2d(M2, shift_y, shift_x, self.xp)
+                        M0 = self.applyshifts(M0, shift_y, shift_x, self.xp)
+                        M1 = self.applyshifts(M1, shift_y, shift_x, self.xp)
+                        M2 = self.applyshifts(M2, shift_y, shift_x, self.xp)
                         reg_list[i] = (shift_y, shift_x)
                 
                 stream_compute.synchronize()
@@ -1710,9 +1759,9 @@ class Holodoppler:
                     with stream_registration:
                         M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
                         (shift_y, shift_x) = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
-                        M0 = self._roll2d(M0, shift_y, shift_x, self.xp)
-                        M1 = self._roll2d(M1, shift_y, shift_x, self.xp)
-                        M2 = self._roll2d(M2, shift_y, shift_x, self.xp)
+                        M0 = self.applyshifts(M0, shift_y, shift_x, self.xp)
+                        M1 = self.applyshifts(M1, shift_y, shift_x, self.xp)
+                        M2 = self.applyshifts(M2, shift_y, shift_x, self.xp)
                         reg_list[i] = (shift_y, shift_x)
                     
                     if stream_registration:
@@ -1829,9 +1878,9 @@ class Holodoppler:
                     if parameters["image_registration"]:
                         M0_ff = self_state._flatfield(M0, parameters["registration_flatfield_gw"])
                         shift_y, shift_x = self_state._registration(self_state.M0_reg, M0_ff, parameters["registration_disc_ratio"])
-                        M0 = self_state._roll2d(M0, shift_y, shift_x, np)
-                        M1 = self_state._roll2d(M1, shift_y, shift_x, np)
-                        M2 = self_state._roll2d(M2, shift_y, shift_x, np)
+                        M0 = self_state.applyshifts(M0, shift_y, shift_x, np)
+                        M1 = self_state.applyshifts(M1, shift_y, shift_x, np)
+                        M2 = self_state.applyshifts(M2, shift_y, shift_x, np)
                     return i, (M0, M1, M2, debug_imgs, shift_y, shift_x)
                 except Exception:
                     traceback.print_exc()
@@ -1878,9 +1927,9 @@ class Holodoppler:
                     if parameters["image_registration"]:
                         M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
                         (shift_y, shift_x) = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
-                        M0 = self._roll2d(M0, shift_y, shift_x, self.xp)
-                        M1 = self._roll2d(M1, shift_y, shift_x, self.xp)
-                        M2 = self._roll2d(M2, shift_y, shift_x, self.xp)
+                        M0 = self.applyshifts(M0, shift_y, shift_x, self.xp)
+                        M1 = self.applyshifts(M1, shift_y, shift_x, self.xp)
+                        M2 = self.applyshifts(M2, shift_y, shift_x, self.xp)
                         reg_list[i] = (shift_y, shift_x)
 
                     out_list.append(
