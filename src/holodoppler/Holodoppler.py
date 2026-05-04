@@ -2054,11 +2054,11 @@ class Holodoppler:
                     reg_start = time.perf_counter()
                     with stream_registration:
                         M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
-                        (shift_y, shift_x) = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
-                        M0 = self.applyshifts(M0, shift_y, shift_x, self.xp)
-                        M1 = self.applyshifts(M1, shift_y, shift_x, self.xp)
-                        M2 = self.applyshifts(M2, shift_y, shift_x, self.xp)
-                        reg_list[i] = (shift_y, shift_x)
+                        reg = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
+                        M0 = self.applyregistration(M0, reg, self.xp)
+                        M1 = self.applyregistration(M1, reg, self.xp)
+                        M2 = self.applyregistration(M2, reg, self.xp)
+                        reg_list[i] = reg
                     
                     if stream_registration:
                         stream_registration.synchronize()
@@ -2173,10 +2173,11 @@ class Holodoppler:
                     shift_y = shift_x = None
                     if parameters["image_registration"]:
                         M0_ff = self_state._flatfield(M0, parameters["registration_flatfield_gw"])
-                        shift_y, shift_x = self_state._registration(self_state.M0_reg, M0_ff, parameters["registration_disc_ratio"])
-                        M0 = self_state.applyshifts(M0, shift_y, shift_x, np)
-                        M1 = self_state.applyshifts(M1, shift_y, shift_x, np)
-                        M2 = self_state.applyshifts(M2, shift_y, shift_x, np)
+                        reg = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
+                        M0 = self.applyregistration(M0, reg, self.xp)
+                        M1 = self.applyregistration(M1, reg, self.xp)
+                        M2 = self.applyregistration(M2, reg, self.xp)
+                        reg_list[i] = reg
                     return i, (M0, M1, M2, debug_imgs, shift_y, shift_x)
                 except Exception:
                     traceback.print_exc()
@@ -2222,11 +2223,11 @@ class Holodoppler:
 
                     if parameters["image_registration"]:
                         M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
-                        (shift_y, shift_x) = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
-                        M0 = self.applyshifts(M0, shift_y, shift_x, self.xp)
-                        M1 = self.applyshifts(M1, shift_y, shift_x, self.xp)
-                        M2 = self.applyshifts(M2, shift_y, shift_x, self.xp)
-                        reg_list[i] = (shift_y, shift_x)
+                        reg = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
+                        M0 = self.applyregistration(M0, reg, self.xp)
+                        M1 = self.applyregistration(M1, reg, self.xp)
+                        M2 = self.applyregistration(M2, reg, self.xp)
+                        reg_list[i] = reg
 
                     out_list.append(
                         self.xp.stack([M0, M1, M2], axis=2)
