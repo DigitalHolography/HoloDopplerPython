@@ -6,7 +6,7 @@ import numpy as np
 from matlab_imresize.imresize import imresize
 
 parameter_path = "./src/holodoppler/default_parameters_debug.json"
-holo_path = r"D:\za\260429_zzz.holo"
+holo_path = r"D:\aberrotono\260504_BOM0753_aberotono_8.holo"
 
 with open(parameter_path) as f :
     x = f.read()

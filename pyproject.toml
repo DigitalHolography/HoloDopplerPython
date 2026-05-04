@@ -1,7 +1,11 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "holodoppler"
 version = "0.1.0"
-description = "Add your description here"
+description = "HoloDoppler processing and preview tools."
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -17,7 +21,22 @@ dependencies = [
   "imageio>=2.37.3",
 ]
 
+[project.optional-dependencies]
+build = [
+  "pyinstaller>=6.0",
+]
+
+[project.scripts]
+holodoppler = "holodoppler.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[tool.setuptools.package-data]
+holodoppler = ["py.typed"]
 
+[tool.pyinstaller]
+name = "HoloDoppler"

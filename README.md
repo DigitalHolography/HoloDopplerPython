@@ -2,26 +2,24 @@
 
 Follow the steps below to install dependencies and run the example.
 
-## 1. Install `uv` if not already intalled
+## 1. Install the Project
 
 ```bash
-python -m pip install uv
+python -m venv .venv
+source ./.venv/Scripts/activate
+python -m pip install -e .
 ```
 
-## 2. Sync Dependencies
+## 2. Run the Example
+
+### Preview
 
 ```bash
-uv sync
+holodoppler preview "D:\path\to\holo.holo" "./src/holodoppler/default_parameters.json"
 ```
 
-## 3. Install the Project in Editable Mode
+### Process
 
 ```bash
-uv pip install -e .
-```
-
-## 4. Run the Example
-
-```bash
-uv run python -m holodoppler.example
+holodoppler process "D:\path\to\holo.holo" "./src/holodoppler/default_parameters.json"
 ```
