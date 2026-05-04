@@ -13,8 +13,9 @@ def preview(holo_path, parameters: dict) -> None:
     HD = Holodoppler(backend = "cupyRAM", pipeline_version = "latest")
 
     HD.load_file(holo_path)
-
-    print("file header :", HD.file_header)
+    
+    if HD.ext == ".holo":
+        print("file header :", HD.file_header)
     
     print(parameters)
 
@@ -114,7 +115,8 @@ def process(holo_path, parameters: dict) -> None:
 
     HD.load_file(holo_path)
 
-    print("file header :", HD.file_header)
+    if HD.ext == ".holo":
+        print("file header :", HD.file_header)
 
     HD.process_moments_(parameters, holodoppler_path = True)
 

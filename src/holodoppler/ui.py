@@ -274,6 +274,7 @@ class UI(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                     self.q.put(("status", "Stopped"))
                     return
                 self.q.put(("status", f"Processing {i}/{len(self.paths)}"))
+                print(f"Processing {p} with parameters:")
                 process(str(p), params)
             self.q.put(("status", "Done ヽ(^o^)丿"))
         except Exception as e:
@@ -290,7 +291,7 @@ class UI(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
     # ------------------------------------------------------------------
 
     def choose_config(self):
-        p = filedialog.askopenfilename(filetypes=[("JSON config", "*.json"), ("All files", "*.*")])
+        p = filedialog.askopenfilename(filetypes=[("JSON config", "*.json"), ("All files", "*.*")], initialdir=self.config_path.parent)
         if p:
             self.config_path = Path(p)
             self.config_var.set(str(self.config_path))

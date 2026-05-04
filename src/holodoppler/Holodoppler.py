@@ -753,8 +753,7 @@ class Holodoppler:
             matrix,
             offset=offset,
             order=1,
-            mode="constant",
-            cval=0.0,
+            mode="nearest",
         )
 
         return out.astype(img.dtype, copy=False)
@@ -784,7 +783,7 @@ class Holodoppler:
         moving,
         radius=None,
         *,
-        estimate_similarity=True,
+        estimate_similarity=False,
         radial_bins=256,
         angular_bins=360,
         return_registered=False,
@@ -2099,7 +2098,7 @@ class Holodoppler:
         else:
             vid_debug = None
         t_debug = time.perf_counter() - t0
-        print(f"[TIMING] debug handling: {t_debug:.3f}s")
+        # print(f"[TIMING] debug handling: {t_debug:.3f}s")
 
         # ------------------------------------------------------------
         # Zernike coefficients
@@ -2118,7 +2117,7 @@ class Holodoppler:
             ny, nx, nimgs, nt = vid.shape
             vid = self.xp.reshape(vid[:,:,:,:(nt//acc)*acc], (ny, nx, nimgs, nt//acc, acc)) @ self.xp.ones(acc)
         t_acc = time.perf_counter() - t0
-        print(f"[TIMING] accumulation: {t_acc:.3f}s")
+        # print(f"[TIMING] accumulation: {t_acc:.3f}s")
 
         # ------------------------------------------------------------
         # Spatial transformations (square, transpose, flips)
@@ -2136,7 +2135,7 @@ class Holodoppler:
         if parameters["flip_y"]:
             vid = self.xp.flip(vid, axis=0)
         t_spatial = time.perf_counter() - t0
-        print(f"[TIMING] spatial transforms: {t_spatial:.3f}s")
+        # print(f"[TIMING] spatial transforms: {t_spatial:.3f}s")
 
         # ------------------------------------------------------------
         # Convert to numpy if needed
@@ -2145,7 +2144,7 @@ class Holodoppler:
         if (h5_path is not None) or (mp4_path is not None) or holodoppler_path:
             vid = self._to_numpy(vid)
         t_to_numpy = time.perf_counter() - t0
-        print(f"[TIMING] to_numpy conversion: {t_to_numpy:.3f}s")
+        # print(f"[TIMING] to_numpy conversion: {t_to_numpy:.3f}s")
         
         # -------------------------------------------------------------
         # Close file if needed
@@ -2193,7 +2192,7 @@ class Holodoppler:
                 git_commit = None
             save_to_h5path(h5_path, v, parameters, reg_list = None, zernike_coefs = None, git_commit = git_commit)
             t_save += time.perf_counter() - tt
-            print(f"[TIMING] save HDF5: {time.perf_counter()-tt:.3f}s")
+            # print(f"[TIMING] save HDF5: {time.perf_counter()-tt:.3f}s")
 
         if mp4_path is not None:
             tt = time.perf_counter()
@@ -2212,7 +2211,7 @@ class Holodoppler:
             fps = num_batch / (end_frame - first_frame) * parameters["sampling_freq"]
             write_video(mp4_path, vid[:, :, 0, :], min(fps, 65), "mp4v")
             t_save += time.perf_counter() - tt
-            print(f"[TIMING] save MP4: {time.perf_counter()-tt:.3f}s")
+            # print(f"[TIMING] save MP4: {time.perf_counter()-tt:.3f}s")
 
         if holodoppler_path:
             tt = time.perf_counter()
@@ -2318,11 +2317,22 @@ class Holodoppler:
                     f.write(f"{self.file_footer.get('info',{}).get('holovibes_version', 'unknown')}")
                     
             t_save += time.perf_counter() - tt
-            print(f"[TIMING] holodoppler outputs: {time.perf_counter()-tt:.3f}s")
+            # print(f"[TIMING] holodoppler outputs: {time.perf_counter()-tt:.3f}s")
+            
+        # Dispose of GPU arrays to free memory
+        if self.backend in ["cupy", "cupyRAM"]:
+            del d_frames
+            if 'd_frames_next' in locals():
+                del d_frames_next
+            cp.cuda.Device().synchronize()
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+            
+        plt.close('all') # close any open figures to free memory
 
-        print(f"[TIMING] total saving time: {t_save:.3f}s")
+        print(f"total saving time: {t_save:.3f}s")
 
         if return_numpy:
             return self._to_numpy(vid)
-
-        return vid
+        
+        
