@@ -19,6 +19,7 @@ dependencies = [
   "cupy-cuda13x>=14.0.1",
   "lblprof>=0.1.8",
   "imageio>=2.37.3",
+  "tkinterdnd2",
 ]
 
 [project.optional-dependencies]
@@ -27,7 +28,7 @@ build = [
 ]
 
 [project.scripts]
-holodoppler = "holodoppler.cli:main"
+holodoppler = "holodoppler.__main__:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -23,3 +23,10 @@ holodoppler preview "D:\path\to\holo.holo" "./src/holodoppler/default_parameters
 ```bash
 holodoppler process "D:\path\to\holo.holo" "./src/holodoppler/default_parameters.json"
 ```
+
+### Building app
+
+```bash
+python -m pip install -e .[build]
+python build_installer.py
+```

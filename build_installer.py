@@ -83,6 +83,7 @@ def _ensure_supported_python() -> None:
 def _read_version() -> str:
     if PYPROJECT_FILE.exists():
         data = tomllib.loads(PYPROJECT_FILE.read_text(encoding="utf-8"))
+        print(data)
         version = data.get("project", {}).get("version")
         if isinstance(version, str) and version.strip():
             return version.strip()
@@ -127,7 +128,19 @@ def _find_iscc(explicit_path: Path | None) -> Path:
 def _run_command(command: list[str | Path]) -> None:
     cmd = [str(part) for part in command]
     print(f"> {' '.join(cmd)}")
-    subprocess.run(cmd, cwd=PROJECT_ROOT, check=True)
+
+    result = subprocess.run(
+        cmd,
+        cwd=PROJECT_ROOT,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+    )
+
+    print(result.stdout)
+
+    if result.returncode != 0:
+        raise SystemExit(f"Command failed with exit code {result.returncode}")
 
 
 def _remove_path(path: Path) -> None:
@@ -152,7 +165,17 @@ def _write_pyinstaller_entrypoint() -> Path:
             """
             from __future__ import annotations
 
-            from holodoppler.cli import main
+            import sys
+
+            from holodoppler.cli import main as cli_main
+            from holodoppler.ui import UI
+
+            def main() -> int:
+                if len(sys.argv) == 1:
+                    UI().mainloop()
+                    return 0
+
+                return cli_main()
 
             if __name__ == "__main__":
                 raise SystemExit(main())
@@ -196,6 +219,10 @@ def _run_pyinstaller(console: bool) -> None:
         "scipy",
         "--collect-submodules",
         "h5py",
+        "--collect-submodules",
+        "tkinterdnd2",
+        "--collect-data",
+        "tkinterdnd2",
     ]
 
     if console:

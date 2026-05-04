@@ -9,14 +9,14 @@ from holodoppler.Holodoppler import Holodoppler
 from matlab_imresize.imresize import imresize
 import os
 
-    
-
 def preview(holo_path, parameters: dict) -> None:
     HD = Holodoppler(backend = "cupyRAM", pipeline_version = "latest")
 
     HD.load_file(holo_path)
 
     print("file header :", HD.file_header)
+    
+    print(parameters)
 
     frames = HD.read_frames(0, 1)
     res = HD.render_moments(parameters, tictoc= False)
@@ -97,6 +97,16 @@ def preview(holo_path, parameters: dict) -> None:
     # --- Save ---
     save_dir = "./debug_outputs"
     save_debug_images(debug_imgs, save_dir)
+    
+    M0img = debug_imgs.get("M0")
+    if M0img is not None:
+        if M0img.ndim == 2 and parameters["square"]:
+            H, W = M0img.shape
+            L = max(H, W)
+            # --- Resize ---
+            M0img = imresize(M0img, output_shape=(L, L))
+            
+        return M0img
 
 
 def process(holo_path, parameters: dict) -> None:
