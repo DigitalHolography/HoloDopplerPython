@@ -21,8 +21,18 @@ APP_NAME = "HoloDoppler"
 SUPPORTED = {".holo", ".cine", ".txt"}
 DEFAULT_CONFIG = Path("./src/holodoppler/default_parameters.json")
 
+# ------------------------------------------------------------------
+# DND availability check – root window will inherit from TkinterDnD.Tk if present
+# ------------------------------------------------------------------
+try:
+    from tkinterdnd2 import TkinterDnD
+    DND_AVAILABLE = True
+except ImportError:
+    DND_AVAILABLE = False
+    TkinterDnD = tk.Tk  # fallback (no DND)
 
-class UI(tk.Tk):
+
+class UI(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
@@ -66,6 +76,13 @@ class UI(tk.Tk):
             style.configure("Accent.TButton", background="#0a5c8e", foreground="white")
             style.map("Accent.TButton", background=[("active", "#0f6ba3")])
 
+            # Custom style for readonly Entry (gray background, white text)
+            style.configure("Readonly.TEntry",
+                            fieldbackground="#3c3c3c",   # gray background
+                            foreground="white",
+                            borderwidth=1,
+                            relief="solid")
+
         # Use a font that is guaranteed to exist, avoid tuple issues
         default_font = ("TkDefaultFont", 10)
         self.option_add("*Font", default_font)
@@ -105,7 +122,10 @@ class UI(tk.Tk):
         config_frame = ttk.Frame(main)
         config_frame.grid(row=1, column=1, sticky="ew", pady=(10, 0))
         config_frame.columnconfigure(0, weight=1)
-        config_entry = ttk.Entry(config_frame, textvariable=self.config_var, state="readonly")
+
+        # Use a custom style to give the readonly entry a gray background
+        config_entry = ttk.Entry(config_frame, textvariable=self.config_var,
+                                 state="readonly", style="Readonly.TEntry")
         config_entry.grid(row=0, column=0, sticky="ew")
 
         ttk.Button(main, text="⚙️ Change", command=self.choose_config).grid(
@@ -283,18 +303,22 @@ class UI(tk.Tk):
     # ------------------------------------------------------------------
 
     def _enable_dnd(self):
+        if not DND_AVAILABLE:
+            self.status_var.set("Drag & drop not available (install tkinterdnd2)")
+            return
+
         try:
-            from tkinterdnd2 import DND_FILES, TkinterDnD
-            # Convert the root window to a TkinterDnD window dynamically
-            self.__class__ = type("DNDUI", (TkinterDnD.Tk, UI), {})
-            self.drop_target_register(DND_FILES)
+            # Register the whole window as a drop target
+            self.drop_target_register("DND_Files")
             self.dnd_bind("<<Drop>>", self._on_drop)
             self.status_var.set("Ready – drop .holo/.cine/.txt anywhere")
         except Exception as e:
-            print(e)
-            self.status_var.set("Drag & drop not available (install tkinterdnd2)")
+            print(f"DND registration error: {e}")
+            self.status_var.set("Drag & drop failed to initialize")
 
     def _on_drop(self, e):
+        # e.data may contain space-separated paths, possibly with curly braces for spaces.
+        # splitlist handles that correctly.
         files = self.tk.splitlist(e.data)
         if files:
             self._set_paths([Path(p) for p in files])
