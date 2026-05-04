@@ -2072,7 +2072,11 @@ class Holodoppler:
             zernike_coefs = None
         
         vid = self.xp.stack(out_list, axis=3) 
-            
+        
+        # ------------------------------------------------------------
+        # Debug handling
+        # ------------------------------------------------------------
+        t0 = time.perf_counter()
         if parameters["debug"]:
             debugin_queue.join()
             stop_event.set()
@@ -2099,31 +2103,58 @@ class Holodoppler:
                 vid_debug = None
         else:
             vid_debug = None
+        t_debug = time.perf_counter() - t0
+        print(f"[TIMING] debug handling: {t_debug:.3f}s")
 
+        # ------------------------------------------------------------
+        # Zernike coefficients
+        # ------------------------------------------------------------
+        if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and all(coefs is not None for coefs in coefs_list):
+            zernike_coefs = self._to_numpy(self.xp.array(coefs_list))
+        else:
+            zernike_coefs = None
+
+        # ------------------------------------------------------------
+        # Temporal accumulation
+        # ------------------------------------------------------------
+        t0 = time.perf_counter()
         if parameters["accumulation"] > 1:
             acc = parameters["accumulation"] 
             ny, nx, nimgs, nt = vid.shape
-            vid = self.xp.reshape(vid[:,:,:,:(nt//acc)*acc],(ny, nx, nimgs, nt//acc, acc)) @ self.xp.ones(acc) # / acc
+            vid = self.xp.reshape(vid[:,:,:,:(nt//acc)*acc], (ny, nx, nimgs, nt//acc, acc)) @ self.xp.ones(acc)
+        t_acc = time.perf_counter() - t0
+        print(f"[TIMING] accumulation: {t_acc:.3f}s")
 
+        # ------------------------------------------------------------
+        # Spatial transformations (square, transpose, flips)
+        # ------------------------------------------------------------
+        t0 = time.perf_counter()
         if parameters["square"]:
             m = max(vid.shape[0], vid.shape[1])
-            # vid = self.resize_fft2_slicewise(vid, m, m)
-            import numpy as np
             vid = self._to_numpy(vid).astype(np.float64)
             vid = self._resize(vid, m, m)
-            
         if parameters["transpose"]:
             vid = self.xp.transpose(vid, axes=(1, 0, 2, 3))
-            
         if parameters["flip_x"]:
             vid = self.xp.flip(vid, axis=1)
-        
         if parameters["flip_y"]:
             vid = self.xp.flip(vid, axis=0)
+        t_spatial = time.perf_counter() - t0
+        print(f"[TIMING] spatial transforms: {t_spatial:.3f}s")
 
+        # ------------------------------------------------------------
+        # Convert to numpy if needed
+        # ------------------------------------------------------------
+        t0 = time.perf_counter()
         if (h5_path is not None) or (mp4_path is not None) or holodoppler_path:
             vid = self._to_numpy(vid)
-            
+        t_to_numpy = time.perf_counter() - t0
+        print(f"[TIMING] to_numpy conversion: {t_to_numpy:.3f}s")
+
+        # ------------------------------------------------------------
+        # Saving outputs (h5, mp4, holodoppler)
+        # ------------------------------------------------------------
+        
         def save_to_h5path(h5_path, v, parameters, reg_list = None, zernike_coefs = None, git_commit = None):
             with h5py.File(h5_path, "w") as f:
                 f.create_dataset("moment0", data=v[:, :, :, 0])
@@ -2148,9 +2179,43 @@ class Holodoppler:
                     f.create_dataset("cine_metadata", data=json.dumps(self.cine_metadata_json, default=json_serializer))
                 if git_commit is not None:
                     f.create_dataset("git_commit", data=git_commit)
+                    
+                    
+        t_save = 0.0
 
-        if holodoppler_path is True:
-            # make the new directory at the same level as the input file with its name then _HD{idx} where idx is the max index of existing holodoppler output directories for this file + 1
+        if h5_path is not None:
+            tt = time.perf_counter()
+            try:
+                import subprocess
+                git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
+            except Exception:
+                git_commit = None
+            save_to_h5path(h5_path, v, parameters, reg_list = None, zernike_coefs = None, git_commit = git_commit)
+            t_save += time.perf_counter() - tt
+            print(f"[TIMING] save HDF5: {time.perf_counter()-tt:.3f}s")
+
+        if mp4_path is not None:
+            tt = time.perf_counter()
+            
+            # save m0 as mp4
+            def normalize(arr):
+                arr = arr.astype(np.float32)
+                lo, hi = arr.min(), arr.max()
+                return ((arr - lo) / (hi - lo) * 255).astype(np.uint8) if hi > lo else arr.astype(np.uint8)
+            def write_video(path, frames, fps):
+                h, w, n = frames.shape[0], frames.shape[1], frames.shape[2]
+                out = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h), isColor=False)
+                for i in range(n):
+                    out.write(normalize(frames[:, :, i]))
+                out.release()
+            fps = num_batch / (end_frame - first_frame) * parameters["sampling_freq"]
+            write_video(mp4_path, vid[:, :, 0, :], min(fps, 65), "mp4v")
+            t_save += time.perf_counter() - tt
+            print(f"[TIMING] save MP4: {time.perf_counter()-tt:.3f}s")
+
+        if holodoppler_path:
+            tt = time.perf_counter()
+            
             base_name = os.path.splitext(os.path.basename(self.file_path))[0]
             dir_name = f"{base_name}_HD"
             parent_dir = os.path.dirname(self.file_path)
@@ -2250,6 +2315,11 @@ class Holodoppler:
             if self.ext == ".holo":
                 with open(os.path.join(holodoppler_path, "version_holovibes.txt"), "w") as f:
                     f.write(f"{self.file_footer.get('info',{}).get('holovibes_version', 'unknown')}")
+                    
+            t_save += time.perf_counter() - tt
+            print(f"[TIMING] holodoppler outputs: {time.perf_counter()-tt:.3f}s")
+
+        print(f"[TIMING] total saving time: {t_save:.3f}s")
 
         if return_numpy:
             return self._to_numpy(vid)
