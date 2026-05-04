@@ -772,6 +772,25 @@ class Holodoppler:
         )
 
         return out.astype(img.dtype, copy=False)
+    
+    @staticmethod
+    def new_applyshifts(img, shift_y, shift_x, xp):
+        ny, nx = img.shape[-2:]
+
+        fy = xp.fft.fftfreq(ny).reshape(ny, 1)
+        fx = xp.fft.fftfreq(nx).reshape(1, nx)
+
+        phase = xp.exp(-2j * xp.pi * (fy * shift_y + fx * shift_x))
+
+        out = xp.fft.ifft2(
+            xp.fft.fft2(img, axes=(-2, -1)) * phase,
+            axes=(-2, -1),
+        )
+
+        if xp.isrealobj(img):
+            out = out.real
+
+        return out.astype(img.dtype, copy=False)
 
 
     def _registration_trs(
@@ -2076,6 +2095,7 @@ class Holodoppler:
         # ------------------------------------------------------------
         # Debug handling
         # ------------------------------------------------------------
+        import time
         t0 = time.perf_counter()
         if parameters["debug"]:
             debugin_queue.join()
