@@ -7,19 +7,24 @@ from tqdm import tqdm
 import cv2
 import json
 import os
-import threading
-import queue
 import time
 import cinereader
 from cupy.cuda.nvtx import RangePush, RangePop
 import time
 import matplotlib.pyplot as plt
-
-# ------------------------------------------------------------
-# Optional CuPy support
-# ------------------------------------------------------------
-
-
+import scipy.fft as np_fft
+from scipy.ndimage import gaussian_filter as np_gaussian_filter
+from scipy.ndimage import gaussian_filter1d
+from matlab_imresize.imresize import imresize
+import scipy.ndimage as np_ndi
+from scipy.interpolate import griddata
+import scipy.fftpack as np_fftpack
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+import numpy as np
+# from concurrent.futures import ProcessPoolExecutor, as_completed
+# from multiprocessing import cpu_count
+# import threading
+# import queue
 
 try:
     import cupy as cp
@@ -33,18 +38,6 @@ except Exception:
     cp_fft = None
     _cupy_available = False
 
-import scipy.fft as np_fft
-from scipy.ndimage import gaussian_filter as np_gaussian_filter
-from scipy.ndimage import gaussian_filter1d
-from matlab_imresize.imresize import imresize
-import scipy.ndimage as np_ndi
-from scipy.interpolate import griddata
-import scipy.fftpack as np_fftpack
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-
-import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import cpu_count
 
 class Holodoppler:
     """
@@ -280,7 +273,6 @@ class Holodoppler:
         if zero_padding:
             self.kernels["Fresnel_in"] = self.pad_array_centrally(self.kernels["Fresnel_in"], zero_padding)
             self.kernels["Fresnel_out"] = self.xp.ones_like(self.kernels["Fresnel_in"])
-
 
     def _build_angular_kernel(self,
                               z,
@@ -630,14 +622,12 @@ class Holodoppler:
             kx -= nx
         return float(ky), float(kx)
 
-
     @staticmethod
     def _subpixel_parabola(vm, v0, vp):
         denom = vm - 2.0 * v0 + vp
         if abs(float(denom)) < 1e-12:
             return 0.0
         return 0.5 * float(vm - vp) / float(denom)
-
 
     def _phase_corr_subpixel(self, a, b, xp):
         ny, nx = a.shape[-2:]
@@ -673,7 +663,6 @@ class Holodoppler:
 
         return -peak_y, -peak_x
 
-
     @staticmethod
     def _logpolar(img, radial_bins, angular_bins, xp):
         if xp.__name__ == "cupy":
@@ -699,7 +688,6 @@ class Holodoppler:
 
         return map_coordinates(img, coords, order=1, mode="constant", cval=0.0)
 
-
     @staticmethod
     def _fourier_magnitude_for_similarity(img, xp):
         mag = xp.abs(xp.fft.fftshift(xp.fft.fft2(img)))
@@ -717,7 +705,6 @@ class Holodoppler:
 
         return mag
 
-
     def _estimate_rotation_scale(self, fixed, moving, xp, radial_bins=256, angular_bins=360):
         fixed_mag = self._fourier_magnitude_for_similarity(fixed, xp)
         moving_mag = self._fourier_magnitude_for_similarity(moving, xp)
@@ -734,7 +721,6 @@ class Holodoppler:
         scale = float(xp.exp(d_r * log_base))
 
         return float(angle_deg), scale
-
 
     @staticmethod
     def _apply_rotation_scale(img, angle_deg, scale, xp):
@@ -791,7 +777,6 @@ class Holodoppler:
             out = out.real
 
         return out.astype(img.dtype, copy=False)
-
 
     def _registration_trs(
         self,
@@ -1581,10 +1566,7 @@ class Holodoppler:
                 # print(f" CPU time: {t2[1] - t1[1]:.2f} seconds")
                 # if arr is not None and isinstance(arr, (np.ndarray, cp.ndarray)): 
                 #     print(arr.dtype)
-            
-        
-        
-        
+                
         t1 = tic()
         if frames is None:
             frames = self.read_frames(parameters["first_frame"], parameters["batch_size"])
@@ -1712,7 +1694,6 @@ class Holodoppler:
     # ------------------------------------------------------------
 
     def process_moments_(self, parameters, h5_path = None, mp4_path = None, return_numpy = False, holodoppler_path = False):
-        
         
         batch_size = parameters["batch_size"]
         batch_stride = parameters["batch_stride"]
@@ -2165,6 +2146,11 @@ class Holodoppler:
             vid = self._to_numpy(vid)
         t_to_numpy = time.perf_counter() - t0
         print(f"[TIMING] to_numpy conversion: {t_to_numpy:.3f}s")
+        
+        # -------------------------------------------------------------
+        # Close file if needed
+        # -------------------------------------------------------------
+        self._close_file()
 
         # ------------------------------------------------------------
         # Saving outputs (h5, mp4, holodoppler)
