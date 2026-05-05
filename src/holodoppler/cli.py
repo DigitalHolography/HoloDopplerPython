@@ -23,6 +23,7 @@ def preview(holo_path, parameters: dict) -> None:
     res = HD.render_moments(parameters, tictoc= False)
 
     def plot_debug_safe(HD, res, i):
+        HD.init_plot_debug(parameters)
         debug = {}
 
         if "U_subaps" in res:
