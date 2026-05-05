@@ -19,7 +19,7 @@ from holodoppler.cli import preview, process
 
 APP_NAME = "HoloDoppler"
 SUPPORTED = {".holo", ".cine", ".txt"}
-DEFAULT_CONFIG = Path("./src/holodoppler/default_parameters.json")
+DEFAULT_CONFIG = Path("./parameters/default_parameters.json")
 
 # ------------------------------------------------------------------
 # DND availability check – root window will inherit from TkinterDnD.Tk if present
