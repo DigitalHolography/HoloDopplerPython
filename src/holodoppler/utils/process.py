@@ -171,7 +171,6 @@ class Processor():
             
             # Create queues for frames and results
             frame_queue = queue.Queue(maxsize=4)  # Configurable queue depth
-            result_queue = queue.Queue()
             
             # Control flags
             stop_reader = threading.Event()
@@ -256,7 +255,7 @@ class Processor():
                 # Compute current batch
                 compute_start = time.perf_counter()
                 with stream_compute:
-                    res = self.render_moments(parameters, frames=d_frames)
+                    res = self.render_moments(parameters, frames=d_frames, registration_ref=M0_reg)
                 
                 if res is None:
                     break
@@ -373,7 +372,7 @@ class Processor():
 
                     frames = self.read_frames(first_frame + i * parameters["batch_stride"] , parameters["batch_size"])
 
-                    res = self.render_moments(parameters, frames = frames)
+                    res = self.render_moments(parameters, frames = frames, registration_ref=M0_reg)
 
                     if res is None:
                         break
