@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matlab_imresize.imresize import imresize
 
-parameter_path = "./src/holodoppler/default_parameters_debug.json"
+parameter_path = "./src/holodoppler/default_parameters_lightest.json"
 holo_path = r"D:\PROJETS\DATA\260113_AUZ0752_6.holo"
 
 with open(parameter_path) as f :
@@ -24,7 +24,7 @@ frames = HD.read_frames(0, 1)
 res = HD.render_moments(parameters, tictoc= False)
 
 def plot_debug_safe(HD, res):
-    HD.init_plot_debug()
+    HD.init_plot_debug(parameters)
     debug = {}
 
     for key, plotter in HD.debug_plotters.items():

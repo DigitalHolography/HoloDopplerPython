@@ -1479,7 +1479,7 @@ class Holodoppler:
             return img
         def close(self):
             pass
-        
+
     class ShiftsPlotter:
         # TODO no matplotlib just cv2
         def __init__(self, title="Wavefront Slopes from Sub-aperture Shifts", figsize=(8, 6), dpi=100, scale=None):
@@ -1518,6 +1518,102 @@ class Holodoppler:
         def close(self):
             plt.close(self.fig)
         
+    class SpectrumPlotter:
+
+        def __init__(self, fs, f1, f2,
+                    title="Spectrum",
+                    figsize=(8, 6), dpi=100,
+                    show_bands=True,
+                    ylim=None,
+                    use_stem=False):
+
+            self.fs = fs
+            self.f1 = f1
+            self.f2 = f2
+            self.show_bands = show_bands
+            self.ylim = ylim
+            self.use_stem = use_stem
+
+            self.fig, self.ax = plt.subplots(figsize=figsize, dpi=dpi)
+            self.canvas = FigureCanvasAgg(self.fig)
+            self.title = title
+
+        def plot(self, spectrum_line, freqs):
+
+            if isinstance(spectrum_line, cp.ndarray):
+                spectrum_line = cp.asnumpy(spectrum_line)
+            freqs = np.fft.fftfreq(len(spectrum_line), d=1/self.fs)
+
+            freqs = np.fft.fftshift(freqs)
+            spectrum_line = np.fft.fftshift(spectrum_line)
+
+            # log scale
+            spectrum_line[spectrum_line <= 0] = np.nan
+            signal_log = np.log10(spectrum_line)
+
+            self.ax.clear()
+
+            # main plot
+            if self.use_stem:
+                markerline, stemlines, baseline = self.ax.stem(freqs, signal_log, basefmt=" ")
+                plt.setp(markerline, color='black')
+                plt.setp(stemlines, color='black', linewidth=1)
+            else:
+                self.ax.plot(freqs, signal_log, color='black', linewidth=1)
+
+            # shaded bands
+            if self.show_bands:
+                r1 = (-self.f2 < freqs) & (freqs < -self.f1)
+                r2 = (self.f1 < freqs) & (freqs < self.f2)
+
+                self.ax.fill_between(freqs[r1], signal_log[r1],
+                                    color='lightgray', edgecolor='black')
+                self.ax.fill_between(freqs[r2], signal_log[r2],
+                                    color='lightgray', edgecolor='black')
+
+            # vertical lines
+            for val in [self.f1, self.f2, -self.f1, -self.f2]:
+                self.ax.axvline(val, linestyle='--', color='black')
+
+            # x limits
+            self.ax.set_xlim([freqs.min(), freqs.max()])
+
+            # y limits
+            if self.ylim is not None:
+                self.ax.set_ylim(self.ylim)
+            else:
+                valid = (~np.isnan(spectrum_line)) & (np.abs(freqs) > self.f1)
+                if np.any(valid):
+                    ymin = 0.9 * np.log10(np.nanmin(spectrum_line[valid]))
+                    ymax = 1.11 * np.log10(np.nanmax(spectrum_line[valid]))
+                    self.ax.set_ylim([ymin, ymax])
+
+            # ticks
+            if self.f1 != 0:
+                ticks = [-self.f2, -self.f1, self.f1, self.f2]
+            else:
+                ticks = [-self.f2, self.f2]
+
+            self.ax.set_xticks(ticks)
+            self.ax.set_xticklabels([f"{t:.1f}" for t in ticks])
+
+            # labels
+            self.ax.set_title(self.title)
+            self.ax.set_xlabel('frequency (Hz)')
+            self.ax.set_ylabel('log10 S')
+
+            self.ax.grid(True, linestyle='--', alpha=0.5)
+
+            # render
+            self.canvas.draw()
+            img = np.frombuffer(self.canvas.buffer_rgba(), dtype=np.uint8)
+            img = img.reshape(self.canvas.get_width_height()[::-1] + (4,))
+
+            return img[..., :3]
+
+        def close(self):
+            plt.close(self.fig)
+        
     class SubapertureMontagePlotter:
         def __init__(self):
             pass
@@ -1533,7 +1629,7 @@ class Holodoppler:
         def close(self):
             pass
         
-    def init_plot_debug(self):
+    def init_plot_debug(self, parameters):
         matplotlib.use("Agg")
         # --- CENTRAL DEBUG REGISTRY (edit only here to add new outputs) ---
         self.debug_plotters = {
@@ -1543,6 +1639,13 @@ class Holodoppler:
             "phase": self.PhasePlotter(),
             "phase_rel": self.PhasePlotter(relative=True),
             "M0notfixed": self.ImagePlotter(),
+            "spectrum": self.SpectrumPlotter(
+                fs=parameters["sampling_freq"],
+                f1=parameters["low_freq"],
+                f2=parameters["high_freq"],
+                ylim=(12,20),
+                use_stem=False
+            ),
         }
 
         # maps key -> function(res) -> args for plotter
@@ -1553,6 +1656,7 @@ class Holodoppler:
             "phase":   lambda res: (res["phase"],),
             "phase_rel": lambda res: (res["phase"],),
             "M0notfixed": lambda res: (res["M0notfixed"],),
+            "spectrum": lambda res: (res["spectrum_line"], res["freqs"]),
         }
     
     def plot_debug(self, res, i):
@@ -1713,6 +1817,10 @@ class Holodoppler:
             idxs, freqs = self._frequency_symmetric_filtering(frames_sub.shape[0], parameters["sampling_freq"], parameters["low_freq"], parameters["high_freq"])
             psd = self.xp.abs(spectrum_f[idxs,:,:]) ** 2
 
+            if parameters["debug"]:
+                res_["spectrum_line"] = self.xp.mean(self.xp.abs(spectrum_f[:,:,:]) ** 2, axis=(-1, -2)) # spectrum line at the center of the image for debug purposes
+                res_["freqs"] = freqs
+
             res_["M0"] = self._moment(psd, freqs, 0)
             res_["M1"] = self._moment(psd, freqs, 1)
             res_["M2"] = self._moment(psd, freqs, 2)
@@ -1782,7 +1890,7 @@ class Holodoppler:
             import threading
             import queue
             
-            self.init_plot_debug()
+            self.init_plot_debug(parameters)
 
             # --- create plotting worker ---
 
