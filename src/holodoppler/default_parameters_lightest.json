@@ -7,7 +7,7 @@
   "registration_flatfield_gw": 35,
   "batch_size_registration": 512,
   "first_frame": 0,
-  "end_frame": 0,
+  "end_frame": 1000,
   "wavelength": 8.52e-7,
   "pixel_pitch": 2e-5,
   "spatial_propagation": "Fresnel",
@@ -32,5 +32,5 @@
   "flip_x": false,
   "flip_y": false,
   
-  "debug" : false
+  "debug" : true
 }

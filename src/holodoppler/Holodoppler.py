@@ -1785,22 +1785,34 @@ class Holodoppler:
             self.init_plot_debug()
 
             # --- create plotting worker ---
-            def plotting_worker(in_q, out_q, stop_event):
+
+            debug_results = {}
+            res_store = {}   # shared storage
+            lock = threading.Lock()
+
+            def plotting_worker(in_q, stop_event):
                 while not stop_event.is_set() or not in_q.empty():
                     try:
-                        i, res = in_q.get(timeout=0.1)
+                        i = in_q.get(timeout=0.1)
                     except queue.Empty:
                         continue
+
+                    with lock:
+                        res = res_store.pop(i)  # remove to free memory early
+
                     out = self.plot_debug(res, i)
-                    out_q.put((i, out))
+
+                    with lock:
+                        debug_results[i] = out
+
                     in_q.task_done()
-                    
-            debugin_queue = queue.Queue(maxsize=14)  # limit to avoid memory blowup
-            debugout_queue = queue.Queue()
+
+            debugin_queue = queue.Queue(maxsize=14)
             stop_event = threading.Event()
+
             debug_thread = threading.Thread(
                 target=plotting_worker,
-                args=(debugin_queue, debugout_queue, stop_event),
+                args=(debugin_queue, stop_event),
                 daemon=True
             )
             debug_thread.start()
@@ -1854,7 +1866,9 @@ class Holodoppler:
                 
                 if parameters["debug"]:
                     # debug_imgs = {k: res[k] for k in res if k not in ["M0", "M1", "M2"]}
-                    debugin_queue.put((i, res))
+                    with lock:
+                        res_store[i] = res
+                    debugin_queue.put((i))
                 
                 stream_compute.synchronize()
                 
@@ -1984,7 +1998,9 @@ class Holodoppler:
                 M0, M1, M2 = res["M0"], res["M1"], res["M2"]
                 if parameters["debug"]:
                     # debug_imgs = {k: res[k] for k in res if k not in ["M0", "M1", "M2"]}
-                    debugin_queue.put((i, res))
+                    with lock:
+                        res_store[i] = res
+                    debugin_queue.put((i))
                 if "coefs" in res:
                     coefs_list[i] = res["coefs"]
                 if "registration" in res:
@@ -2099,7 +2115,9 @@ class Holodoppler:
                     M0, M1, M2 = res["M0"], res["M1"], res["M2"]
                     if parameters["debug"]:
                         # debug_imgs = {k: res[k] for k in res if k not in ["M0", "M1", "M2"]}
-                        debugin_queue.put((i, res))
+                        with lock:
+                            res_store[i] = res
+                        debugin_queue.put((i))
                     if "coefs" in res:
                         coefs_list[i] = res["coefs"]
                     if "registration" in res:
@@ -2108,9 +2126,6 @@ class Holodoppler:
                     out_list.append(
                         self.xp.stack([M0, M1, M2], axis=2)
                     )
-                    if parameters["debug"]:
-                        # debug_imgs = {k: res[k] for k in res if k not in ["M0", "M1", "M2"]}
-                        debugin_queue.put((i, res))
 
                 except Exception:
                     traceback.print_exc()
@@ -2145,6 +2160,7 @@ class Holodoppler:
                     streams[key][i] = img
 
             # stack only non-empty streams
+            import numpy as np
             vid_debug = [
                 np.stack([img for img in stream if img is not None], axis=2)
                 for stream in streams.values()
@@ -2170,12 +2186,12 @@ class Holodoppler:
         # ------------------------------------------------------------
         # Temporal accumulation
         # ------------------------------------------------------------
-        t0 = time.perf_counter()
-        if parameters["accumulation"] > 1:
-            acc = parameters["accumulation"] 
-            ny, nx, nimgs, nt = vid.shape
-            vid = self.xp.reshape(vid[:,:,:,:(nt//acc)*acc], (ny, nx, nimgs, nt//acc, acc)) @ self.xp.ones(acc)
-        t_acc = time.perf_counter() - t0
+        # t0 = time.perf_counter()
+        # if parameters["accumulation"] > 1:
+        #     acc = parameters["accumulation"] 
+        #     ny, nx, nimgs, nt = vid.shape
+        #     vid = self.xp.reshape(vid[:,:,:,:(nt//acc)*acc], (ny, nx, nimgs, nt//acc, acc)) @ self.xp.ones(acc)
+        # t_acc = time.perf_counter() - t0
         # print(f"[TIMING] accumulation: {t_acc:.3f}s")
 
         # ------------------------------------------------------------
@@ -2342,7 +2358,7 @@ class Holodoppler:
 
             if parameters["debug"] and vid_debug is not None:
                 for idx, v in enumerate(vid_debug):
-                    save_pair(f"debug_{idx}", v, fps, mp4_dir, avi_dir, sigma=0, is_color=v.ndim == 4, save_png=False)
+                    save_pair(f"debug_{list(self.debug_plotters.keys())[idx]}", v, fps, mp4_dir, avi_dir, sigma=0, is_color=v.ndim == 4, save_png=False)
 
             # save json
             with open(os.path.join(json_dir, "parameters.json"), "w") as f:
