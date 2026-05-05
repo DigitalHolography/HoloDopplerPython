@@ -11,3 +11,5 @@ wheels/
 .venv
 
 /debug_outputs
+
+*.env

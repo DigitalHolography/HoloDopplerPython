@@ -8,9 +8,9 @@ import matplotlib.pyplot as plt
 
 
 def first_h5_in_raw(folder: Path) -> Path:
-    raw = folder / "raw"
+    raw = folder / "h5"
     if not raw.is_dir():
-        raise FileNotFoundError(f"No 'raw' folder found at: {raw}")
+        raise FileNotFoundError(f"No 'h5' folder found at: {raw}")
 
     files = sorted(list(raw.glob("*.h5")) + list(raw.glob("*.hdf5")))
     if not files:

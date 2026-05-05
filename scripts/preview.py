@@ -5,42 +5,40 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matlab_imresize.imresize import imresize
 
-with open(r"./src/holodoppler/default_parameters_cine.json") as f :
+from dotenv import load_dotenv
+import os
+
+load_dotenv()
+
+parameter_path = "./parameters/default_parameters_lightest.json"
+holo_path = os.getenv("HOLOFILEDATA")
+
+with open(parameter_path) as f :
     x = f.read()
     parameters = json.loads(x)
-
+    
 print("parameters :", parameters)
 
 HD = Holodoppler(backend = "cupyRAM", pipeline_version = "latest")
 
-HD.load_file(r"W:\210120_LAG0315\210120_LAG0315_OD_ONH.cine")
+HD.load_file(holo_path)
 
-print("file metadata :", HD.cine_metadata_json)
+print("file header :", HD.file_header)
 
+frames = HD.read_frames(0, 1)
 res = HD.render_moments(parameters, tictoc= False)
 
-def plot_debug_safe(HD, res, i):
+def plot_debug_safe(HD, res):
+    HD.init_plot_debug(parameters)
     debug = {}
 
-    if "U_subaps" in res:
-        montage_plotter = HD.SubapertureMontagePlotter()
-        debug["montage"] = montage_plotter.plot(res["U_subaps"])
-        montage_plotter.close()
+    for key, plotter in HD.debug_plotters.items():
+        try:
+            args = HD.debug_sources[key](res)
+        except KeyError:
+            continue
 
-    if "shifts_y" in res and "shifts_x" in res:
-        shifts_plotter = HD.ShiftsPlotter()
-        debug["shifts"] = shifts_plotter.plot(res["shifts_y"], res["shifts_x"])
-        shifts_plotter.close()
-
-    if "phase" in res:
-        phase_plotter = HD.PhasePlotter()
-        debug["phase"] = phase_plotter.plot(res["phase"])
-        phase_plotter.close()
-
-    if "M0notfixed" in res:
-        M0nf = res["M0notfixed"]
-        M0nf = (M0nf - np.min(M0nf)) / (np.max(M0nf) - np.min(M0nf) + 1e-12)
-        debug["M0notfixed"] = (M0nf * 255).astype(np.uint8)
+        debug[key] = plotter.plot(*args)
 
     return debug
 
@@ -78,7 +76,11 @@ def save_debug_images(debug_dict, save_dir, prefix="debug"):
 
 
 # --- Generate debug safely ---
-debug_imgs = plot_debug_safe(HD, res, i=0)
+debug_imgs = plot_debug_safe(HD, res)
+
+if parameters["debug"] and parameters["shack_hartmann"] and parameters["shack_hartmann_zernike_fit"]:
+    print("zernike_fit_coeffs (radians):", HD._to_numpy(res["coefs"]) if "coefs" in res else "N/A")
+    print("delta to true z in mm if coef[0] is defocus : ", 4* np.sqrt(3) * parameters["z"]**2 / ((min(frames.shape[1:])* parameters["pixel_pitch"])**2)  * parameters["wavelength"] / (2*np.pi) * (HD._to_numpy(res["coefs"])[0] if "coefs" in res else 0) * 1e3)
 
 # --- Add M0 ---
 if "M0" in res:

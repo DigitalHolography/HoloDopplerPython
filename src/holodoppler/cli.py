@@ -22,29 +22,17 @@ def preview(holo_path, parameters: dict) -> None:
     frames = HD.read_frames(0, 1)
     res = HD.render_moments(parameters, tictoc= False)
 
-    def plot_debug_safe(HD, res, i):
+    def plot_debug_safe(HD, res):
         HD.init_plot_debug(parameters)
         debug = {}
 
-        if "U_subaps" in res:
-            montage_plotter = HD.SubapertureMontagePlotter()
-            debug["montage"] = montage_plotter.plot(res["U_subaps"])
-            montage_plotter.close()
+        for key, plotter in HD.debug_plotters.items():
+            try:
+                args = HD.debug_sources[key](res)
+            except KeyError:
+                continue
 
-        if "shifts_y" in res and "shifts_x" in res:
-            shifts_plotter = HD.ShiftsPlotter()
-            debug["shifts"] = shifts_plotter.plot(res["shifts_y"], res["shifts_x"])
-            shifts_plotter.close()
-
-        if "phase" in res:
-            phase_plotter = HD.PhasePlotter()
-            debug["phase"] = phase_plotter.plot(res["phase"])
-            phase_plotter.close()
-
-        if "M0notfixed" in res:
-            M0nf = res["M0notfixed"]
-            M0nf = (M0nf - np.min(M0nf)) / (np.max(M0nf) - np.min(M0nf) + 1e-12)
-            debug["M0notfixed"] = (M0nf * 255).astype(np.uint8)
+            debug[key] = plotter.plot(*args)
 
         return debug
 
@@ -82,7 +70,7 @@ def preview(holo_path, parameters: dict) -> None:
 
 
     # --- Generate debug safely ---
-    debug_imgs = plot_debug_safe(HD, res, i=0)
+    debug_imgs = plot_debug_safe(HD, res)
 
     if parameters["debug"] and parameters["shack_hartmann"] and parameters["shack_hartmann_zernike_fit"]:
         print("zernike_fit_coeffs (radians):", HD._to_numpy(res["coefs"]) if "coefs" in res else "N/A")
