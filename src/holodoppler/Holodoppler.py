@@ -2257,7 +2257,6 @@ class Holodoppler:
         if parameters["debug"]:
             # --- build streams automatically ---
             streams = {k: [None]*len(debug_results) for k in self.debug_plotters.keys()}
-            streams["M0notfixed"] = [None]*len(debug_results)
 
             for i, dic in debug_results.items():
                 for key, img in dic.items():
@@ -2400,17 +2399,17 @@ class Holodoppler:
             tt = time.perf_counter()
             
             base_name = os.path.splitext(os.path.basename(self.file_path))[0]
-            dir_name = f"{base_name}_HD"
+            dir_name = f"{base_name}"
             parent_dir = os.path.dirname(self.file_path)
-            holodoppler_dir_name = f"{dir_name}"
-            holodoppler_path = os.path.join(parent_dir, holodoppler_dir_name)
+            holodoppler_dir_name = f"{dir_name}_HD"
+            holodoppler_path = os.path.join(parent_dir,dir_name, holodoppler_dir_name)
             os.makedirs(holodoppler_path, exist_ok=True)
             # make a png, mp4 json and h5 sub directories with their respective content
             png_dir = os.path.join((holodoppler_path), "png")
             mp4_dir = os.path.join((holodoppler_path), "mp4")
             avi_dir = os.path.join((holodoppler_path), "avi")
             json_dir = os.path.join((holodoppler_path), "json")
-            h5_dir = os.path.join((holodoppler_path), "raw")
+            h5_dir = os.path.join((holodoppler_path), "h5")
             print(f"Saving output to: {holodoppler_path}")
             os.makedirs(png_dir, exist_ok=True)
             os.makedirs(mp4_dir, exist_ok=True)

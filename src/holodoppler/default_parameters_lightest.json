@@ -1,7 +1,7 @@
 {
   "batch_size": 256,
   "batch_stride": 256,
-  "accumulation": 1,
+  "accumulation": 8,
   "image_registration": true,
   "registration_disc_ratio": 0.8,
   "registration_flatfield_gw": 35,
