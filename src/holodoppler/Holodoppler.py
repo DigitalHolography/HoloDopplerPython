@@ -1450,31 +1450,39 @@ class Holodoppler:
     # ------------------------------------------------------------
     # Render tools for debug and visualization
     # ------------------------------------------------------------
-           
-    class PhasePlotter:
-        def __init__(self, title="Wavefront Phase", cmap="twilight", figsize=(6, 6), dpi=100):
-            self.fig, self.ax = plt.subplots(figsize=figsize, dpi=dpi)
-            self.canvas = FigureCanvasAgg(self.fig)
-            self.title = title
-            self.cmap = cmap
 
+    class ImagePlotter:
+        def __init__(self):
+            pass
+        def plot(self, image):
+            image_ = (image - np.min(image)) / (np.max(image) - np.min(image)) * 255
+            if isinstance(image_, cp.ndarray):
+                image_ = image_.get()
+            return image_.astype(np.uint8)
+        def close(self):
+            pass
+
+    class PhasePlotter:
+        def __init__(self, relative=False):
+            self.relative = relative  
         def plot(self, phase):
             if isinstance(phase, cp.ndarray):
-                phase = cp.asnumpy(phase)   
-            self.ax.clear()
-            self.ax.set_title(self.title)
-            im = self.ax.imshow((phase + np.pi) % (2*np.pi) - np.pi, cmap=self.cmap)
-            self.fig.colorbar(im, ax=self.ax, fraction=0.029, pad=0.04)
-            self.ax.set_aspect('equal')
-            self.canvas.draw()
-            img = np.frombuffer(self.canvas.buffer_rgba(), dtype=np.uint8).reshape(self.canvas.get_width_height()[::-1] + (4,))
-            img = img[..., :3]  # drop alpha channel
+                phase = cp.asnumpy(phase)
+            if self.relative :
+                ny, nx = phase.shape
+                phase = phase - phase[ny//2,nx//2]
+            phase = (phase + np.pi) % (2*np.pi) - np.pi
+            norm = (phase + np.pi) / (2*np.pi)
+            img = (norm * 255).astype(np.uint8)
+            img = np.stack([img, img, img], axis=-1)
+            # No resizing → output keeps exact input shape (rectangular preserved)
             return img
         def close(self):
-            plt.close(self.fig)
+            pass
         
     class ShiftsPlotter:
-        def __init__(self, title="Wavefront Slopes from Sub-aperture Shifts", figsize=(8, 6), dpi=100, scale=50):
+        # TODO no matplotlib just cv2
+        def __init__(self, title="Wavefront Slopes from Sub-aperture Shifts", figsize=(8, 6), dpi=100, scale=None):
             self.fig, self.ax = plt.subplots(figsize=figsize, dpi=dpi)
             self.canvas = FigureCanvasAgg(self.fig)
             self.title = title
@@ -1485,6 +1493,13 @@ class Holodoppler:
                 shifts_y = cp.asnumpy(shifts_y)
             if isinstance(shifts_x, cp.ndarray):
                 shifts_x = cp.asnumpy(shifts_x)
+            # --- AUTO SCALE IF NONE ---
+            if self.scale is None:
+                mag = np.sqrt(shifts_x**2 + shifts_y**2)
+                med = np.median(mag[mag > 0]) if np.any(mag > 0) else 1.0
+                scale = 1.0 / (med + 1e-12)
+            else:
+                scale = self.scale
             self.ax.clear()
             ny_subabs, nx_subabs = shifts_y.shape
             X, Y = np.meshgrid(np.arange(nx_subabs), np.arange(ny_subabs))
@@ -1504,9 +1519,8 @@ class Holodoppler:
             plt.close(self.fig)
         
     class SubapertureMontagePlotter:
-        def __init__(self, figsize=(12, 8), dpi=100):
-            self.fig, self.ax = plt.subplots(figsize=figsize, dpi=dpi)
-            self.canvas = FigureCanvasAgg(self.fig)
+        def __init__(self):
+            pass
         def plot(self, U_subaps):
             if isinstance(U_subaps, cp.ndarray):
                 U_subaps = cp.asnumpy(U_subaps)
@@ -1517,35 +1531,43 @@ class Holodoppler:
             montage_img = np.vstack(rows)
             return montage_img
         def close(self):
-            plt.close(self.fig)
+            pass
         
     def init_plot_debug(self):
         matplotlib.use("Agg")
-        self.montage_plotter = self.SubapertureMontagePlotter()
-        self.shifts_plotter = self.ShiftsPlotter()
-        self.phase_plotter = self.PhasePlotter()
+        # --- CENTRAL DEBUG REGISTRY (edit only here to add new outputs) ---
+        self.debug_plotters = {
+            "montage": self.SubapertureMontagePlotter(),
+            "shifts": self.ShiftsPlotter(scale=30),
+            "shifts_rel": self.ShiftsPlotter(scale=None),
+            "phase": self.PhasePlotter(),
+            "phase_rel": self.PhasePlotter(relative=True),
+            "M0notfixed": self.ImagePlotter(),
+        }
+
+        # maps key -> function(res) -> args for plotter
+        self.debug_sources = {
+            "montage": lambda res: (res["U_subaps"],),
+            "shifts":  lambda res: (res["shifts_y"], res["shifts_x"]),
+            "shifts_rel":  lambda res: (res["shifts_y"], res["shifts_x"]),
+            "phase":   lambda res: (res["phase"],),
+            "phase_rel": lambda res: (res["phase"],),
+            "M0notfixed": lambda res: (res["M0notfixed"],),
+        }
     
     def plot_debug(self, res, i):
-        if "U_subaps" in res:
-            montage_plotter = self.SubapertureMontagePlotter()
-            montage_img = montage_plotter.plot(res["U_subaps"])
-            montage_plotter.close()
-                
-            # cv2.imshow("Sub-aperture Montage", montage_img)
-        if "shifts_y" in res and "shifts_x" in res:
-            shifts_plotter = self.ShiftsPlotter()
-            shifts_img = shifts_plotter.plot(res["shifts_y"], res["shifts_x"])
-            shifts_plotter.close()
-            # cv2.imshow("Sub-aperture Shifts", shifts_img)
-        if "phase" in res:
-            phase_plotter = self.PhasePlotter()
-            phase_img = phase_plotter.plot(res["phase"])
-            phase_plotter.close()
-            # cv2.imshow("Reconstructed Phase", phase_img)
-        if "M0notfixed" in res:
-            M0notfixedimg = self._to_numpy((res["M0notfixed"] - np.min(res["M0notfixed"])) / (np.max(res["M0notfixed"]) - np.min(res["M0notfixed"])) * 255)
-            # cv2.imshow("M0 without Phase Correction", M0notfixed_img)
-        return { "montage": montage_img, "shifts": shifts_img, "phase": phase_img, "M0notfixed": M0notfixedimg }
+        out = {}
+
+        for key, plotter in self.debug_plotters.items():
+
+            try:
+                args = self.debug_sources[key](res)
+            except KeyError:
+                continue  # required data not present
+
+            out[key] = plotter.plot(*args)
+
+        return out
         
     # ------------------------------------------------------------
     # One batch full pipeline
@@ -2110,29 +2132,28 @@ class Holodoppler:
         import time
         t0 = time.perf_counter()
         if parameters["debug"]:
+            # --- build streams automatically ---
+            streams = {k: [None]*len(debug_results) for k in self.debug_plotters.keys()}
+            streams["M0notfixed"] = [None]*len(debug_results)
+
+            for i, dic in debug_results.items():
+                for key, img in dic.items():
+                    if parameters["square"] and key in ["montage", "M0notfixed"]:
+                        m = max(img.shape[0], img.shape[1])
+                        img = self._resize(img, m, m)
+
+                    streams[key][i] = img
+
+            # stack only non-empty streams
+            vid_debug = [
+                np.stack([img for img in stream if img is not None], axis=2)
+                for stream in streams.values()
+                if any(img is not None for img in stream)
+            ]
             debugin_queue.join()
             stop_event.set()
             debug_thread.join()
-            
-            debug_results = {}
-            while not debugout_queue.empty():
-                i, res = debugout_queue.get()
-                debug_results[i] = res
 
-            if any(res is not None for res in debug_results.values()):
-                streams = {"montage": [], "shifts": [], "phase": [], "M0notfixed": []}
-                for i in range(len(debug_results)):
-                    dic = debug_results[i]
-                    for key, img in dic.items():
-                        if parameters["square"] and key in ["montage", "M0notfixed"]:
-                            m = max(img.shape[0], img.shape[1])
-                            img = self._resize(img, m, m)
-                        streams[key].append(img)
-                import numpy as np
-                vid_debug = [np.stack(stream, axis=2) for stream in streams.values() if len(stream) > 0]
-            else:
-                
-                vid_debug = None
         else:
             vid_debug = None
         t_debug = time.perf_counter() - t0
@@ -2149,12 +2170,12 @@ class Holodoppler:
         # ------------------------------------------------------------
         # Temporal accumulation
         # ------------------------------------------------------------
-        # t0 = time.perf_counter()
-        # if parameters["accumulation"] > 1:
-        #     acc = parameters["accumulation"] 
-        #     ny, nx, nimgs, nt = vid.shape
-        #     vid = self.xp.reshape(vid[:,:,:,:(nt//acc)*acc], (ny, nx, nimgs, nt//acc, acc)) @ self.xp.ones(acc)
-        # t_acc = time.perf_counter() - t0
+        t0 = time.perf_counter()
+        if parameters["accumulation"] > 1:
+            acc = parameters["accumulation"] 
+            ny, nx, nimgs, nt = vid.shape
+            vid = self.xp.reshape(vid[:,:,:,:(nt//acc)*acc], (ny, nx, nimgs, nt//acc, acc)) @ self.xp.ones(acc)
+        t_acc = time.perf_counter() - t0
         # print(f"[TIMING] accumulation: {t_acc:.3f}s")
 
         # ------------------------------------------------------------
