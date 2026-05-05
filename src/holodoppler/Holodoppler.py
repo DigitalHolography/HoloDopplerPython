@@ -2318,7 +2318,7 @@ class Holodoppler:
                 
                 # print(frames.shape, frames.dtype, type(frames))
                 write_video(os.path.join(mp4_dir, f"{stem}.mp4"), frames, min(fps, 65), "mp4v", is_color)
-                write_video(os.path.join(avi_dir, f"{stem}.avi"), frames, min(fps, 65), "XVID", is_color)
+                write_video(os.path.join(avi_dir, f"{stem}.avi"), frames, min(fps, 65), "MJPG", is_color)
                 if save_png:
                     plt.imsave(os.path.join(png_dir, f"{stem}.png"), np.mean(frames, axis=2), cmap="gray")
 
