@@ -5,8 +5,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matlab_imresize.imresize import imresize
 
-parameter_path = "./src/holodoppler/default_parameters_debug.json"
-holo_path = r"D:\aberrotono\260504_BOM0753_aberotono_8.holo"
+parameter_path = "./src/holodoppler/default_parameters_lightest.json"
+holo_path = r"D:\PROJETS\DATA\260113_AUZ0752_6.holo"
 
 with open(parameter_path) as f :
     x = f.read()
