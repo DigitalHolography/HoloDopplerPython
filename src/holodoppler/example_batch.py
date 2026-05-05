@@ -4,13 +4,13 @@ import os
 import numpy as np
 import matplotlib.pyplot as plt
 
-with open(r"./src/holodoppler/default_parameters.json") as f :
+with open(r"./src/holodoppler/default_parameters_debug.json") as f :
     x = f.read()
     parameters = json.loads(x)
     
 print("Using parameters :", parameters)
 
-HD = Holodoppler(backend = "cupyRAM", pipeline_version = "latest")
+HD = Holodoppler(backend = "cupy", pipeline_version = "latest")
 
 
 listpath = r"C:\Users\Ivashka\Desktop\list_for_zernike.txt"

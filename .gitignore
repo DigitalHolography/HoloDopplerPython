@@ -5,8 +5,9 @@ build/
 dist/
 wheels/
 *.egg-info
+*.spec
 
 # Virtual environments
 .venv
 
-*.png
+/debug_outputs

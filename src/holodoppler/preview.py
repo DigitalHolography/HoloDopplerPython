@@ -6,7 +6,7 @@ import numpy as np
 from matlab_imresize.imresize import imresize
 
 parameter_path = "./src/holodoppler/default_parameters_debug.json"
-holo_path = r"D:\STAGE\260113_AUZ0752_2.holo"
+holo_path = r"D:\aberrotono\260504_BOM0753_aberotono_8.holo"
 
 with open(parameter_path) as f :
     x = f.read()
@@ -83,6 +83,10 @@ def save_debug_images(debug_dict, save_dir, prefix="debug"):
 
 # --- Generate debug safely ---
 debug_imgs = plot_debug_safe(HD, res, i=0)
+
+if parameters["debug"] and parameters["shack_hartmann"] and parameters["shack_hartmann_zernike_fit"]:
+    print("zernike_fit_coeffs (radians):", HD._to_numpy(res["coefs"]) if "coefs" in res else "N/A")
+    print("delta to true z in mm if coef[0] is defocus : ", 4* np.sqrt(3) * parameters["z"]**2 / ((min(frames.shape[1:])* parameters["pixel_pitch"])**2)  * parameters["wavelength"] / (2*np.pi) * (HD._to_numpy(res["coefs"])[0] if "coefs" in res else 0) * 1e3)
 
 # --- Add M0 ---
 if "M0" in res:

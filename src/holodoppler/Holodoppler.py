@@ -7,19 +7,24 @@ from tqdm import tqdm
 import cv2
 import json
 import os
-import threading
-import queue
 import time
 import cinereader
 from cupy.cuda.nvtx import RangePush, RangePop
 import time
 import matplotlib.pyplot as plt
-
-# ------------------------------------------------------------
-# Optional CuPy support
-# ------------------------------------------------------------
-
-
+import scipy.fft as np_fft
+from scipy.ndimage import gaussian_filter as np_gaussian_filter
+from scipy.ndimage import gaussian_filter1d
+from matlab_imresize.imresize import imresize
+import scipy.ndimage as np_ndi
+from scipy.interpolate import griddata
+import scipy.fftpack as np_fftpack
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+import numpy as np
+# from concurrent.futures import ProcessPoolExecutor, as_completed
+# from multiprocessing import cpu_count
+# import threading
+# import queue
 
 try:
     import cupy as cp
@@ -33,18 +38,6 @@ except Exception:
     cp_fft = None
     _cupy_available = False
 
-import scipy.fft as np_fft
-from scipy.ndimage import gaussian_filter as np_gaussian_filter
-from scipy.ndimage import gaussian_filter1d
-from matlab_imresize.imresize import imresize
-import scipy.ndimage as np_ndi
-from scipy.interpolate import griddata
-import scipy.fftpack as np_fftpack
-from matplotlib.backends.backend_agg import FigureCanvasAgg
-
-import numpy as np
-from concurrent.futures import ProcessPoolExecutor, as_completed
-from multiprocessing import cpu_count
 
 class Holodoppler:
     """
@@ -116,14 +109,14 @@ class Holodoppler:
         if self.pipeline_version == "latest":
             self._frequency_symmetric_filtering = self._new_frequency_symmetric_filtering
             self._resize = self.resize_fft2_slicewise
-            self._registration = self.new_registration
-            self.applyshifts = self.applyshifts_subpix
+            self._registration = self._registration_trs
+            self._applyregistration = self.applyregistration
             return
         elif self.pipeline_version == "old":
             self._frequency_symmetric_filtering = self._old_frequency_symmetric_filtering
             self._resize = self.resize_matlab_slicewise
             self._registration = self.old_registration
-            self.applyshifts = self._roll2d
+            self._applyregistration = self._roll2d
             self._moment = self._momentkHz
 
     # ------------------------------------------------------------
@@ -280,7 +273,6 @@ class Holodoppler:
         if zero_padding:
             self.kernels["Fresnel_in"] = self.pad_array_centrally(self.kernels["Fresnel_in"], zero_padding)
             self.kernels["Fresnel_out"] = self.xp.ones_like(self.kernels["Fresnel_in"])
-
 
     def _build_angular_kernel(self,
                               z,
@@ -621,26 +613,153 @@ class Holodoppler:
     @staticmethod
     def _roll2d(img, peak_y, peak_x, xp):
         return xp.roll(xp.roll(img, peak_y, axis = -2), peak_x, axis = -1)
+    
+    @staticmethod
+    def _signed_peak(ky, kx, ny, nx):
+        if ky > ny // 2:
+            ky -= ny
+        if kx > nx // 2:
+            kx -= nx
+        return float(ky), float(kx)
 
     @staticmethod
-    def _signed_shift_from_peak(peak_y, peak_x, ny, nx):
-        if peak_y > ny // 2:
-            peak_y -= ny
-        if peak_x > nx // 2:
-            peak_x -= nx
-        return float(peak_y), float(peak_x)
-
-
-    @staticmethod
-    def _subpixel_peak_1d(v_minus, v_0, v_plus):
-        denom = v_minus - 2.0 * v_0 + v_plus
+    def _subpixel_parabola(vm, v0, vp):
+        denom = vm - 2.0 * v0 + vp
         if abs(float(denom)) < 1e-12:
             return 0.0
-        return 0.5 * float(v_minus - v_plus) / float(denom)
+        return 0.5 * float(vm - vp) / float(denom)
 
+    def _phase_corr_subpixel(self, a, b, xp):
+        ny, nx = a.shape[-2:]
+
+        fa = xp.fft.fft2(a)
+        fb = xp.fft.fft2(b)
+
+        cps = fb * fa.conj()
+        cps /= xp.abs(cps) + 1e-12
+
+        corr = xp.fft.ifft2(cps)
+        mag = xp.abs(corr)
+
+        ky, kx = xp.unravel_index(xp.argmax(mag), mag.shape)
+        ky, kx = int(ky), int(kx)
+
+        peak_y, peak_x = self._signed_peak(ky, kx, ny, nx)
+
+        sub_y = self._subpixel_parabola(
+            mag[(ky - 1) % ny, kx],
+            mag[ky, kx],
+            mag[(ky + 1) % ny, kx],
+        )
+
+        sub_x = self._subpixel_parabola(
+            mag[ky, (kx - 1) % nx],
+            mag[ky, kx],
+            mag[ky, (kx + 1) % nx],
+        )
+
+        peak_y += sub_y
+        peak_x += sub_x
+
+        return -peak_y, -peak_x
 
     @staticmethod
-    def applyshifts_subpix(img, shift_y, shift_x, xp):
+    def _logpolar(img, radial_bins, angular_bins, xp):
+        if xp.__name__ == "cupy":
+            from cupyx.scipy.ndimage import map_coordinates
+        else:
+            from scipy.ndimage import map_coordinates
+
+        ny, nx = img.shape
+        cy = (ny - 1) * 0.5
+        cx = (nx - 1) * 0.5
+
+        max_radius = min(cx, cy)
+        log_r = xp.linspace(0.0, xp.log(max_radius), radial_bins)
+        theta = xp.linspace(0.0, 2.0 * xp.pi, angular_bins, endpoint=False)
+
+        rr = xp.exp(log_r).reshape(-1, 1)
+        tt = theta.reshape(1, -1)
+
+        yy = cy + rr * xp.sin(tt)
+        xx = cx + rr * xp.cos(tt)
+
+        coords = xp.stack([yy, xx], axis=0)
+
+        return map_coordinates(img, coords, order=1, mode="constant", cval=0.0)
+
+    @staticmethod
+    def _fourier_magnitude_for_similarity(img, xp):
+        mag = xp.abs(xp.fft.fftshift(xp.fft.fft2(img)))
+        mag = xp.log1p(mag)
+
+        ny, nx = mag.shape
+        cy, cx = ny // 2, nx // 2
+
+        r = max(4, min(ny, nx) // 32)
+        yy, xx = xp.ogrid[:ny, :nx]
+        dc_mask = (yy - cy) ** 2 + (xx - cx) ** 2 <= r * r
+
+        mag = mag.copy()
+        mag[dc_mask] = 0
+
+        return mag
+
+    def _estimate_rotation_scale(self, fixed, moving, xp, radial_bins=256, angular_bins=360):
+        fixed_mag = self._fourier_magnitude_for_similarity(fixed, xp)
+        moving_mag = self._fourier_magnitude_for_similarity(moving, xp)
+
+        fixed_lp = self._logpolar(fixed_mag, radial_bins, angular_bins, xp)
+        moving_lp = self._logpolar(moving_mag, radial_bins, angular_bins, xp)
+
+        d_r, d_theta = self._phase_corr_subpixel(fixed_lp, moving_lp, xp)
+
+        angle_deg = -d_theta * 360.0 / angular_bins
+
+        max_radius = min(fixed.shape[-1], fixed.shape[-2]) * 0.5
+        log_base = xp.log(max_radius) / radial_bins
+        scale = float(xp.exp(d_r * log_base))
+
+        return float(angle_deg), scale
+
+    @staticmethod
+    def _apply_rotation_scale(img, angle_deg, scale, xp):
+        if xp.__name__ == "cupy":
+            from cupyx.scipy.ndimage import affine_transform
+        else:
+            from scipy.ndimage import affine_transform
+
+        ny, nx = img.shape[-2:]
+        cy = (ny - 1) * 0.5
+        cx = (nx - 1) * 0.5
+
+        angle = xp.deg2rad(angle_deg)
+        c = float(xp.cos(angle))
+        s = float(xp.sin(angle))
+
+        matrix = xp.asarray(
+            [
+                [c / scale, s / scale],
+                [-s / scale, c / scale],
+            ],
+            dtype=xp.float32,
+        )
+
+        center = xp.asarray([cy, cx], dtype=xp.float32)
+        offset = center - matrix @ center
+
+        out = affine_transform(
+            img,
+            matrix,
+            offset=offset,
+            order=1,
+            mode="nearest",
+        )
+
+        return out.astype(img.dtype, copy=False)
+    
+    @staticmethod
+    def new_applyshifts(img, shift_y, shift_x, xp):
         ny, nx = img.shape[-2:]
 
         fy = xp.fft.fftfreq(ny).reshape(ny, 1)
@@ -648,56 +767,114 @@ class Holodoppler:
 
         phase = xp.exp(-2j * xp.pi * (fy * shift_y + fx * shift_x))
 
-        f_img = xp.fft.fft2(img, axes=(-2, -1))
-        shifted = xp.fft.ifft2(f_img * phase, axes=(-2, -1))
+        out = xp.fft.ifft2(
+            xp.fft.fft2(img, axes=(-2, -1)) * phase,
+            axes=(-2, -1),
+        )
 
         if xp.isrealobj(img):
-            shifted = shifted.real
+            out = out.real
 
-        return shifted.astype(img.dtype, copy=False)
+        return out.astype(img.dtype, copy=False)
 
-
-    def new_registration(self, fixed, moving, radius):
-        ny, nx = fixed.shape
+    def _registration_trs(
+        self,
+        fixed,
+        moving,
+        radius=None,
+        *,
+        estimate_similarity=False,
+        radial_bins=256,
+        angular_bins=360,
+        return_registered=False,
+    ):
         xp = self.xp
+        ny, nx = fixed.shape
 
-        mask = self._elliptical_mask(ny, nx, radius, xp) if radius else xp.ones((ny, nx), dtype=bool)
+        mask = (
+            self._elliptical_mask(ny, nx, radius, xp)
+            if radius
+            else xp.ones((ny, nx), dtype=bool)
+        )
 
-        _fixed = fixed
-        _moving = moving
+        fixed_f = fixed.astype(xp.float32, copy=False)
+        moving_f = moving.astype(xp.float32, copy=False)
 
-        fixed_c = (_fixed - xp.mean(_fixed[mask])) * mask
-        moving_c = (_moving - xp.mean(_moving[mask])) * mask
+        fixed_c = (fixed_f - xp.mean(fixed_f[mask])) * mask
+        moving_c = (moving_f - xp.mean(moving_f[mask])) * mask
 
-        xcorr = self._xcorr2d(fixed_c, moving_c, xp)
-        mag = xp.abs(xcorr)
+        if estimate_similarity:
+            angle_deg, scale = self._estimate_rotation_scale(
+                fixed_c,
+                moving_c,
+                xp,
+                radial_bins=radial_bins,
+                angular_bins=angular_bins,
+            )
 
-        ky0, kx0 = xp.unravel_index(xp.argmax(mag), mag.shape)
-        ky0, kx0 = int(ky0), int(kx0)
+            moving_rs = self._apply_rotation_scale(
+                moving_f,
+                angle_deg,
+                scale,
+                xp,
+            )
 
-        # Integer FFT peak -> signed shift close to zero.
-        peak_y, peak_x = self._signed_shift_from_peak(ky0, kx0, ny, nx)
+            moving_rs_c = (moving_rs - xp.mean(moving_rs[mask])) * mask
 
-        # Subpixel refinement by fitting a parabola around the peak.
-        ym = mag[(ky0 - 1) % ny, kx0]
-        y0 = mag[ky0, kx0]
-        yp = mag[(ky0 + 1) % ny, kx0]
+        else:
+            angle_deg = 0.0
+            scale = 1.0
+            moving_rs = moving_f
+            moving_rs_c = moving_c
 
-        xm = mag[ky0, (kx0 - 1) % nx]
-        x0 = mag[ky0, kx0]
-        xp1 = mag[ky0, (kx0 + 1) % nx]
+        shift_y, shift_x = self._phase_corr_subpixel(fixed_c, moving_rs_c, xp)
 
-        sub_y = self._subpixel_peak_1d(ym, y0, yp)
-        sub_x = self._subpixel_peak_1d(xm, x0, xp1)
+        if not return_registered:
+            return shift_y, shift_x, angle_deg, scale
 
-        peak_y += sub_y
-        peak_x += sub_x
+        moving_registered = self.new_applyshifts(
+            moving_rs,
+            shift_y,
+            shift_x,
+            xp,
+        )
 
-        # Shift to apply to moving to align it with fixed.
-        shift_y = -peak_y
-        shift_x = -peak_x
+        return shift_y, shift_x, angle_deg, scale, moving_registered
+    
+    def applyregistration(self, img, reg, xp):
+        """
+        Apply a registration tuple to an image.
 
-        return shift_y, shift_x
+        Parameters
+        ----------
+        img : array (numpy or cupy)
+        reg : tuple
+            (shift_y, shift_x, angle_deg, scale)
+            or (shift_y, shift_x) for translation-only
+        xp : numpy or cupy module
+
+        Returns
+        -------
+        registered image
+        """
+        # --- Parse registration tuple ---
+        if len(reg) == 2:
+            shift_y, shift_x = reg
+            angle_deg = 0.0
+            scale = 1.0
+        else:
+            shift_y, shift_x, angle_deg, scale = reg
+
+        out = img
+
+        # --- Apply rotation + scale (if needed) ---
+        if angle_deg != 0.0 or scale != 1.0:
+            out = self._apply_rotation_scale(out, angle_deg, scale, xp)
+
+        # --- Apply subpixel translation ---
+        out = self.new_applyshifts(out, shift_y, shift_x, xp)
+
+        return out
 
     def old_registration(self, fixed, moving, radius):
         ny, nx = fixed.shape
@@ -1374,7 +1551,7 @@ class Holodoppler:
     # One batch full pipeline
     # ------------------------------------------------------------
 
-    def render_moments(self, parameters, frames = None, tictoc = False):
+    def render_moments(self, parameters, frames = None, registration_ref = None, tictoc = False):
         RangePush("render_moments")
         
         def tic():
@@ -1385,13 +1562,10 @@ class Holodoppler:
                 print(name)
                 t2 = time.perf_counter(), time.process_time()
                 print(f" Real time: {t2[0] - t1[0]:.2f} seconds")
-                print(f" CPU time: {t2[1] - t1[1]:.2f} seconds")
-                if arr is not None : 
-                    print(arr.dtype)
-            
-        
-        
-        
+                # print(f" CPU time: {t2[1] - t1[1]:.2f} seconds")
+                # if arr is not None and isinstance(arr, (np.ndarray, cp.ndarray)): 
+                #     print(arr.dtype)
+                
         t1 = tic()
         if frames is None:
             frames = self.read_frames(parameters["first_frame"], parameters["batch_size"])
@@ -1492,6 +1666,17 @@ class Holodoppler:
             M0notfixed = self._moment(psdnotfixed, freqs, 0)
             res["M0notfixed"] = M0notfixed
             toc(t2, "Moment computation svd fourier without phase correction time")
+        
+        # --- Register current batch ---  
+        if parameters["image_registration"] and registration_ref is not None:
+            t2 = tic()
+            M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
+            reg = self._registration(registration_ref, M0_ff, parameters["registration_disc_ratio"])
+            M0 = self._applyregistration(M0, reg, self.xp)
+            M1 = self._applyregistration(M1, reg, self.xp)
+            M2 = self._applyregistration(M2, reg, self.xp)
+            res["registration"] = reg
+            toc(t2, "Image registration time", reg)
             
         res["M0"] = M0
         res["M1"] = M1
@@ -1508,7 +1693,6 @@ class Holodoppler:
     # ------------------------------------------------------------
 
     def process_moments_(self, parameters, h5_path = None, mp4_path = None, return_numpy = False, holodoppler_path = False):
-        
         
         batch_size = parameters["batch_size"]
         batch_stride = parameters["batch_stride"]
@@ -1566,6 +1750,8 @@ class Holodoppler:
             M0_reg = self.render_moments(parameters, frames = frames)["M0"] # render the first frame to be used as reference for the registration
             M0_reg = self._flatfield(M0_reg, parameters["registration_flatfield_gw"])
             reg_list = [None] * num_batch
+        else:
+            M0_reg = None
             
         if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and parameters["shack_hartmann_zernike_fit"]:
             coefs_list = [None] * num_batch
@@ -1599,7 +1785,7 @@ class Holodoppler:
 
                 # --- Compute current batch ---
                 with stream_compute:
-                    res = self.render_moments(parameters, frames=d_frames)
+                    res = self.render_moments(parameters, frames=d_frames, registration_ref=M0_reg)
 
                 if res is None:
                     break
@@ -1609,16 +1795,6 @@ class Holodoppler:
                 if parameters["debug"]:
                     # debug_imgs = {k: res[k] for k in res if k not in ["M0", "M1", "M2"]}
                     debugin_queue.put((i, res))
-
-                # --- Register current batch ---
-                with stream_compute:
-                    if parameters["image_registration"]:
-                        M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
-                        (shift_y, shift_x) = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
-                        M0 = self.applyshifts(M0, shift_y, shift_x, self.xp)
-                        M1 = self.applyshifts(M1, shift_y, shift_x, self.xp)
-                        M2 = self.applyshifts(M2, shift_y, shift_x, self.xp)
-                        reg_list[i] = (shift_y, shift_x)
                 
                 stream_compute.synchronize()
                 
@@ -1627,6 +1803,8 @@ class Holodoppler:
                 )
                 if "coefs" in res:
                     coefs_list[i] = res["coefs"]
+                if "registration" in res:
+                    reg_list[i] = res["registration"]
                 
 
             # Ensure transfers complete
@@ -1749,25 +1927,11 @@ class Holodoppler:
                     debugin_queue.put((i, res))
                 if "coefs" in res:
                     coefs_list[i] = res["coefs"]
+                if "registration" in res:
+                    reg_list[i] = res["registration"]
                     
                 compute_time = time.perf_counter() - compute_start
                 profile_data['compute_times'].append(compute_time)
-                
-                # Registration processing (if enabled)
-                if parameters["image_registration"]:
-                    reg_start = time.perf_counter()
-                    with stream_registration:
-                        M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
-                        (shift_y, shift_x) = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
-                        M0 = self.applyshifts(M0, shift_y, shift_x, self.xp)
-                        M1 = self.applyshifts(M1, shift_y, shift_x, self.xp)
-                        M2 = self.applyshifts(M2, shift_y, shift_x, self.xp)
-                        reg_list[i] = (shift_y, shift_x)
-                    
-                    if stream_registration:
-                        stream_registration.synchronize()
-                    reg_time = time.perf_counter() - reg_start
-                    profile_data['registration_times'].append(reg_time)
                 
                 # Ensure compute is done
                 stream_compute.synchronize()
@@ -1857,53 +2021,8 @@ class Holodoppler:
                 print("="*60 + "\n")
 
         elif self.backend == "numpy multiprocessing":
-            
 
-            print("CPU count :" , cpu_count)
-
-            def process_batch(args):
-                i, first_frame, parameters, self_state = args
-                try:
-                    frames = self_state.read_frames(first_frame + i * parameters["batch_stride"], parameters["batch_size"])
-                    res = self_state.render_moments(parameters, frames=frames)
-                    if res is None:
-                        return i, None
-                    M0, M1, M2 = res["M0"], res["M1"], res["M2"]
-                    if parameters["debug"]:
-                        # debug_imgs = {k: res[k] for k in res if k not in ["M0", "M1", "M2"]}
-                        debugin_queue.put((i, res))
-                    if "coefs" in res:
-                        coefs_list[i] = res["coefs"]
-                    shift_y = shift_x = None
-                    if parameters["image_registration"]:
-                        M0_ff = self_state._flatfield(M0, parameters["registration_flatfield_gw"])
-                        shift_y, shift_x = self_state._registration(self_state.M0_reg, M0_ff, parameters["registration_disc_ratio"])
-                        M0 = self_state.applyshifts(M0, shift_y, shift_x, np)
-                        M1 = self_state.applyshifts(M1, shift_y, shift_x, np)
-                        M2 = self_state.applyshifts(M2, shift_y, shift_x, np)
-                    return i, (M0, M1, M2, debug_imgs, shift_y, shift_x)
-                except Exception:
-                    traceback.print_exc()
-                    return i, None
-
-            out_list = [None] * num_batch
-            debug_list = [None] * num_batch
-
-            with ProcessPoolExecutor(max_workers=cpu_count()) as pool:
-                futures = {pool.submit(process_batch, (i, first_frame, parameters, self)): i for i in range(num_batch)}
-                for fut in tqdm(as_completed(futures), total=num_batch):
-                    i, result = fut.result()
-                    if result is None:
-                        for f in futures: f.cancel()
-                        break
-                    M0, M1, M2, debug_imgs, shift_y, shift_x = result
-                    out_list[i] = np.stack([M0, M1, M2], axis=2)
-                    debug_list[i] = debug_imgs
-                    if shift_y is not None:
-                        reg_list[i] = (shift_y, shift_x)
-
-            out_list = [x for x in out_list if x is not None]
-            debug_list = {i: v for i, v in enumerate(debug_list) if v is not None}
+            raise NotImplementedError("Multiprocessing backend is not implemented yet. Please use 'cupy' or 'cupyRAM' for GPU acceleration or 'numpy' for CPU serial execution.")
 
         else:
             for i in tqdm(range(num_batch)):
@@ -1923,19 +2042,15 @@ class Holodoppler:
                         debugin_queue.put((i, res))
                     if "coefs" in res:
                         coefs_list[i] = res["coefs"]
-
-                    if parameters["image_registration"]:
-                        M0_ff = self._flatfield(M0, parameters["registration_flatfield_gw"])
-                        (shift_y, shift_x) = self._registration(M0_reg, M0_ff, parameters["registration_disc_ratio"])
-                        M0 = self.applyshifts(M0, shift_y, shift_x, self.xp)
-                        M1 = self.applyshifts(M1, shift_y, shift_x, self.xp)
-                        M2 = self.applyshifts(M2, shift_y, shift_x, self.xp)
-                        reg_list[i] = (shift_y, shift_x)
+                    if "registration" in res:
+                        reg_list[i] = res["registration"]
 
                     out_list.append(
                         self.xp.stack([M0, M1, M2], axis=2)
                     )
-                    debug_list[i] = debug_imgs
+                    if parameters["debug"]:
+                        # debug_imgs = {k: res[k] for k in res if k not in ["M0", "M1", "M2"]}
+                        debugin_queue.put((i, res))
 
                 except Exception:
                     traceback.print_exc()
@@ -1950,7 +2065,12 @@ class Holodoppler:
             zernike_coefs = None
         
         vid = self.xp.stack(out_list, axis=3) 
-            
+        
+        # ------------------------------------------------------------
+        # Debug handling
+        # ------------------------------------------------------------
+        import time
+        t0 = time.perf_counter()
         if parameters["debug"]:
             debugin_queue.join()
             stop_event.set()
@@ -1977,31 +2097,64 @@ class Holodoppler:
                 vid_debug = None
         else:
             vid_debug = None
+        t_debug = time.perf_counter() - t0
+        # print(f"[TIMING] debug handling: {t_debug:.3f}s")
 
+        # ------------------------------------------------------------
+        # Zernike coefficients
+        # ------------------------------------------------------------
+        if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and all(coefs is not None for coefs in coefs_list):
+            zernike_coefs = self._to_numpy(self.xp.array(coefs_list))
+        else:
+            zernike_coefs = None
+
+        # ------------------------------------------------------------
+        # Temporal accumulation
+        # ------------------------------------------------------------
+        t0 = time.perf_counter()
         if parameters["accumulation"] > 1:
             acc = parameters["accumulation"] 
             ny, nx, nimgs, nt = vid.shape
-            vid = self.xp.reshape(vid[:,:,:,:(nt//acc)*acc],(ny, nx, nimgs, nt//acc, acc)) @ self.xp.ones(acc) # / acc
+            vid = self.xp.reshape(vid[:,:,:,:(nt//acc)*acc], (ny, nx, nimgs, nt//acc, acc)) @ self.xp.ones(acc)
+        t_acc = time.perf_counter() - t0
+        # print(f"[TIMING] accumulation: {t_acc:.3f}s")
 
+        # ------------------------------------------------------------
+        # Spatial transformations (square, transpose, flips)
+        # ------------------------------------------------------------
+        import numpy as np
+        t0 = time.perf_counter()
         if parameters["square"]:
             m = max(vid.shape[0], vid.shape[1])
-            # vid = self.resize_fft2_slicewise(vid, m, m)
-            import numpy as np
             vid = self._to_numpy(vid).astype(np.float64)
             vid = self._resize(vid, m, m)
-            
         if parameters["transpose"]:
             vid = self.xp.transpose(vid, axes=(1, 0, 2, 3))
-            
         if parameters["flip_x"]:
             vid = self.xp.flip(vid, axis=1)
-        
         if parameters["flip_y"]:
             vid = self.xp.flip(vid, axis=0)
+        t_spatial = time.perf_counter() - t0
+        # print(f"[TIMING] spatial transforms: {t_spatial:.3f}s")
 
+        # ------------------------------------------------------------
+        # Convert to numpy if needed
+        # ------------------------------------------------------------
+        t0 = time.perf_counter()
         if (h5_path is not None) or (mp4_path is not None) or holodoppler_path:
             vid = self._to_numpy(vid)
-            
+        t_to_numpy = time.perf_counter() - t0
+        # print(f"[TIMING] to_numpy conversion: {t_to_numpy:.3f}s")
+        
+        # -------------------------------------------------------------
+        # Close file if needed
+        # -------------------------------------------------------------
+        self._close_file()
+
+        # ------------------------------------------------------------
+        # Saving outputs (h5, mp4, holodoppler)
+        # ------------------------------------------------------------
+        
         def save_to_h5path(h5_path, v, parameters, reg_list = None, zernike_coefs = None, git_commit = None):
             with h5py.File(h5_path, "w") as f:
                 f.create_dataset("moment0", data=v[:, :, :, 0])
@@ -2026,9 +2179,43 @@ class Holodoppler:
                     f.create_dataset("cine_metadata", data=json.dumps(self.cine_metadata_json, default=json_serializer))
                 if git_commit is not None:
                     f.create_dataset("git_commit", data=git_commit)
+                    
+                    
+        t_save = 0.0
 
-        if holodoppler_path is True:
-            # make the new directory at the same level as the input file with its name then _HD{idx} where idx is the max index of existing holodoppler output directories for this file + 1
+        if h5_path is not None:
+            tt = time.perf_counter()
+            try:
+                import subprocess
+                git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
+            except Exception:
+                git_commit = None
+            save_to_h5path(h5_path, v, parameters, reg_list = None, zernike_coefs = None, git_commit = git_commit)
+            t_save += time.perf_counter() - tt
+            # print(f"[TIMING] save HDF5: {time.perf_counter()-tt:.3f}s")
+
+        if mp4_path is not None:
+            tt = time.perf_counter()
+            
+            # save m0 as mp4
+            def normalize(arr):
+                arr = arr.astype(np.float32)
+                lo, hi = arr.min(), arr.max()
+                return ((arr - lo) / (hi - lo) * 255).astype(np.uint8) if hi > lo else arr.astype(np.uint8)
+            def write_video(path, frames, fps):
+                h, w, n = frames.shape[0], frames.shape[1], frames.shape[2]
+                out = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h), isColor=False)
+                for i in range(n):
+                    out.write(normalize(frames[:, :, i]))
+                out.release()
+            fps = num_batch / (end_frame - first_frame) * parameters["sampling_freq"]
+            write_video(mp4_path, vid[:, :, 0, :], min(fps, 65), "mp4v")
+            t_save += time.perf_counter() - tt
+            # print(f"[TIMING] save MP4: {time.perf_counter()-tt:.3f}s")
+
+        if holodoppler_path:
+            tt = time.perf_counter()
+            
             base_name = os.path.splitext(os.path.basename(self.file_path))[0]
             dir_name = f"{base_name}_HD"
             parent_dir = os.path.dirname(self.file_path)
@@ -2128,8 +2315,24 @@ class Holodoppler:
             if self.ext == ".holo":
                 with open(os.path.join(holodoppler_path, "version_holovibes.txt"), "w") as f:
                     f.write(f"{self.file_footer.get('info',{}).get('holovibes_version', 'unknown')}")
+                    
+            t_save += time.perf_counter() - tt
+            # print(f"[TIMING] holodoppler outputs: {time.perf_counter()-tt:.3f}s")
+            
+        # Dispose of GPU arrays to free memory
+        if self.backend in ["cupy", "cupyRAM"]:
+            del d_frames
+            if 'd_frames_next' in locals():
+                del d_frames_next
+            cp.cuda.Device().synchronize()
+            cp.get_default_memory_pool().free_all_blocks()
+            cp.get_default_pinned_memory_pool().free_all_blocks()
+            
+        plt.close('all') # close any open figures to free memory
+
+        print(f"total saving time: {t_save:.3f}s")
 
         if return_numpy:
             return self._to_numpy(vid)
-
-        return vid
+        
+        
