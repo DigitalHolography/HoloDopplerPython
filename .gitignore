@@ -5,6 +5,14 @@ build/
 dist/
 wheels/
 *.egg-info
+*.spec
 
 # Virtual environments
 .venv
+
+/debug_outputs
+<<<<<<< HEAD
+=======
+
+.debug_paths.json
+>>>>>>> a046356 (okay)
