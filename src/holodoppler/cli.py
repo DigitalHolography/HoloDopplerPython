@@ -10,7 +10,7 @@ from matlab_imresize.imresize import imresize
 import os
 
 def preview(holo_path, parameters: dict) -> None:
-    HD = Holodoppler(backend = "cupyRAM", pipeline_version = "latest")
+    HD = Holodoppler(backend = "cupyRAM", pipeline_version = "latest_old_reg")
 
     HD.load_file(holo_path)
     
@@ -100,7 +100,7 @@ def preview(holo_path, parameters: dict) -> None:
 
 
 def process(holo_path, parameters: dict) -> None:
-    HD = Holodoppler(backend = "cupy", pipeline_version = "latest")
+    HD = Holodoppler(backend = "cupy", pipeline_version = "latest_old_reg")
 
     HD.load_file(holo_path)
 

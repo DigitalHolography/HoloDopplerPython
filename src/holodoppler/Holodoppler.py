@@ -118,6 +118,12 @@ class Holodoppler:
             self._registration = self.old_registration
             self._applyregistration = self._roll2d
             self._moment = self._momentkHz
+        elif self.pipeline_version == "latest_old_reg":
+            self._frequency_symmetric_filtering = self._new_frequency_symmetric_filtering
+            self._resize = self.resize_fft2_slicewise
+            self._registration = self.old_registration
+            self._applyregistration = self._roll2d
+            return
 
     # ------------------------------------------------------------
     # File handling
@@ -611,7 +617,8 @@ class Holodoppler:
         return xp.fft.ifft2(fa * xp.conj(fb))
     
     @staticmethod
-    def _roll2d(img, peak_y, peak_x, xp):
+    def _roll2d(img, peaks, xp):
+        peak_y, peak_x = peaks
         return xp.roll(xp.roll(img, peak_y, axis = -2), peak_x, axis = -1)
     
     @staticmethod

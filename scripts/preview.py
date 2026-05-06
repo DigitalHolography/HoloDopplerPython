@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matlab_imresize.imresize import imresize
 
-parameter_path = "./parameters/default_parameters_debug.json"
+parameter_path = "./parameters/default_parameters.json"
 holo_path = json.loads(open(r".debug_paths.json").read())["HOLOFILEPATH"]
 
 with open(parameter_path) as f :
@@ -14,7 +14,7 @@ with open(parameter_path) as f :
     
 print("parameters :", parameters)
 
-HD = Holodoppler(backend = "cupyRAM", pipeline_version = "latest")
+HD = Holodoppler(backend = "cupyRAM", pipeline_version = "latest_old_reg")
 
 HD.load_file(holo_path)
 
@@ -73,7 +73,7 @@ def save_debug_images(debug_dict, save_dir, prefix="debug"):
 # --- Generate debug safely ---
 debug_imgs = plot_debug_safe(HD, res)
 
-if parameters["debug"] and parameters["shack_hartmann"] and parameters["shack_hartmann_zernike_fit"]:
+if parameters["shack_hartmann"] and parameters["shack_hartmann_zernike_fit"]:
     print("zernike_fit_coeffs (radians):", HD._to_numpy(res["coefs"]) if "coefs" in res else "N/A")
     # Assuming coef[0] is defocus, calculate the corresponding delta z in mm
     defocus_coef = HD._to_numpy(res["coefs"])[0] if "coefs" in res else 0
