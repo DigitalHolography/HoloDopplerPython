@@ -12,4 +12,4 @@ wheels/
 
 /debug_outputs
 
-*.env
+.debug_paths.json

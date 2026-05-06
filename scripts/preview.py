@@ -5,13 +5,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matlab_imresize.imresize import imresize
 
-from dotenv import load_dotenv
-import os
-
-load_dotenv()
-
-parameter_path = "./parameters/default_parameters_lightest.json"
-holo_path = os.getenv("HOLOFILEDATA")
+parameter_path = "./parameters/default_parameters_debug.json"
+holo_path = json.loads(open(r".debug_paths.json").read())["HOLOFILEPATH"]
 
 with open(parameter_path) as f :
     x = f.read()
@@ -80,7 +75,27 @@ debug_imgs = plot_debug_safe(HD, res)
 
 if parameters["debug"] and parameters["shack_hartmann"] and parameters["shack_hartmann_zernike_fit"]:
     print("zernike_fit_coeffs (radians):", HD._to_numpy(res["coefs"]) if "coefs" in res else "N/A")
-    print("delta to true z in mm if coef[0] is defocus : ", 4* np.sqrt(3) * parameters["z"]**2 / ((min(frames.shape[1:])* parameters["pixel_pitch"])**2)  * parameters["wavelength"] / (2*np.pi) * (HD._to_numpy(res["coefs"])[0] if "coefs" in res else 0) * 1e3)
+    # Assuming coef[0] is defocus, calculate the corresponding delta z in mm
+    defocus_coef = HD._to_numpy(res["coefs"])[0] if "coefs" in res else 0
+    R = min(frames.shape[1:]) * parameters["pixel_pitch"] / 2
+    
+    # Nx = frames.shape[2]
+    # Ny = frames.shape[1]
+    # dx_out = parameters["wavelength"] * parameters["z"] / (Nx * parameters["pixel_pitch"])
+    # dy_out = parameters["wavelength"] * parameters["z"] / (Ny * parameters["pixel_pitch"])
+    # D_phys = min(Nx * dx_out, Ny * dy_out) /2
+    
+    # print(D, D_phys)
+    K = (
+        2.0 * np.sqrt(3.0)
+        * parameters["wavelength"]
+        / (np.pi * R**2)
+    )
+
+    z_corr = 1.0 / (1.0 / parameters["z"] - K * defocus_coef)
+
+    delta_z_mm = (z_corr - parameters["z"]) * 1e3
+    print("delta to true z in mm if coef[0] is defocus:", delta_z_mm)
 
 # --- Add M0 ---
 if "M0" in res:
