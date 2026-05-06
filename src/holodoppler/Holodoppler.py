@@ -2499,7 +2499,7 @@ class Holodoppler:
                 f.write(f"{git_txt}")
                 
             with open(os.path.join(holodoppler_path, "version_holodoppler.txt"), "w") as f:
-                f.write(f"py 0.1.0")
+                f.write(f"py 0.11.0")
             if self.ext == ".holo":
                 with open(os.path.join(holodoppler_path, "version_holovibes.txt"), "w") as f:
                     f.write(f"{self.file_footer.get('info',{}).get('holovibes_version', 'unknown')}")
