@@ -1,10 +1,7 @@
 from holodoppler.Holodoppler import Holodoppler
 import json
-import os
-import numpy as np
-import matplotlib.pyplot as plt
 
-with open(r"./src/holodoppler/default_parameters_debug.json") as f :
+with open(r"./parameters/default_parameters.json") as f :
     x = f.read()
     parameters = json.loads(x)
     
@@ -12,8 +9,7 @@ print("Using parameters :", parameters)
 
 HD = Holodoppler(backend = "cupy", pipeline_version = "latest")
 
-
-listpath = r"C:\Users\Ivashka\Desktop\list_for_zernike.txt"
+listpath = json.loads(open(r".debug_paths.json").read())["LISTTXTPATH"]
 
 for line in open(listpath, 'r'):
     print("Processing file :", line.strip())

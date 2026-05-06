@@ -1,9 +1,7 @@
 from holodoppler.Holodoppler import Holodoppler
 import json
-import os
-import matplotlib.pyplot as plt
 
-with open(r"./src/holodoppler/default_parameters_debug.json") as f :
+with open(r"./parameters/default_parameters.json") as f :
     x = f.read()
     parameters = json.loads(x)
     
@@ -11,7 +9,7 @@ print("parameters :", parameters)
 
 HD = Holodoppler(backend = "cupy", pipeline_version = "latest")
 
-HD.load_file(r"D:\aberrotono\260504_BOM0753_aberotono_8.holo")
+HD.load_file(json.loads(open(r".debug_paths.json").read())["HOLOFILEPATH"])
 
 print("file header :", HD.file_header)
 
