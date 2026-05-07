@@ -30,3 +30,7 @@ holodoppler process "D:\path\to\holo.holo" "./src/holodoppler/default_parameters
 python -m pip install -e .[build]
 python build_installer.py
 ```
+
+## License
+
+This project is licensed under the GNU General Public License v3.0 only. See [LICENSE](LICENSE).
