@@ -27,7 +27,7 @@ def preview(holo_path, parameters: dict) -> None:
     def plot_debug_safe(HD, res):
         debug_manager = DebugPlotterManager(parameters) if parameters.get("debug") else None
         
-        out = debug_manager.plot_all(res)
+        out = debug_manager.plot_all(res) if parameters.get("debug") else {}
 
         return out
 

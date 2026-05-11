@@ -160,7 +160,7 @@ class Holodoppler:
     # Single batch processing
     # ------------------------------------------------------------
     
-    def render_moments(self, parameters, frames=None, registration_ref=None):
+    def render_moments(self, parameters, frames=None, registration_ref=None, tictoc=False):
         """Process a single batch of frames"""
         if frames is None:
             frames = self.read_frames(parameters["first_frame"], parameters["batch_size"])
@@ -194,6 +194,13 @@ class Holodoppler:
         subaps_acc = Accumulator(parameters.get("shack_hartmann_accumulation", 1), self.bm.xp)
         main_acc = Accumulator(parameters.get("accumulation", 1), self.bm.xp)
         
+        t0 = time.perf_counter()
+        
+        def toc(name=""):
+            if tictoc:
+                dt = time.perf_counter() - t0
+                print(name, f"{dt*1000:.3f} ms")
+
         # Shack-Hartmann phase estimation
         if parameters.get("shack_hartmann", False):
             sub_batch_size = nt // subaps_acc.batch_size
@@ -275,7 +282,7 @@ class Holodoppler:
                     phase_term = pad_array_centrally(phase_term, parameters["zero_padding"], self.bm.xp)
             else:
                 phase_term = None
-        
+        toc("Usubap")
         # Main processing loop
         sub_batch_size = nt // main_acc.batch_size
         sub_batch_stride = sub_batch_size
@@ -353,6 +360,7 @@ class Holodoppler:
                     res_batch["M0notfixed"] = self._moment(psd_not_fixed, freqs, 0)
             
             b = main_acc.add(res_batch)
+        toc(name="Propag")
         
         if b is not None:
             res.update(b)
@@ -366,6 +374,7 @@ class Holodoppler:
             res["M1"] = self._apply_registration(res["M1"], reg)
             res["M2"] = self._apply_registration(res["M2"], reg)
             res["registration"] = reg
+        toc(name="Reg")
         
         return res
     
@@ -469,20 +478,27 @@ class Holodoppler:
         for i in range(num_batch) :
             coefs_list[i] =self.bm.to_numpy(coefs_list[i])
             reg_list[i] =self.bm.to_numpy(reg_list[i])
+        if parameters["debug"]:
+            vid_debug = {
+                key: np.moveaxis(np.stack([self.bm.to_numpy(debug_results[k][key]) for k in range(num_batch)]), 0, -1)
+                for key in debug_results[0]
+            }
+        else:
+            vid_debug = {}
         
         # Post-processing: spatial transforms
         if parameters.get("square"):
             m = max(vid_np.shape[0], vid_np.shape[1])
             vid_np = self._resize_to_square(vid_np, m, m)
         if parameters.get("transpose"):
-            vid_np = self.bm.xp.transpose(vid_np, axes=(1, 0, 2, 3))
+            vid_np = np.transpose(vid_np, axes=(1, 0, 2, 3))
         if parameters.get("flip_x"):
-            vid_np = self.bm.xp.flip(vid_np, axis=1)
+            vid_np = np.flip(vid_np, axis=1)
         if parameters.get("flip_y"):
-            vid_np = self.bm.xp.flip(vid_np, axis=0)
+            vid_np = np.flip(vid_np, axis=0)
         
         # Save outputs
-        self._save_outputs(mp4_path, holodoppler_path, vid_np, parameters,
+        self._save_outputs(mp4_path, holodoppler_path, vid_np, vid_debug, parameters,
                           reg_list, coefs_list, end_frame, first_frame, num_batch)
         
         self.close_file()
@@ -641,7 +657,7 @@ class Holodoppler:
         stream_compute.synchronize()
         cp.cuda.Device().synchronize()
     
-    def _save_outputs(self, mp4_path, holodoppler_path, vid, parameters,
+    def _save_outputs(self, mp4_path, holodoppler_path, vid, vid_debug, parameters,
                       reg_list, coefs_list, end_frame, first_frame, num_batch):
         """Save outputs to disk"""
         
@@ -675,18 +691,37 @@ class Holodoppler:
             self._write_video(mp4_path, vid[:, :, 0, :], fps)
         
         if holodoppler_path is not None:
-            self._save_holodoppler_output(vid, parameters, fps,
+            self._save_holodoppler_output(vid, vid_debug, parameters, fps,
                                           reg_list, coefs_list, end_frame, first_frame, num_batch)
     
-    def _write_video(self, path, frames, fps, fourcc="mp4v", is_color=False):
-        """Write video file"""
-        h, w, n = frames.shape
-        out = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fourcc), fps, (w, h), isColor=is_color)
+    def _write_video(self, path, frames, fps, fourcc="mp4v"):
+        """Write grayscale or color video."""
+        if frames.ndim == 3:
+            # (H, W, N)
+            h, w, n = frames.shape
+            is_color = False
+        elif frames.ndim == 4:
+            # (H, W, C, N)
+            h, w, c, n = frames.shape
+            is_color = c > 1
+        else:
+            raise ValueError(f"Unsupported frame shape: {frames.shape}")
+        out = cv2.VideoWriter(
+            path,
+            cv2.VideoWriter_fourcc(*fourcc),
+            fps,
+            (w, h),
+            isColor=is_color,
+        )
         for i in range(n):
-            out.write(normalize_image(frames[:, :, i]))
+            if frames.ndim == 3:
+                frame = normalize_image(frames[:, :, i])
+            else:
+                frame = normalize_image(frames[:, :, :, i])
+            out.write(frame)
         out.release()
     
-    def _save_holodoppler_output(self, vid, parameters, fps, reg_list, coefs_list, end_frame, first_frame, num_batch):
+    def _save_holodoppler_output(self, vid, vid_debug, parameters, fps, reg_list, coefs_list, end_frame, first_frame, num_batch):
         """Save complete Holodoppler output directory"""
         import subprocess
         import json
@@ -694,22 +729,29 @@ class Holodoppler:
         base_name = os.path.splitext(os.path.basename(self.file_reader.file_path))[0]
         dir_name = f"{base_name}_HD"
         parent_dir = os.path.dirname(self.file_reader.file_path)
-        full_path = os.path.join(parent_dir, dir_name)
+        full_path = os.path.join(parent_dir, base_name, dir_name)
         os.makedirs(full_path, exist_ok=True)
         
         # Create subdirectories
         for subdir in ["png", "mp4", "avi", "json", "h5"]:
             os.makedirs(os.path.join(full_path, subdir), exist_ok=True)
         
-        def save_pair(name, frames):
+        def save_pair(name, frames, png=True):
             self._write_video(os.path.join(full_path, "mp4", f"{name}.mp4"), frames, fps, "mp4v")
             self._write_video(os.path.join(full_path, "avi", f"{name}.avi"), frames, fps, "MJPG")
-            plt.imsave(os.path.join(full_path, "png", f"{name}.png"), np.mean(frames, axis=2), cmap="gray")
+            if png:
+                plt.imsave(os.path.join(full_path, "png", f"{name}.png"), np.mean(frames, axis=-1), cmap="gray")
         
         save_pair("moment_0", vid[:, :, 0, :])
         save_pair("moment_1", vid[:, :, 1, :])
         save_pair("moment_2", vid[:, :, 2, :])
         save_pair("moment_0_flatfield", flatfield3D(vid[:, :, 0, :], parameters["registration_flatfield_gw"]))
+        
+        for key, video_debug in vid_debug.items():
+            save_pair(f"debug_{key}", video_debug, png=False)
+
+                
+            
         
         # Save JSON parameters
         with open(os.path.join(full_path, "json", "parameters_holodoppler.json"), "w") as f:
