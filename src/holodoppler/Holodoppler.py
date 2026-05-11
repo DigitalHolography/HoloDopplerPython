@@ -26,7 +26,7 @@ from .shack_hartmann import ShackHartmann
 from .zernike import ZernikeReconstructor
 from .moments import MomentCalculator
 from .plotting import DebugPlotterManager
-from .utils import (gaussian_flatfield, normalize_image, temporal_gaussian_filter,
+from .utils import (gaussian_flatfield, normalize_image, temporal_gaussian_filter, flatfield3D, 
                     pad_array_centrally, crop_array_centrally, elliptical_mask, resize_fft2_slicewise, resize_matlab_slicewise)
 
 
@@ -52,7 +52,7 @@ class Holodoppler:
         self.backend_name = backend
         self.pipeline_version = pipeline_version
         
-        print(f"HoloDoppler : py{self.__version__}  {backend}  {pipeline_version}")
+        print(f"HoloDoppler : py{self.__version__}  {self.backend_name}  {self.pipeline_version}")
         
         # Initialize components
         self.bm = BackendManager(backend)
@@ -441,10 +441,14 @@ class Holodoppler:
         reg_list = [None] * num_batch if parameters.get("image_registration") else None
         
         # Main processing loop with GPU streaming if enabled
-        if self.backend_name in ["cupy", "cupyRAM"]:
+        if self.backend_name =="cupy":
             self._process_gpu_streaming(parameters, num_batch, first_frame, batch_stride,
                                         batch_size, M0_reg, out_list, coefs_list, reg_list,
                                         debug_manager, debug_queue, res_store, lock if parameters.get("debug") else None)
+        elif self.backend_name =="cupyRAM":
+            self._process_gpu_streaming_onram(parameters, num_batch, first_frame, batch_stride,
+                                    batch_size, M0_reg, out_list, coefs_list, reg_list,
+                                    debug_manager, debug_queue, res_store, lock if parameters.get("debug") else None)
         else:
             self._process_cpu(parameters, num_batch, first_frame, batch_stride,
                              batch_size, M0_reg, out_list, coefs_list, reg_list,
@@ -462,6 +466,9 @@ class Holodoppler:
             
         # Convert to numpy for saving
         vid_np = self.bm.to_numpy(vid)
+        for i in range(num_batch) :
+            coefs_list[i] =self.bm.to_numpy(coefs_list[i])
+            reg_list[i] =self.bm.to_numpy(reg_list[i])
         
         # Post-processing: spatial transforms
         if parameters.get("square"):
@@ -557,6 +564,82 @@ class Holodoppler:
         
         stream_h2d.synchronize()
         cp.cuda.Device().synchronize()
+        
+    def _process_gpu_streaming_onram(self, parameters, num_batch, first_frame, batch_stride,
+                                    batch_size, M0_reg, out_list, coefs_list, reg_list,
+                                    debug_manager, debug_queue, res_store, lock):
+        """GPU streaming processing loop with CPU RAM prefetch queue."""
+        import queue, threading
+        import cupy as cp
+        from tqdm import tqdm
+
+        frame_queue = queue.Queue(maxsize=4)
+        stop_reader = threading.Event()
+
+        def reader():
+            frame_idx = first_frame
+            for i in range(num_batch):
+                if stop_reader.is_set():
+                    break
+                frames = self.read_frames(frame_idx, batch_size)
+                frame_queue.put((i, frames))
+                frame_idx += batch_stride
+            frame_queue.put(None)
+
+        reader_thread = threading.Thread(target=reader, daemon=True)
+        reader_thread.start()
+
+        stream_h2d = cp.cuda.Stream(non_blocking=True)
+        stream_compute = cp.cuda.Stream(non_blocking=True)
+
+        item = frame_queue.get()
+        if item is None:
+            return
+
+        _, frames = item
+        with stream_h2d:
+            d_frames = cp.asarray(frames)
+        stream_h2d.synchronize()
+
+        for i in tqdm(range(num_batch)):
+            next_item = frame_queue.get() if i + 1 < num_batch else None
+
+            d_frames_next = None
+            if next_item is not None:
+                _, frames_next = next_item
+                with stream_h2d:
+                    d_frames_next = cp.asarray(frames_next)
+
+            with stream_compute:
+                res = self.render_moments(parameters, frames=d_frames, registration_ref=M0_reg)
+
+            stream_compute.synchronize()
+
+            if res is None:
+                break
+
+            out_list.append(cp.stack([res["M0"], res["M1"], res["M2"]], axis=2))
+
+            if "coefs" in res and coefs_list is not None:
+                coefs_list[i] = res["coefs"]
+            if "registration" in res and reg_list is not None:
+                reg_list[i] = res["registration"]
+
+            if debug_manager is not None and debug_queue is not None and lock is not None:
+                with lock:
+                    res_store[i] = res
+                debug_queue.put(i)
+
+            if d_frames_next is not None:
+                stream_h2d.synchronize()
+                d_frames = d_frames_next
+
+        stop_reader.set()
+        reader_thread.join(timeout=5)
+
+        stream_h2d.synchronize()
+        stream_compute.synchronize()
+        cp.cuda.Device().synchronize()
     
     def _save_outputs(self, mp4_path, holodoppler_path, vid, parameters,
                       reg_list, coefs_list, end_frame, first_frame, num_batch):
@@ -626,6 +709,7 @@ class Holodoppler:
         save_pair("moment_0", vid[:, :, 0, :])
         save_pair("moment_1", vid[:, :, 1, :])
         save_pair("moment_2", vid[:, :, 2, :])
+        save_pair("moment_0_flatfield", flatfield3D(vid[:, :, 0, :], parameters["registration_flatfield_gw"]))
         
         # Save JSON parameters
         with open(os.path.join(full_path, "json", "parameters_holodoppler.json"), "w") as f:
@@ -642,6 +726,27 @@ class Holodoppler:
                 f.write("Git commit hash: Not available\n")
         with open(os.path.join(full_path, "version_holodoppler.txt"), "w") as f:
             f.write(f"py{self.__version__}")
+        with open(os.path.join(full_path, "info_holodoppler.txt"), "w") as f:
+            f.write(f"py{self.__version__}  {self.backend_name}  {self.pipeline_version}")
+            
+        # copy camera aquisition metadata information if any
+        if self.file_reader.ext == ".holo":
+            with open(os.path.join(full_path, "version_holovibes.txt"), "w") as f:
+                f.write(f"{self.file_reader.file_footer.get('info',{}).get('holovibes_version', 'unknown')}")
+            with open(os.path.join(full_path, "json", "holovibes_footer.json"), "w") as f:
+                json.dump(self.file_reader.file_footer, f, indent=4)
+                
+        # Dispose of GPU arrays to free memory
+        # if "cupy" in self.bm.backend_name:
+        #     import cupy as cp
+        #     del d_frames
+        #     if 'd_frames_next' in locals():
+        #         del d_frames_next
+        #     cp.cuda.Device().synchronize()
+        #     cp.get_default_memory_pool().free_all_blocks()
+        #     cp.get_default_pinned_memory_pool().free_all_blocks()
+        
+        plt.close('all') # close any open figures to free memory
         
         # Save HDF5
         with h5py.File(os.path.join(full_path, "h5", f"{dir_name}_output.h5"), "w") as f:
@@ -649,3 +754,11 @@ class Holodoppler:
             f.create_dataset("moment1", data=vid[:, :, :, 1])
             f.create_dataset("moment2", data=vid[:, :, :, 2])
             f.create_dataset("HD_parameters", data=json.dumps(parameters))
+            f.create_dataset("HD_info", data=f"py{self.__version__}  {self.backend_name}  {self.pipeline_version}")
+            if parameters["image_registration"]:
+                reg_array = np.array(reg_list, dtype=np.float32)
+                f.create_dataset("registration", data=reg_array)
+            if parameters["shack_hartmann"] and parameters["shack_hartmann_zernike_fit"] and coefs_list is not None:
+                coefs_zernike = np.stack(coefs_list).astype(np.float32)
+                dset = f.create_dataset("zernike_coefs_radians", data=coefs_zernike)
+                dset.attrs["noll_indices"] = parameters["shack_hartmann_zernike_fit_modes"]

@@ -5,6 +5,9 @@ Utility functions for array operations
 import numpy as np
 import scipy.fftpack as fft
 from matlab_imresize import imresize
+from scipy.ndimage import gaussian_filter as np_gaussian_filter
+from scipy.ndimage import gaussian_filter1d
+
 
 def resize_fft2_slicewise(img, new_h, new_w, xp=np, fft=np.fft):
     img = img.astype(xp.float32)
@@ -144,3 +147,12 @@ def temporal_gaussian(arr, sigma):
                 if sigma == 0 :
                     return arr
                 return gaussian_filter1d(arr.astype(np.float32), sigma=sigma, axis=2)
+            
+def flatfield3D(arr, gw):
+            if arr.ndim != 3:
+                raise ValueError("Input array must be 3D")
+            if gw <= 1:
+                return arr
+            blurred = np_gaussian_filter(arr, sigma=(gw, gw, 1))
+            blurred[blurred == 0] = 1
+            return arr / blurred
