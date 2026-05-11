@@ -100,7 +100,7 @@ def preview(holo_path, parameters: dict) -> None:
 
 
 def process(holo_path, parameters: dict) -> None:
-    HD = Holodoppler(backend = "cupy", pipeline_version = "latest_old_reg")
+    HD = Holodoppler(backend = "cupyRAM", pipeline_version = "latest_old_reg")
 
     HD.load_file(holo_path)
 

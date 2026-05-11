@@ -2261,9 +2261,13 @@ class Holodoppler:
         import time
         t0 = time.perf_counter()
         if parameters["debug"]:
+            
+            debugin_queue.join()
+            stop_event.set()
+            debug_thread.join()
             # --- build streams automatically ---
             streams = {k: [None]*len(debug_results) for k in self.debug_plotters.keys()}
-
+            print(debug_results)
             for i, dic in debug_results.items():
                 for key, img in dic.items():
                     if parameters["square"] and key in ["montage", "M0notfixed"]:
@@ -2279,10 +2283,6 @@ class Holodoppler:
                 for stream in streams.values()
                 if any(img is not None for img in stream)
             ]
-            debugin_queue.join()
-            stop_event.set()
-            debug_thread.join()
-
         else:
             vid_debug = None
         t_debug = time.perf_counter() - t0

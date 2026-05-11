@@ -278,6 +278,8 @@ class UI(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                 process(str(p), params)
             self.q.put(("status", "Done ヽ(^o^)丿"))
         except Exception as e:
+            import traceback
+            print(traceback.format_exc())
             self.q.put(("err", str(e)))
         finally:
             self.q.put(("done", None))
