@@ -7,8 +7,7 @@ with open(r"./parameters/default_parameters.json") as f :
     
 print("Using parameters :", parameters)
 
-HD = Holodoppler(backend = "cupy", pipeline_version = "latest_old_reg")
-
+HD = Holodoppler(backend = "cupyRAM", pipeline_version = "latest_old_reg")
 listpath = json.loads(open(r".debug_paths.json").read())["LISTTXTPATH"]
 
 for line in open(listpath, 'r'):
