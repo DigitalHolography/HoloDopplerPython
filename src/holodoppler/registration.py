@@ -79,8 +79,9 @@ class ImageRegistration:
         ky0, kx0 = xp.unravel_index(xp.argmax(mag), mag.shape)
         return (int(ky0), int(kx0))
     
-    def apply_translation(self, img, shift_y, shift_x):
+    def apply_translation(self, img, shifts):
         """Apply translation using Fourier phase shift"""
+        shift_y, shift_x = shifts
         xp = self.bm.xp
         ny, nx = img.shape[-2:]
         

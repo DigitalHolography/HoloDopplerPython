@@ -3,7 +3,45 @@ Utility functions for array operations
 """
 
 import numpy as np
+import scipy.fftpack as fft
+from matlab_imresize import imresize
 
+def resize_fft2_slicewise(img, new_h, new_w, xp=np, fft=np.fft):
+    img = img.astype(xp.float32)
+    h, w = img.shape[:2]
+    rest = img.shape[2:]
+    img = img.reshape(h, w, -1)
+    n_slices = img.shape[-1]
+    out = xp.empty((new_h, new_w, n_slices), dtype=xp.float32)
+    for i in range(n_slices):
+        slice_2d = img[:, :, i]
+        F = fft.fftshift(
+            fft.fft2(slice_2d),
+        )
+        F_new = xp.zeros((new_h, new_w), dtype=F.dtype)
+        h_min, w_min = min(h, new_h), min(w, new_w)
+        ho, wo = (h - h_min)//2, (w - w_min)//2
+        hn, wn = (new_h - h_min)//2, (new_w - w_min)//2
+        F_new[hn:hn+h_min, wn:wn+w_min] = F[ho:ho+h_min, wo:wo+w_min]
+        resized = fft.ifft2(
+            fft.ifftshift(F_new)
+        ).real
+        resized *= (new_h * new_w) / (h * w)
+        out[:, :, i] = resized
+    return out.reshape(new_h, new_w, *rest)
+
+def resize_matlab_slicewise(img, new_h, new_w, xp=np):
+    img = img.astype(xp.float32)
+    h, w = img.shape[:2]
+    rest = img.shape[2:]
+    img = img.reshape(h, w, -1)
+    n_slices = img.shape[-1]
+    out = xp.empty((new_h, new_w, n_slices), dtype=xp.float32)
+    for i in range(n_slices):
+        slice_2d = img[:, :, i]
+        resized = imresize(slice_2d, output_shape=(new_h, new_w))
+        out[:, :, i] = resized
+    return out.reshape(new_h, new_w, *rest)
 
 def pad_array_centrally(arr, new_shape, xp):
     """Pad array centrally to new shape"""
@@ -101,3 +139,8 @@ def normalize_image(arr):
     if hi > lo:
         return ((arr - lo) / (hi - lo) * 255).astype(np.uint8)
     return arr.astype(np.uint8)
+
+def temporal_gaussian(arr, sigma):
+                if sigma == 0 :
+                    return arr
+                return gaussian_filter1d(arr.astype(np.float32), sigma=sigma, axis=2)

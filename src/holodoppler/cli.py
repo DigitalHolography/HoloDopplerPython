@@ -99,10 +99,10 @@ def process(holo_path, parameters: dict) -> None:
 
     HD.load_file(holo_path)
 
-    if HD.ext == ".holo":
-        print("file header :", HD.file_header)
+    if HD.file_reader.ext == ".holo":
+        print("file header :", HD.file_reader.file_header)
 
-    HD.process_moments_(parameters, holodoppler_path = True)
+    HD.process_moments(parameters, holodoppler_path = True)
 
 def _existing_file(value: str) -> Path:
     path = Path(value).expanduser().resolve()

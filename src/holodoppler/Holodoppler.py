@@ -9,6 +9,7 @@ import threading
 import queue
 import traceback
 from collections import defaultdict
+from importlib.metadata import version
 
 import numpy as np
 import cv2
@@ -26,7 +27,7 @@ from .zernike import ZernikeReconstructor
 from .moments import MomentCalculator
 from .plotting import DebugPlotterManager
 from .utils import (gaussian_flatfield, normalize_image, temporal_gaussian_filter,
-                    pad_array_centrally, crop_array_centrally, elliptical_mask)
+                    pad_array_centrally, crop_array_centrally, elliptical_mask, resize_fft2_slicewise, resize_matlab_slicewise)
 
 
 class Holodoppler:
@@ -45,8 +46,13 @@ class Holodoppler:
     """
     
     def __init__(self, backend="numpy", pipeline_version="latest"):
+        self.__version__ = version("holodoppler")
+        
+        
         self.backend_name = backend
         self.pipeline_version = pipeline_version
+        
+        print(f"HoloDoppler : py{self.__version__}  {backend}  {pipeline_version}")
         
         # Initialize components
         self.bm = BackendManager(backend)
@@ -73,6 +79,7 @@ class Holodoppler:
             self._register = self.registration.register_trs
             self._apply_registration = self.registration.apply_translation
             self._moment = self.moments.moment
+            self._resize_to_square = resize_fft2_slicewise
         elif self.pipeline_version == "old":
             self._frequency_filter = self._old_frequency_filter
             self._propagate = self.propagation.fresnel_transform
@@ -80,6 +87,7 @@ class Holodoppler:
             self._register = self.registration.translation_only
             self._apply_registration = self.registration.apply_roll
             self._moment = self.moments.moment_khz
+            self._resize_to_square = resize_matlab_slicewise
         elif self.pipeline_version == "latest_old_reg":
             self._frequency_filter = self.filtering.frequency_symmetric_filtering
             self._propagate = self.propagation.fresnel_transform
@@ -87,8 +95,9 @@ class Holodoppler:
             self._register = self.registration.translation_only
             self._apply_registration = self.registration.apply_translation
             self._moment = self.moments.moment
+            self._resize_to_square = resize_fft2_slicewise
     
-    def _old_frequency_filter(self, batch_size, sampling_freq, low_freq, high_freq=None):
+    def _old_frequency_filter(self, batch_size, sampling_freq, low_freq, high_freq=None): # TODO move elsewhere
         """Legacy frequency filtering (MATLAB compatible)"""
         if high_freq is None:
             high_freq = sampling_freq / 2
@@ -353,9 +362,9 @@ class Holodoppler:
             M0_ff = gaussian_flatfield(res["M0"], parameters["registration_flatfield_gw"], 
                                         self.bm.gaussian_filter)
             reg = self._register(registration_ref, M0_ff, parameters.get("registration_disc_ratio"))
-            res["M0"] = self._apply_registration(res["M0"], reg, self.bm.xp)
-            res["M1"] = self._apply_registration(res["M1"], reg, self.bm.xp)
-            res["M2"] = self._apply_registration(res["M2"], reg, self.bm.xp)
+            res["M0"] = self._apply_registration(res["M0"], reg)
+            res["M1"] = self._apply_registration(res["M1"], reg)
+            res["M2"] = self._apply_registration(res["M2"], reg)
             res["registration"] = reg
         
         return res
@@ -364,8 +373,8 @@ class Holodoppler:
     # Full video processing
     # ------------------------------------------------------------
     
-    def process_moments(self, parameters, h5_path=None, mp4_path=None, 
-                        return_numpy=False, holodoppler_path=None):
+    def process_moments(self, parameters, mp4_path = None, 
+                        return_numpy = False, holodoppler_path = True):
         """Process entire video"""
         
         batch_size = parameters["batch_size"]
@@ -424,7 +433,7 @@ class Holodoppler:
             M0_reg = self.render_moments(parameters, frames=frames_reg)["M0"]
             M0_reg = gaussian_flatfield(M0_reg, parameters["registration_flatfield_gw"], 
                                          self.bm.gaussian_filter)
-            M0_reg = self.bm.to_numpy(M0_reg)
+            M0_reg = self.bm.to_backend(M0_reg)
         else:
             M0_reg = None
         
@@ -450,23 +459,23 @@ class Holodoppler:
             stop_event.set()
             debug_thread.join()
             debug_manager.close_all()
-        
-        # Post-processing: spatial transforms
-        if parameters.get("square"):
-            m = max(vid.shape[0], vid.shape[1])
-            vid = self._resize_to_square(vid, m)
-        if parameters.get("transpose"):
-            vid = self.bm.xp.transpose(vid, axes=(1, 0, 2, 3))
-        if parameters.get("flip_x"):
-            vid = self.bm.xp.flip(vid, axis=1)
-        if parameters.get("flip_y"):
-            vid = self.bm.xp.flip(vid, axis=0)
-        
+            
         # Convert to numpy for saving
         vid_np = self.bm.to_numpy(vid)
         
+        # Post-processing: spatial transforms
+        if parameters.get("square"):
+            m = max(vid_np.shape[0], vid_np.shape[1])
+            vid_np = self._resize_to_square(vid_np, m, m)
+        if parameters.get("transpose"):
+            vid_np = self.bm.xp.transpose(vid_np, axes=(1, 0, 2, 3))
+        if parameters.get("flip_x"):
+            vid_np = self.bm.xp.flip(vid_np, axis=1)
+        if parameters.get("flip_y"):
+            vid_np = self.bm.xp.flip(vid_np, axis=0)
+        
         # Save outputs
-        self._save_outputs(h5_path, mp4_path, holodoppler_path, vid_np, parameters,
+        self._save_outputs(mp4_path, holodoppler_path, vid_np, parameters,
                           reg_list, coefs_list, end_frame, first_frame, num_batch)
         
         self.close_file()
@@ -476,19 +485,6 @@ class Holodoppler:
             return vid_np
         
         return None
-    
-    def _resize_to_square(self, vid, size):
-        """Resize video to square"""
-        from .utils import pad_array_centrally, crop_array_centrally
-        
-        ny, nx = vid.shape[0], vid.shape[1]
-        if ny == nx == size:
-            return vid
-        
-        if ny < size or nx < size:
-            return pad_array_centrally(vid, (size, size), self.bm.xp)
-        else:
-            return crop_array_centrally(vid, (size, size), self.bm.xp)
     
     def _process_cpu(self, parameters, num_batch, first_frame, batch_stride,
                      batch_size, M0_reg, out_list, coefs_list, reg_list,
@@ -562,44 +558,41 @@ class Holodoppler:
         stream_h2d.synchronize()
         cp.cuda.Device().synchronize()
     
-    def _save_outputs(self, h5_path, mp4_path, holodoppler_path, vid, parameters,
+    def _save_outputs(self, mp4_path, holodoppler_path, vid, parameters,
                       reg_list, coefs_list, end_frame, first_frame, num_batch):
         """Save outputs to disk"""
-        import subprocess
-        import json
         
+        # if h5_path is not None:
+            # with h5py.File(h5_path, "w") as f:
+            #     f.create_dataset("moment0", data=vid[:, :, :, 0])
+            #     f.create_dataset("moment1", data=vid[:, :, :, 1])
+            #     f.create_dataset("moment2", data=vid[:, :, :, 2])
+            #     f.create_dataset("HD_parameters", data=json.dumps(parameters))
+            #     if reg_list is not None and any(r is not None for r in reg_list):
+            #         f.create_dataset("registration", data=self.bm.to_numpy(self.bm.xp.array(reg_list)))
+            #     if coefs_list is not None and any(c is not None for c in coefs_list):
+            #         f.create_dataset("zernike_coefs_radians", data=self.bm.to_numpy(self.bm.xp.array(coefs_list)))
+                
+            #     # Metadata
+            #     if hasattr(self, 'holo_header'):
+            #         f.create_dataset("holo_header", data=json.dumps(self.holo_header))
+            #         f.create_dataset("holo_footer", data=json.dumps(self.holo_footer))
+            #     elif hasattr(self, 'cine_metadata'):
+            #         f.create_dataset("cine_metadata", data=json.dumps(self.cine_metadata))
+                
+            #     try:
+            #         git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
+            #         f.create_dataset("git_commit", data=git_commit)
+            #     except Exception:
+            #         pass
         fps = num_batch / (end_frame - first_frame) * parameters["sampling_freq"]
         fps = min(fps, 65)
-        
-        if h5_path is not None:
-            with h5py.File(h5_path, "w") as f:
-                f.create_dataset("moment0", data=vid[:, :, :, 0])
-                f.create_dataset("moment1", data=vid[:, :, :, 1])
-                f.create_dataset("moment2", data=vid[:, :, :, 2])
-                f.create_dataset("HD_parameters", data=json.dumps(parameters))
-                if reg_list is not None and any(r is not None for r in reg_list):
-                    f.create_dataset("registration", data=self.bm.to_numpy(self.bm.xp.array(reg_list)))
-                if coefs_list is not None and any(c is not None for c in coefs_list):
-                    f.create_dataset("zernike_coefs_radians", data=self.bm.to_numpy(self.bm.xp.array(coefs_list)))
-                
-                # Metadata
-                if hasattr(self, 'holo_header'):
-                    f.create_dataset("holo_header", data=json.dumps(self.holo_header))
-                    f.create_dataset("holo_footer", data=json.dumps(self.holo_footer))
-                elif hasattr(self, 'cine_metadata'):
-                    f.create_dataset("cine_metadata", data=json.dumps(self.cine_metadata))
-                
-                try:
-                    git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
-                    f.create_dataset("git_commit", data=git_commit)
-                except Exception:
-                    pass
-        
+            
         if mp4_path is not None:
             self._write_video(mp4_path, vid[:, :, 0, :], fps)
         
         if holodoppler_path is not None:
-            self._save_holodoppler_output(holodoppler_path, vid, parameters, fps,
+            self._save_holodoppler_output(vid, parameters, fps,
                                           reg_list, coefs_list, end_frame, first_frame, num_batch)
     
     def _write_video(self, path, frames, fps, fourcc="mp4v", is_color=False):
@@ -610,7 +603,7 @@ class Holodoppler:
             out.write(normalize_image(frames[:, :, i]))
         out.release()
     
-    def _save_holodoppler_output(self, output_path, vid, parameters, fps, reg_list, coefs_list, end_frame, first_frame, num_batch):
+    def _save_holodoppler_output(self, vid, parameters, fps, reg_list, coefs_list, end_frame, first_frame, num_batch):
         """Save complete Holodoppler output directory"""
         import subprocess
         import json
@@ -618,7 +611,7 @@ class Holodoppler:
         base_name = os.path.splitext(os.path.basename(self.file_reader.file_path))[0]
         dir_name = f"{base_name}_HD"
         parent_dir = os.path.dirname(self.file_reader.file_path)
-        full_path = os.path.join(parent_dir, dir_name, output_path) if output_path else os.path.join(parent_dir, dir_name)
+        full_path = os.path.join(parent_dir, dir_name)
         os.makedirs(full_path, exist_ok=True)
         
         # Create subdirectories
@@ -635,7 +628,7 @@ class Holodoppler:
         save_pair("moment_2", vid[:, :, 2, :])
         
         # Save JSON parameters
-        with open(os.path.join(full_path, "json", "parameters.json"), "w") as f:
+        with open(os.path.join(full_path, "json", "parameters_holodoppler.json"), "w") as f:
             json.dump(parameters, f, indent=4)
         
         # Save version info
@@ -647,6 +640,8 @@ class Holodoppler:
                 f.write(f"Git commit hash: {git_commit}\n")
             except Exception:
                 f.write("Git commit hash: Not available\n")
+        with open(os.path.join(full_path, "version_holodoppler.txt"), "w") as f:
+            f.write(f"py{self.__version__}")
         
         # Save HDF5
         with h5py.File(os.path.join(full_path, "h5", f"{dir_name}_output.h5"), "w") as f:
