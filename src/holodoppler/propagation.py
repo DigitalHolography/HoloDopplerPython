@@ -113,7 +113,7 @@ class PropagationKernels:
         
         return result
     
-    def fresnel_transform_with_phase(self, frames, phase_term, zero_padding=False):
+    def fresnel_transform_with_phase(self, frames, phase_term, zero_padding=False, use_output_kernel=True):
         """Apply Fresnel transform with phase correction"""
         xp = self.bm.xp
         fft = self.bm.fft
@@ -128,7 +128,7 @@ class PropagationKernels:
             axes=(-1, -2)
         )
         
-        if "Fresnel_out" in self.kernels:
+        if use_output_kernel and "Fresnel_out" in self.kernels:
             result = result * self.kernels["Fresnel_out"]
         
         return result

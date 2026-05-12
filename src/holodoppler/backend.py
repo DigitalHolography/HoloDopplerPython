@@ -57,6 +57,18 @@ class BackendManager:
             return arr.get()
         return arr
     
+    def clear_gpu_memory(self, synchronize=True):
+        """Clear GPU memory pools if using CuPy backend."""
+
+        if self.xp is not cp:
+            return
+
+        if synchronize:
+            self.xp.cuda.Device().synchronize()
+
+        self.xp.get_default_memory_pool().free_all_blocks()
+        self.xp.get_default_pinned_memory_pool().free_all_blocks()
+    
     @property
     def is_gpu(self):
         return "cupy" in self.backend_name and _cupy_available

@@ -84,8 +84,8 @@ class ZernikeReconstructor:
         
         nysubabs, nxsubabs = shifts_y.shape
         
-        slopes_y = (shifts_y) * wavelength / (pixel_pitch_y * (ny // nysubabs))
-        slopes_x = (shifts_x) * wavelength / (pixel_pitch_x * (nx // nxsubabs))
+        slopes_y = (shifts_y) * wavelength / (pixel_pitch_y * (ny // nysubabs)) # z / z
+        slopes_x = (shifts_x) * wavelength / (pixel_pitch_x * (nx // nxsubabs)) # z / z
         
         s = xp.stack([slopes_y, slopes_x])
         

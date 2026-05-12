@@ -315,7 +315,7 @@ class Holodoppler:
                         parameters["wavelength"], ny, nx,
                         zero_padding=parameters.get("zero_padding")
                     )
-                    holograms = self._propagate(frames_sub, zero_padding=parameters.get("zero_padding"))
+                    holograms = self.propagation.fresnel_transform(frames_sub, zero_padding=parameters.get("zero_padding"))
                 else:
                     self.propagation.build_angular_kernel(
                         parameters["z"], parameters["pixel_pitch"],
@@ -328,7 +328,8 @@ class Holodoppler:
                 holograms_not_fixed = None
             
             # SVD filtering
-            holograms_f = self.filtering.svd_filter(holograms, parameters["svd_threshold"])
+            # holograms_f = self.filtering.svd_filter(holograms, parameters["svd_threshold"])
+            holograms_f = self.filtering.tucker_filter(holograms, ranks=holograms.shape, temporal_modes_to_remove=parameters["svd_threshold"])
             
             # Temporal FFT
             spectrum_f = self.filtering.fourier_time_transform(holograms_f)
@@ -485,6 +486,9 @@ class Holodoppler:
             }
         else:
             vid_debug = {}
+            
+        # clear gpu memory to enforce no memory leak
+        self.bm.clear_gpu_memory()
         
         # Post-processing: spatial transforms
         if parameters.get("square"):
@@ -661,29 +665,6 @@ class Holodoppler:
                       reg_list, coefs_list, end_frame, first_frame, num_batch):
         """Save outputs to disk"""
         
-        # if h5_path is not None:
-            # with h5py.File(h5_path, "w") as f:
-            #     f.create_dataset("moment0", data=vid[:, :, :, 0])
-            #     f.create_dataset("moment1", data=vid[:, :, :, 1])
-            #     f.create_dataset("moment2", data=vid[:, :, :, 2])
-            #     f.create_dataset("HD_parameters", data=json.dumps(parameters))
-            #     if reg_list is not None and any(r is not None for r in reg_list):
-            #         f.create_dataset("registration", data=self.bm.to_numpy(self.bm.xp.array(reg_list)))
-            #     if coefs_list is not None and any(c is not None for c in coefs_list):
-            #         f.create_dataset("zernike_coefs_radians", data=self.bm.to_numpy(self.bm.xp.array(coefs_list)))
-                
-            #     # Metadata
-            #     if hasattr(self, 'holo_header'):
-            #         f.create_dataset("holo_header", data=json.dumps(self.holo_header))
-            #         f.create_dataset("holo_footer", data=json.dumps(self.holo_footer))
-            #     elif hasattr(self, 'cine_metadata'):
-            #         f.create_dataset("cine_metadata", data=json.dumps(self.cine_metadata))
-                
-            #     try:
-            #         git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
-            #         f.create_dataset("git_commit", data=git_commit)
-            #     except Exception:
-            #         pass
         fps = num_batch / (end_frame - first_frame) * parameters["sampling_freq"]
         fps = min(fps, 65)
             
@@ -730,6 +711,8 @@ class Holodoppler:
         dir_name = f"{base_name}_HD"
         parent_dir = os.path.dirname(self.file_reader.file_path)
         full_path = os.path.join(parent_dir, base_name, dir_name)
+        
+        print("Saving holodoppler outputs to : ",full_path)
         os.makedirs(full_path, exist_ok=True)
         
         # Create subdirectories
