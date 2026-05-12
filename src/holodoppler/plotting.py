@@ -222,7 +222,7 @@ class DebugPlotterManager:
             "phase": lambda res: (res["phase"],),
             "phase_rel": lambda res: (res["phase"],),
             "M0notfixed": lambda res: (res["M0notfixed"],),
-            "spectrum": lambda res: (res["spectrum_line"], res["freqs"]),
+            "spectrum": lambda res: (res["spectrum_line"],),
         }
         
         self.plotters = plotters

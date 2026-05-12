@@ -74,24 +74,18 @@ class Holodoppler:
         """Configure pipeline functions based on version"""
         if self.pipeline_version == "latest":
             self._frequency_filter = self.filtering.frequency_symmetric_filtering
-            self._propagate = self.propagation.fresnel_transform
-            self._propagate_with_phase = self.propagation.fresnel_transform_with_phase
             self._register = self.registration.register_trs
             self._apply_registration = self.registration.apply_translation
             self._moment = self.moments.moment
             self._resize_to_square = resize_fft2_slicewise
         elif self.pipeline_version == "old":
             self._frequency_filter = self._old_frequency_filter
-            self._propagate = self.propagation.fresnel_transform
-            self._propagate_with_phase = self.propagation.fresnel_transform_with_phase
             self._register = self.registration.translation_only
             self._apply_registration = self.registration.apply_roll
             self._moment = self.moments.moment_khz
             self._resize_to_square = resize_matlab_slicewise
         elif self.pipeline_version == "latest_old_reg":
             self._frequency_filter = self.filtering.frequency_symmetric_filtering
-            self._propagate = self.propagation.fresnel_transform
-            self._propagate_with_phase = self.propagation.fresnel_transform_with_phase
             self._register = self.registration.translation_only
             self._apply_registration = self.registration.apply_translation
             self._moment = self.moments.moment
@@ -293,7 +287,7 @@ class Holodoppler:
             # Propagate with or without phase correction
             if parameters.get("shack_hartmann") and phase_term is not None:
                 if parameters["spatial_propagation"] == "Fresnel":
-                    holograms = self._propagate_with_phase(frames_sub, phase_term, 
+                    holograms = self.propagation.fresnel_transform_with_phase(frames_sub, phase_term, 
                                                            zero_padding=parameters.get("zero_padding"))
                 else:
                     holograms = self.propagation.angular_spectrum_transform_with_phase(
@@ -302,7 +296,7 @@ class Holodoppler:
                 
                 if parameters.get("debug"):
                     if parameters["spatial_propagation"] == "Fresnel":
-                        holograms_not_fixed = self._propagate(frames_sub, 
+                        holograms_not_fixed = self.propagation.fresnel_transform(frames_sub, 
                                                                zero_padding=parameters.get("zero_padding"))
                     else:
                         holograms_not_fixed = self.propagation.angular_spectrum_transform(
