@@ -206,6 +206,7 @@ class DebugPlotterManager:
             "phase": PhasePlotter(),
             "phase_rel": PhasePlotter(relative=True),
             "M0notfixed": ImagePlotter(),
+            "M0ffnoreg": ImagePlotter(),
             "spectrum": SpectrumPlotter(
                 fs=parameters["sampling_freq"],
                 f1=parameters["low_freq"],
@@ -222,6 +223,7 @@ class DebugPlotterManager:
             "phase": lambda res: (res["phase"],),
             "phase_rel": lambda res: (res["phase"],),
             "M0notfixed": lambda res: (res["M0notfixed"],),
+            "M0ffnoreg": lambda res: (res["M0_ff_noreg"],),
             "spectrum": lambda res: (res["spectrum_line"],),
         }
         

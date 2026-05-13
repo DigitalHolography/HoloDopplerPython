@@ -12,7 +12,7 @@
   "pixel_pitch": 2e-5,
   "spatial_propagation": "Fresnel",
   "zero_padding": false,
-  "z": 0.480,
+  "z": 0.435,
   "shack_hartmann": true,
   "shack_hartmann_accumulation": 1,
   "shack_hartmann_ny_subap": 5,

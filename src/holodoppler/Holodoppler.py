@@ -75,7 +75,7 @@ class Holodoppler:
         if self.pipeline_version == "latest":
             self._frequency_filter = self.filtering.frequency_symmetric_filtering
             self._register = self.registration.register_trs
-            self._apply_registration = self.registration.apply_translation
+            self._apply_registration = self.registration.apply_registration
             self._moment = self.moments.moment
             self._resize_to_square = resize_fft2_slicewise
         elif self.pipeline_version == "old":
@@ -364,6 +364,7 @@ class Holodoppler:
         if parameters.get("image_registration") and registration_ref is not None:
             M0_ff = gaussian_flatfield(res["M0"], parameters["registration_flatfield_gw"], 
                                         self.bm.gaussian_filter)
+            res["M0_ff_noreg"] = M0_ff
             reg = self._register(registration_ref, M0_ff, parameters.get("registration_disc_ratio"))
             res["M0"] = self._apply_registration(res["M0"], reg)
             res["M1"] = self._apply_registration(res["M1"], reg)
@@ -670,17 +671,37 @@ class Holodoppler:
                                           reg_list, coefs_list, end_frame, first_frame, num_batch)
     
     def _write_video(self, path, frames, fps, fourcc="mp4v"):
-        """Write grayscale or color video."""
+        """Write grayscale (H, W, N) or color (H, W, C, N) video."""
+        import cv2
+        import numpy as np
+
+        frames = np.asarray(frames)
+
         if frames.ndim == 3:
-            # (H, W, N)
-            h, w, n = frames.shape
+            # (H, W, N) -> (N, H, W)
+            video = np.moveaxis(frames, -1, 0)
             is_color = False
+
         elif frames.ndim == 4:
-            # (H, W, C, N)
-            h, w, c, n = frames.shape
-            is_color = c > 1
+            # (H, W, C, N) -> (N, H, W, C)
+            video = np.moveaxis(frames, -1, 0)
+            is_color = video.shape[-1] > 1
+
+            if video.shape[-1] == 3:
+                video = video[..., ::-1]  # RGB -> BGR for OpenCV
+
         else:
             raise ValueError(f"Unsupported frame shape: {frames.shape}")
+
+        video = video.astype(np.float32, copy=False)
+        vmin = video.min(axis=tuple(range(1, video.ndim)), keepdims=True)
+        vmax = video.max(axis=tuple(range(1, video.ndim)), keepdims=True)
+
+        video = (255 * (video - vmin) / (vmax - vmin + 1e-12)).clip(0, 255).astype(np.uint8)
+        video = np.ascontiguousarray(video)
+
+        h, w = video.shape[1:3]
+
         out = cv2.VideoWriter(
             path,
             cv2.VideoWriter_fourcc(*fourcc),
@@ -688,12 +709,10 @@ class Holodoppler:
             (w, h),
             isColor=is_color,
         )
-        for i in range(n):
-            if frames.ndim == 3:
-                frame = normalize_image(frames[:, :, i])
-            else:
-                frame = normalize_image(frames[:, :, :, i])
+
+        for frame in video:
             out.write(frame)
+
         out.release()
     
     def _save_holodoppler_output(self, vid, vid_debug, parameters, fps, reg_list, coefs_list, end_frame, first_frame, num_batch):
@@ -725,10 +744,11 @@ class Holodoppler:
         save_pair("moment_0_flatfield", flatfield3D(vid[:, :, 0, :], parameters["registration_flatfield_gw"]))
         
         for key, video_debug in vid_debug.items():
+            if key in {"montage","M0notfixed", "M0ffnoreg"}:
+                ny, nx, nt = video_debug.shape
+                m = max(nx,ny)
+                video_debug = self._resize_to_square(video_debug, m, m)
             save_pair(f"debug_{key}", video_debug, png=False)
-
-                
-            
         
         # Save JSON parameters
         with open(os.path.join(full_path, "json", "parameters_holodoppler.json"), "w") as f:
@@ -754,24 +774,14 @@ class Holodoppler:
                 f.write(f"{self.file_reader.file_footer.get('info',{}).get('holovibes_version', 'unknown')}")
             with open(os.path.join(full_path, "json", "holovibes_footer.json"), "w") as f:
                 json.dump(self.file_reader.file_footer, f, indent=4)
-                
-        # Dispose of GPU arrays to free memory
-        # if "cupy" in self.bm.backend_name:
-        #     import cupy as cp
-        #     del d_frames
-        #     if 'd_frames_next' in locals():
-        #         del d_frames_next
-        #     cp.cuda.Device().synchronize()
-        #     cp.get_default_memory_pool().free_all_blocks()
-        #     cp.get_default_pinned_memory_pool().free_all_blocks()
         
         plt.close('all') # close any open figures to free memory
         
         # Save HDF5
         with h5py.File(os.path.join(full_path, "h5", f"{dir_name}_output.h5"), "w") as f:
-            f.create_dataset("moment0", data=vid[:, :, :, 0])
-            f.create_dataset("moment1", data=vid[:, :, :, 1])
-            f.create_dataset("moment2", data=vid[:, :, :, 2])
+            f.create_dataset("moment0", data=vid[:, :, 0, :])
+            f.create_dataset("moment1", data=vid[:, :, 1, :])
+            f.create_dataset("moment2", data=vid[:, :, 2, :])
             f.create_dataset("HD_parameters", data=json.dumps(parameters))
             f.create_dataset("HD_info", data=f"py{self.__version__}  {self.backend_name}  {self.pipeline_version}")
             if parameters["image_registration"]:

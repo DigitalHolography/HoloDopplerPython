@@ -95,12 +95,14 @@ def preview(holo_path, parameters: dict) -> None:
 
 
 def process(holo_path, parameters: dict) -> None:
-    HD = Holodoppler(backend = "cupyRAM", pipeline_version = "latest_old_reg")
+    HD = Holodoppler(backend = "cupyRAM", pipeline_version = "latest")
 
     HD.load_file(holo_path)
 
     if HD.file_reader.ext == ".holo":
         print("file header :", HD.file_reader.file_header)
+        
+    print("parameters : ", parameters)
 
     HD.process_moments(parameters, holodoppler_path = True)
 

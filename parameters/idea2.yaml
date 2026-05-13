@@ -1,0 +1,329 @@
+version: 1.0
+
+pipeline:
+
+  globals:
+
+    dtype:
+      real: float32
+      complex: complex64
+
+    execution:
+      device: cuda
+
+
+
+      # accumulation:
+      #   enabled: true
+      #   batches: 1
+
+    physical_aquisition:
+      wavelength: 8.52e-7
+      pixel_pitch: 2.0e-5
+
+    temporal:
+      sampling_freq: 37037
+
+    debug: false # rename it is for debugging or advanced of more outputs, maybe we could specify it in outputs with every plot and the plot parameters too
+
+
+
+  nodes:
+
+    # io:
+
+    #   input_frames:
+    #     type: image_sequence
+    #     path: data/input/
+    frame_reader:
+      type: file_reader
+        
+        batch_stride: 256
+    #   outputs_dir: data/output/
+
+    # ============================================================
+    # INPUT ACCUMULATION
+    # ============================================================
+
+    frames_batching:
+
+      type: batch_accumulation
+
+      params:
+        batch_size: 256
+        batches: 1
+        mode: rolling
+
+      inputs:
+        frames: input_frames_stream
+
+      outputs:
+        frames: accumulated_frames
+
+    # ============================================================
+    # SHACK-HARTMANN SPLIT
+    # ============================================================
+
+    subaperture_split:
+
+      type: shack_hartmann_split
+
+      params:
+        nx: 5
+        ny: 5
+
+        pupil_threshold: 1.2
+        deviation_threshold: 3.0
+
+      inputs:
+        frames: accumulated_frames
+
+      outputs:
+        cube: subap_cube
+        masks: subap_masks
+
+    # ============================================================
+    # PROPAGATION
+    # ============================================================
+
+    propagate_subaps:
+
+      type: wavefront_propagation
+
+      params:
+        method: fresnel
+        z: 0.480
+        zero_padding: false
+
+      inputs:
+        field: subap_cube
+
+      outputs:
+        field: propagated_subap_cube
+
+    # ============================================================
+    # TEMPORAL FILTERING ON SUBAPS
+    # ============================================================
+
+    subap_temporal_filter:
+
+      type: temporal_filter
+
+      enabled: true
+
+      params:
+        low_freq: 6000
+        high_freq: 18300
+        svd_threshold: 16
+
+      inputs:
+        signal: propagated_subap_cube
+
+      outputs:
+        signal: filtered_subap_cube
+
+    # ============================================================
+    # OPTIONAL CUBE FILTER
+    # ============================================================
+
+    optional_cube_filter:
+
+      type: cube_filter
+
+      enabled: false
+
+      params:
+        method: spatial_svd
+
+      inputs:
+        cube: filtered_subap_cube
+
+      outputs:
+        cube: processed_cube
+
+    # ============================================================
+    # SUBAP RECONSTRUCTIONS
+    # ============================================================
+
+    subap_reconstruction:
+
+      type: subaperture_reconstruction
+
+      params:
+        output: complex_field
+
+      inputs:
+        cube: processed_cube
+
+      outputs:
+        reconstructions: subap_recons
+
+    # ============================================================
+    # REFERENCE RECONSTRUCTION
+    # ============================================================
+
+    reference_reconstruction:
+
+      type: reference_selection
+
+      params:
+        mode: central_subap
+
+        # central_subap
+        # resized_full_reconstruction
+        # external_reference
+
+      inputs:
+        reconstructions: subap_recons
+
+      outputs:
+        reference: reference_recon
+
+    # ============================================================
+    # CROSS CORRELATIONS
+    # ============================================================
+
+    cross_correlation:
+
+      type: cross_correlation
+
+      params:
+        mode: subap_vs_reference
+
+        # all_pairs
+        # subap_vs_reference
+
+        max_shift_pixels: 20
+
+      inputs:
+        source_a: subap_recons
+        source_b: reference_recon
+
+      outputs:
+        correlations: cross_correlations
+
+    # ============================================================
+    # SHIFT ESTIMATION
+    # ============================================================
+
+    shift_estimation:
+
+      type: shift_estimation
+
+      params:
+        estimator: peak_fit
+
+      inputs:
+        correlations: cross_correlations
+
+      outputs:
+        shifts: estimated_shifts
+
+    # ============================================================
+    # PHASE RECONSTRUCTION
+    # ============================================================
+
+    phase_estimation:
+
+      type: phase_reconstruction
+
+      params:
+
+        method: zernike
+
+        # zernike
+        # southwell
+
+        zernike_modes: [4, 5, 6]
+
+      inputs:
+        shifts: estimated_shifts
+
+      outputs:
+        phase: estimated_phase
+        coefficients: zernike_coefficients
+
+    # ============================================================
+    # FULL FIELD RECONSTRUCTION
+    # ============================================================
+
+    full_field_reconstruction:
+
+      type: full_field_reconstruction
+
+      params:
+        iterative_shack_hartmann: true
+        iterations: 3
+
+      inputs:
+        phase: estimated_phase
+        raw_frames: accumulated_frames
+
+      outputs:
+        field: reconstructed_field
+
+    # ============================================================
+    # FINAL TEMPORAL FILTERING
+    # ============================================================
+
+    final_temporal_filter:
+
+      type: temporal_filter
+
+      enabled: true
+
+      params:
+        low_freq: 6000
+        high_freq: 18300
+
+      inputs:
+        signal: reconstructed_field
+
+      outputs:
+        signal: temporally_filtered_field
+
+    # ============================================================
+    # FINAL POSTPROCESS
+    # ============================================================
+
+    final_postprocess:
+
+      type: field_postprocess
+
+      params:
+
+        registration:
+          enabled: true
+          disc_ratio: 0.8
+          flatfield_gaussian_width: 35
+          accumulation_batches: 512
+
+        square: true
+        transpose: false
+
+        flip_x: false
+        flip_y: false
+
+      inputs:
+        field: temporally_filtered_field
+
+      outputs:
+        field: final_field
+        registration_transforms: registration_transforms
+
+  outputs:
+
+    reconstructed_field:
+      from: final_field
+
+    phase:
+      from: estimated_phase
+
+    zernike_coefficients:
+      from: zernike_coefficients
+
+    shifts:
+      from: estimated_shifts
+
+    correlations:
+      from: cross_correlations

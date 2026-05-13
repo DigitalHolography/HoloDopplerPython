@@ -196,7 +196,62 @@ class ImageRegistration:
         out = affine_transform(img, matrix, offset=offset, order=1, mode="nearest")
         return out.astype(img.dtype)
     
-    def register_trs(self, fixed, moving, radius=None, estimate_similarity=False,
+    @staticmethod
+    def new_applyshifts(img, shift_y, shift_x, xp):
+        ny, nx = img.shape[-2:]
+
+        fy = xp.fft.fftfreq(ny).reshape(ny, 1)
+        fx = xp.fft.fftfreq(nx).reshape(1, nx)
+
+        phase = xp.exp(-2j * xp.pi * (fy * shift_y + fx * shift_x))
+
+        out = xp.fft.ifft2(
+            xp.fft.fft2(img, axes=(-2, -1)) * phase,
+            axes=(-2, -1),
+        )
+
+        if xp.isrealobj(img):
+            out = out.real
+
+        return out.astype(img.dtype, copy=False)
+    
+    def apply_registration(self, img, reg):
+        """
+        Apply a registration tuple to an image.
+
+        Parameters
+        ----------
+        img : array (numpy or cupy)
+        reg : tuple
+            (shift_y, shift_x, angle_deg, scale)
+            or (shift_y, shift_x) for translation-only
+        xp : numpy or cupy module
+
+        Returns
+        -------
+        registered image
+        """
+        xp = self.bm.xp
+        # --- Parse registration tuple ---
+        if len(reg) == 2:
+            shift_y, shift_x = reg
+            angle_deg = 0.0
+            scale = 1.0
+        else:
+            shift_y, shift_x, angle_deg, scale = reg
+
+        out = img
+
+        # --- Apply rotation + scale (if needed) ---
+        if angle_deg != 0.0 or scale != 1.0:
+            out = self.apply_rotation_scale(out, angle_deg, scale)
+
+        # --- Apply subpixel translation ---
+        out = self.new_applyshifts(out, shift_y, shift_x, xp)
+
+        return out
+    
+    def register_trs(self, fixed, moving, radius=None, estimate_similarity=True,
                      radial_bins=256, angular_bins=360, return_registered=False):
         """Full TRS (Translation, Rotation, Scale) registration"""
         xp = self.bm.xp
