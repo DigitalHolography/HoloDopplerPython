@@ -1,2526 +1,793 @@
-import matplotlib
-import numpy as np
-import traceback
-import h5py
-import scipy
-from tqdm import tqdm
-import cv2
-import json
+"""
+Holodoppler - Main processing class
+"""
+
 import os
+import json
 import time
-import cinereader
-from cupy.cuda.nvtx import RangePush, RangePop
-import time
-import matplotlib.pyplot as plt
-import scipy.fft as np_fft
-from scipy.ndimage import gaussian_filter as np_gaussian_filter
-from scipy.ndimage import gaussian_filter1d
-from matlab_imresize.imresize import imresize
-import scipy.ndimage as np_ndi
-from scipy.interpolate import griddata
-import scipy.fftpack as np_fftpack
-from matplotlib.backends.backend_agg import FigureCanvasAgg
+import threading
+import queue
+import traceback
+from collections import defaultdict
+from importlib.metadata import version
+
 import numpy as np
-# from concurrent.futures import ProcessPoolExecutor, as_completed
-# from multiprocessing import cpu_count
-# import threading
-# import queue
+import cv2
+import h5py
+from tqdm import tqdm
+import matplotlib.pyplot as plt
 
-try:
-    import cupy as cp
-    import cupyx.scipy.fft as cp_fft
-    from cupyx.scipy.ndimage import gaussian_filter as cp_gaussian_filter
-    import cupyx.scipy.ndimage as cp_ndi
-
-    _cupy_available = True
-except Exception:
-    cp = None
-    cp_fft = None
-    _cupy_available = False
+from .backend import BackendManager
+from .file_io import FileReaderFactory
+from .propagation import PropagationKernels
+from .filtering import Filtering
+from .registration import ImageRegistration
+from .shack_hartmann import ShackHartmann
+from .zernike import ZernikeReconstructor
+from .moments import MomentCalculator
+from .plotting import DebugPlotterManager
+from .utils import (gaussian_flatfield, normalize_image, temporal_gaussian_filter, flatfield3D, 
+                    pad_array_centrally, crop_array_centrally, elliptical_mask, resize_fft2_slicewise, resize_matlab_slicewise)
 
 
 class Holodoppler:
     """
-    Holodoppler processing class for .holo files. 
-        adding support for .cine files.
-
+    Holodoppler processing class for .holo and .cine files.
+    
     Backend:
         backend="numpy"  -> CPU
         backend="cupy"   -> GPU (if available)
-
-    Data is always read on CPU then transferred to GPU if needed.
+        backend="cupyRAM" -> GPU with async I/O
+    
+    Pipeline versions:
+        "latest" - Current optimized pipeline
+        "old" - Legacy MATLAB-compatible pipeline
+        "latest_old_reg" - Current pipeline with old registration
     """
-
-    HOLO_HEADER_SIZE = 64
-
-    def __init__(self, backend = "numpy", pipeline_version = "latest"):
-
-        self.file_path = ""
-
-        self.backend = backend
-
+    
+    def __init__(self, backend="numpy", pipeline_version="latest"):
+        self.__version__ = version("holodoppler")
+        
+        
+        self.backend_name = backend
         self.pipeline_version = pipeline_version
-
-        self._init_backend()
-
-        self._init_pipeline()
-
-        self.fid = None
-
-        self.parameters = dict()
-
-        self.kernels = dict()
-
-    # ------------------------------------------------------------
-    # Backend handling
-    # ------------------------------------------------------------
-
-    def _init_backend(self):
-
-        if "cupy" in self.backend:
-            if not _cupy_available:
-                raise RuntimeError("CuPy backend requested but CuPy is not available.")
-            self.xp = cp
-            self.fft = cp_fft
-            self.gaussian_filter = cp_gaussian_filter
-            self.ndi = cp_ndi
-            self.fftpack = cp_fft
-        else:
-            self.backend = self.backend
-            self.xp = np
-            self.fft = np_fft
-            self.gaussian_filter = np_gaussian_filter
-            self.ndi = np_ndi
-            self.fftpack = np_fftpack
-            
-    def _to_backend(self, arr):
-        if "cupy" in self.backend:
-            return cp.asarray(arr)
-        return arr
-
-    def _to_numpy(self, arr):
-        if "cupy" in self.backend:
-            if isinstance(arr, cp.ndarray):
-                return arr.get() 
-            return arr  # already NumPy or other type
-        return arr
-
-    def _init_pipeline(self):
+        
+        print(f"HoloDoppler : py{self.__version__}  {self.backend_name}  {self.pipeline_version}")
+        
+        # Initialize components
+        self.bm = BackendManager(backend)
+        self.propagation = PropagationKernels(self.bm)
+        self.filtering = Filtering(self.bm)
+        self.registration = ImageRegistration(self.bm)
+        self.shack_hartmann = ShackHartmann(self.bm, self.propagation, self.filtering)
+        self.zernike = ZernikeReconstructor(self.bm)
+        self.moments = MomentCalculator(self.bm)
+        
+        # State
+        self.file_reader = None
+        self.parameters = {}
+        
+        # Pipeline version configuration
+        self._configure_pipeline()
+    
+    def _configure_pipeline(self):
+        """Configure pipeline functions based on version"""
         if self.pipeline_version == "latest":
-            self._frequency_symmetric_filtering = self._new_frequency_symmetric_filtering
-            self._resize = self.resize_fft2_slicewise
-            self._registration = self._registration_trs
-            self._applyregistration = self.applyregistration
-            return
+            self._frequency_filter = self.filtering.frequency_symmetric_filtering
+            self._register = self.registration.register_trs
+            self._apply_registration = self.registration.apply_registration
+            self._moment = self.moments.moment
+            self._resize_to_square = resize_fft2_slicewise
         elif self.pipeline_version == "old":
-            self._frequency_symmetric_filtering = self._old_frequency_symmetric_filtering
-            self._resize = self.resize_matlab_slicewise
-            self._registration = self.old_registration
-            self._applyregistration = self._roll2d
-            self._moment = self._momentkHz
+            self._frequency_filter = self._old_frequency_filter
+            self._register = self.registration.translation_only
+            self._apply_registration = self.registration.apply_roll
+            self._moment = self.moments.moment_khz
+            self._resize_to_square = resize_matlab_slicewise
         elif self.pipeline_version == "latest_old_reg":
-            self._frequency_symmetric_filtering = self._new_frequency_symmetric_filtering
-            self._resize = self.resize_fft2_slicewise
-            self._registration = self.old_registration
-            self._applyregistration = self._roll2d
-            return
-
-    # ------------------------------------------------------------
-    # File handling
-    # ------------------------------------------------------------
-
-    def load_file(self, file_path):
-
-        if self.fid is not None:
-            self.fid.close()
-
-        _, ext = os.path.splitext(file_path)
-
-        self.file_path = file_path
-
-        if ext == ".holo":
-            self.ext = ext
-            def _extract_holo_footer(f, w, h, numframes):
-                offset = w * h * numframes + 64
-                f.seek(offset)
-                footer_bytes = f.read()
-                if not footer_bytes:
-                    return {}
-                try:
-                    footer_str = footer_bytes.decode("utf-8")
-                    return json.loads(footer_str)
-                except Exception:
-                    return {}
-            self.fid = open(self.file_path, "rb")
-            header = self.fid.read(self.HOLO_HEADER_SIZE)
-            file_header = dict()
-            file_header["magic_number"] = ''.join(list(map(chr, header[0:4])))
-            file_header["version"] = int.from_bytes(header[4:6], "little")
-            file_header["bit_depth"] = int.from_bytes(header[6:8], "little")
-            file_header["width"] = int.from_bytes(header[8:12], "little")
-            file_header["height"] = int.from_bytes(header[12:16], "little")
-            file_header["num_frames"] = int.from_bytes(header[16:20], "little")
-            file_header["total_size"] = int.from_bytes(header[20:28], "little")
-            file_header["endianness"] = header[28]
-
-            self.file_footer = _extract_holo_footer(self.fid, file_header["width"], file_header["height"], file_header["num_frames"])
-            self.file_header = file_header
-            self.read_frames = self.read_frames_holo
-
-        elif ext == ".cine":
-            self.ext = ext
-            self.cine_metadata = cinereader.read_metadata(file_path)
-            self.cine_metadata_json = dict(self.cine_metadata.__dict__)
-            self.read_frames = self.read_frames_cine
-
-    def _close_file(self):
-        if self.fid is not None:
-            self.fid.close()
-
-    # ------------------------------------------------------------
-    # Reading frames (CPU only, then transferred if needed)
-    # ------------------------------------------------------------
-
-    def read_frames_cine(self, first_frame, frame_size):
-        _, images, _ = cinereader.read(self.file_path, self.cine_metadata.FirstImageNo + first_frame, frame_size)
-        frames = np.stack(images, axis=0)
-        return self._to_backend(frames)
+            self._frequency_filter = self.filtering.frequency_symmetric_filtering
+            self._register = self.registration.translation_only
+            self._apply_registration = self.registration.apply_translation
+            self._moment = self.moments.moment
+            self._resize_to_square = resize_fft2_slicewise
     
-    def read_frames_holo(self, first_frame, frame_size, fid = None):
-        
-        try:
-
-            if fid is None:
-                fid = self.fid
-            
-            byte_begin = (
-                self.HOLO_HEADER_SIZE
-                + self.file_header["width"] * self.file_header["height"] * first_frame * self.file_header["bit_depth"] // 8
-            )
-
-            byte_size = self.file_header["width"] * self.file_header["height"] * frame_size * self.file_header["bit_depth"] // 8
-
-            fid.seek(byte_begin)
-            raw_bytes = fid.read(byte_size)
-
-            if self.file_header["bit_depth"] == 8:
-                utyp = np.uint8
-            elif self.file_header["bit_depth"] == 16:
-                utyp = np.uint16
-            else:
-                raise RuntimeError("Unsupported bit depth : Supported bit depth are 8 bits or 16 bits")
-
-            if self.file_header["endianness"] == 1:
-                utyp = utyp.newbyteorder('<')
-
-            out = np.frombuffer(raw_bytes, dtype=utyp)
-
-            out = out.reshape(
-                (frame_size,self.file_header["height"], self.file_header["width"]),
-                order="C"
-            )
-            
-            return self._to_backend(out).astype(self.xp.float32)
-
-        except Exception:
-            traceback.print_exc()
-            return None
-
-    # ------------------------------------------------------------
-    # Calculation kernels
-    # ------------------------------------------------------------
-
-    def _build_fresnel_kernel_in(self, z, pixel_pitch, wavelength, ny, nx):
-
-        if isinstance(pixel_pitch, (float, int)):
-            pixel_pitch = (pixel_pitch, pixel_pitch)
-
-        ppy, ppx = pixel_pitch
-
-        xp = self.xp
-
-        y = (xp.arange(0, ny) - xp.round(ny / 2)) * ppy
-        x = (xp.arange(0, nx) - xp.round(nx / 2)) * ppx
-
-        X, Y = xp.meshgrid(x, y)
-
-        kernel = xp.exp(
-            1j * xp.pi / (wavelength * z) * (X ** 2 + Y ** 2)
-        ).astype(xp.complex64)
-
-        self.kernels["Fresnel_in"] = kernel[xp.newaxis, ...]
-    
-    def _build_fresnel_kernel_out(self, z, pixel_pitch, wavelength, ny, nx):
-
-        if isinstance(pixel_pitch, (float, int)):
-            pixel_pitch = (pixel_pitch, pixel_pitch)
-
-        ppy, ppx = pixel_pitch
-
-        xp = self.xp 
-
-        fx = xp.fft.fftfreq(nx, d=ppx)
-        fx = xp.fft.fftshift(fx)
-        fy = xp.fft.fftfreq(ny, d=ppy)
-        fy = xp.fft.fftshift(fy)
-        FX, FY = xp.meshgrid(fx, fy)
-
-        X = wavelength * z * FX
-        Y = wavelength * z * FY
-        k = 2 * xp.pi / wavelength
-        phase = 1j * xp.pi / (wavelength * z) * (X**2 + Y**2)
-        kernel = (xp.exp(1j * k * z) / (1j * wavelength * z) * xp.exp(phase)).astype(xp.complex64)
-        self.kernels["Fresnel_out"] = kernel[xp.newaxis, ...]
-
-    def _build_fresnel_kernel(self, z, pixel_pitch, wavelength, ny, nx, zero_padding = None):
-        self._build_fresnel_kernel_in(z, pixel_pitch, wavelength, ny, nx)
-        self._build_fresnel_kernel_out(z, pixel_pitch, wavelength, ny, nx)
-        
-        if zero_padding:
-            self.kernels["Fresnel_in"] = self.pad_array_centrally(self.kernels["Fresnel_in"], zero_padding)
-            self.kernels["Fresnel_out"] = self.xp.ones_like(self.kernels["Fresnel_in"])
-
-    def _build_angular_kernel(self,
-                              z,
-                              pixel_pitch,
-                              wavelength, ny, nx, zero_padding = None):
-
-        if isinstance(pixel_pitch, (float, int)):
-            pixel_pitch = (pixel_pitch, pixel_pitch)
-
-        ppy, ppx = pixel_pitch
-
-        xp = self.xp
-
-        du = 1.0 / (nx * ppx)
-        dv = 1.0 / (ny * ppy)
-        u = (xp.arange(1, int(nx) + 1) - 1 - xp.round(nx / 2)) * du
-        v = (xp.arange(1, int(ny) + 1) - 1 - xp.round(ny / 2)) * dv
-        U, V = xp.meshgrid(u, v)
-        kernel = xp.exp(
-            2j * xp.pi * z / wavelength *
-            xp.sqrt(1.0 - (wavelength * U) ** 2 - (wavelength * V) ** 2)
-        )
-
-        self.kernels["AngularSpectrum"] = kernel[xp.newaxis, ...]
-        
-        if zero_padding:
-            self.kernels["AngularSpectrum"] = self.pad_array_centrally(self.kernels["AngularSpectrum"], zero_padding)
-
-    # ------------------------------------------------------------
-    # Calculation processing
-    # ------------------------------------------------------------
-    
-    def pad_array_centrally(self, arr, new_shape):
-        
-        xp = self.xp
-        if isinstance(new_shape, int):
-            new_shape = (new_shape, new_shape)
-
-        ny, nx = arr.shape[-2:]
-        new_ny, new_nx = new_shape
-
-        if new_ny < ny or new_nx < nx:
-            raise ValueError("new_shape must be greater than or equal to the current last two dimensions")
-
-        pad_y0 = (new_ny - ny) // 2
-        pad_y1 = new_ny - ny - pad_y0
-        pad_x0 = (new_nx - nx) // 2
-        pad_x1 = new_nx - nx - pad_x0
-
-        pad_width = [(0, 0)] * arr.ndim
-        pad_width[-2] = (pad_y0, pad_y1)
-        pad_width[-1] = (pad_x0, pad_x1)
-
-        return xp.pad(arr, pad_width, mode="constant")
-    
-    def crop_array_centrally(self, arr, target_shape):
-        xp = self.xp
-
-        if isinstance(target_shape, int):
-            target_shape = (target_shape, target_shape)
-
-        ny, nx = arr.shape[-2:]
-        tgt_ny, tgt_nx = target_shape
-
-        if tgt_ny > ny or tgt_nx > nx:
-            raise ValueError("target_shape must be smaller than or equal to current shape")
-
-        crop_y0 = (ny - tgt_ny) // 2
-        crop_y1 = crop_y0 + tgt_ny
-        crop_x0 = (nx - tgt_nx) // 2
-        crop_x1 = crop_x0 + tgt_nx
-
-        slices = [slice(None)] * arr.ndim
-        slices[-2] = slice(crop_y0, crop_y1)
-        slices[-1] = slice(crop_x0, crop_x1)
-
-        return arr[tuple(slices)]
-
-    def _fresnel_transform(self, frames, zero_padding = False):
-        
-        if zero_padding:
-            frames = self.pad_array_centrally(frames, zero_padding)
-
-        if self.pipeline_version == "latest" : 
-            return self.fft.fftshift(
-                self.fft.fft2(frames *self.kernels["Fresnel_in"], axes=(-1, -2), norm="ortho"), axes=(-1, -2)
-            ) *self.kernels["Fresnel_out"]
-        else :
-            return self.fft.fftshift(
-                self.fft.fft2(frames *self.kernels["Fresnel_in"], axes=(-1, -2), norm="ortho"), axes=(-1, -2)
-            )
-    
-    def _angular_spectrum_transform(self, frames, zero_padding = False):
-        
-        if zero_padding:
-            frames = self.pad_array_centrally(frames, zero_padding)
-
-        tmp = self.fft.fft2(frames,axes=(-1, -2), norm="ortho") * self.fft.fftshift(self.kernels["AngularSpectrum"],axes=(-1, -2))
-
-        return self.fft.ifft2(tmp,axes=(-1, -2), norm="ortho")
-
-    def _fourier_time_transform(self, H):
-
-        return self.fft.fft(H, axis=0, norm="ortho") 
-
-    # ------------------------------------------------------------
-    # SVD filtering
-    # (Eigen decomposition of temporal covariance)
-    # ------------------------------------------------------------
-
-    def _svd_filter(self, H, svd_threshold):
-        RangePush("SVD filtering")
-        xp = self.xp
-
-        if svd_threshold < 0:
-            return H
-        
-        sz = H.shape
-        H2 = H.reshape((sz[0],sz[-1] * sz[-2])).T
-
-        cov = H2.conj().T @ H2 
-        
-        eps = 1e-12
-        cov = cov + eps * xp.eye(cov.shape[0], dtype=cov.dtype)
-    
-        S, V = xp.linalg.eigh(cov)
-
-        idx = xp.argsort(S)[::-1]
-        V = V[:, idx]
-        Vt = V[:, :svd_threshold]
-
-        H2 -= H2 @ Vt @ Vt.conj().T
-        RangePop()
-        return H2.T.reshape(sz)
-    
-    @staticmethod
-    def randomized_svd(H2, k, xp):
-        n_random = k + 5
-
-        # random projection
-        Omega = xp.random.randn(H2.shape[1], n_random, dtype=H2.dtype)
-        Y = H2 @ Omega
-
-        # orthonormalize
-        Q, _ = xp.linalg.qr(Y)
-
-        # smaller SVD
-        B = Q.conj().T @ H2
-        Ub, S, Vh = xp.linalg.svd(B, full_matrices=False)
-
-        U = Q @ Ub
-        return U, S, Vh
-    
-    def _svd_filter2(self, H, svd_threshold):
-        print(H.dtype)
-        RangePush("SVD filtering")
-        xp = self.xp
-
-        if svd_threshold < 0:
-            return H
-
-        sz = H.shape
-
-        # reshape: (pixels, channels)
-        H2 = H.reshape(sz[0], -1).T   # (131072, 320)
-
-        # --- SVD (GPU optimized) ---
-        U, S, Vh = xp.linalg.svd(H2, full_matrices=False)
-
-        # keep only leading components
-        Vh_t = Vh[:svd_threshold]
-
-        # projection (tissue)
-
-        H2 -= H2 @ Vh_t.T @ Vh_t
-
-        RangePop()
-        return H2.T.reshape(sz)
-    
-    # ------------------------------------------------------------
-    # Frequency axis and masks
-    # ------------------------------------------------------------
-
-    def _new_frequency_symmetric_filtering(self, batch_size, sampling_freq, low_freq, high_freq = None):
-
-        xp = self.xp
-
-        # fftfreq is backend dependent
-        freqs = self.fft.fftfreq(batch_size, 1 / sampling_freq)
-
-        if high_freq is None:
-            idxs = xp.abs(freqs) > low_freq
-        else:
-            idxs = (high_freq > xp.abs(freqs)) & (xp.abs(freqs) > low_freq)
-
-        return idxs, freqs[idxs]
-    
-    def _old_frequency_symmetric_filtering(self, batch_size, sampling_freq, low_freq, high_freq = None):
-        # old and not clean but similar to matlab version
-
+    def _old_frequency_filter(self, batch_size, sampling_freq, low_freq, high_freq=None): # TODO move elsewhere
+        """Legacy frequency filtering (MATLAB compatible)"""
         if high_freq is None:
             high_freq = sampling_freq / 2
-
-        # convert frequencies to indices
+        
         n1 = int(np.ceil(low_freq * batch_size / sampling_freq))
         n2 = int(np.ceil(high_freq * batch_size / sampling_freq))
-
-        # clamp to valid range (MATLAB: 1..size(SH,3))
+        
         n1 = max(min(n1, batch_size), 1)
         n2 = max(min(n2, batch_size), 1)
-
-        # symmetric integration interval
+        
         n3 = batch_size - n2 + 1
         n4 = batch_size - n1 + 1
-
-        # convert to Python indexing (0-based)
-        i1 = n1 - 1
-        i2 = n2      # exclusive
-        i3 = n3 - 1
-        i4 = n4      # exclusive
-
-        # frequency ranges (MATLAB inclusive -> +1 in Python)
+        
+        i1, i2 = n1 - 1, n2
+        i3, i4 = n3 - 1, n4
+        
         f_range = np.arange(n1, n2 + 1) * (sampling_freq / batch_size)
         f_range_sym = np.arange(-n2, -n1 + 1) * (sampling_freq / batch_size)
-
-        freqs = np.concatenate([f_range, f_range_sym], axis=0)
-
-        # boolean mask
+        freqs = np.concatenate([f_range, f_range_sym])
+        
         idxs = np.zeros(batch_size, dtype=bool)
         idxs[i1:i2] = True
         idxs[i3:i4] = True
-
-        return self._to_backend(idxs), self._to_backend(freqs)
-
-    # ------------------------------------------------------------
-    # Moments
-    # ------------------------------------------------------------
-
-    def _moment(self, A, freqs, n):
-
-        xp = self.xp
-
-        return xp.sum(
-            A * (freqs[... ,xp.newaxis, xp.newaxis] ** n),
-            axis=0
-        ).astype(xp.float32)
         
-    def _momentkHz(self, A, freqs, n):
-
-        xp = self.xp
-
-        return xp.sum(
-            A * ((freqs[... ,xp.newaxis, xp.newaxis] / 1000) ** n),
-            axis=0
-        ).astype(xp.float32)
+        return self.bm.to_backend(idxs), self.bm.to_backend(freqs)
     
     # ------------------------------------------------------------
-    # Flatfielding for registration
+    # File handling
     # ------------------------------------------------------------
-
-    def _flatfield(self, A, gaussian_width):
-        return A / self.gaussian_filter(A,gaussian_width)
     
-    # ------------------------------------------------------------
-    # Resizing for square output
-    # ------------------------------------------------------------
-
-    def resize_fft2_slicewise(self, img, new_h, new_w):
-        xp = np
-        fft = np_fft
-        img = img.astype(xp.float32)
-        h, w = img.shape[:2]
-        rest = img.shape[2:]
-        img = img.reshape(h, w, -1)
-        n_slices = img.shape[-1]
-        out = xp.empty((new_h, new_w, n_slices), dtype=xp.float32)
-        for i in range(n_slices):
-            slice_2d = img[:, :, i]
-            F = fft.fftshift(
-                fft.fft2(slice_2d),
-            )
-            F_new = xp.zeros((new_h, new_w), dtype=F.dtype)
-            h_min, w_min = min(h, new_h), min(w, new_w)
-            ho, wo = (h - h_min)//2, (w - w_min)//2
-            hn, wn = (new_h - h_min)//2, (new_w - w_min)//2
-            F_new[hn:hn+h_min, wn:wn+w_min] = F[ho:ho+h_min, wo:wo+w_min]
-            resized = fft.ifft2(
-                fft.ifftshift(F_new)
-            ).real
-            resized *= (new_h * new_w) / (h * w)
-            out[:, :, i] = resized
-        return out.reshape(new_h, new_w, *rest)
-    
-    def resize_matlab_slicewise(self, img, new_h, new_w):
-        xp = np
-        img = img.astype(xp.float32)
-        h, w = img.shape[:2]
-        rest = img.shape[2:]
-        img = img.reshape(h, w, -1)
-        n_slices = img.shape[-1]
-        out = xp.empty((new_h, new_w, n_slices), dtype=xp.float32)
-        for i in range(n_slices):
-            slice_2d = img[:, :, i]
-            resized = imresize(slice_2d, output_shape=(new_h, new_w))
-            out[:, :, i] = resized
-        return out.reshape(new_h, new_w, *rest)
-
-    # ------------------------------------------------------------
-    # Registration
-    # ------------------------------------------------------------
-
-    @staticmethod
-    def _elliptical_mask(ny, nx, radius_frac, xp):
-        radius_frac = max(0.0, min(1.0, float(radius_frac)))
-        a = (nx / 2) * radius_frac
-        b = (ny / 2) * radius_frac
-
-        Y, X = xp.ogrid[:ny, :nx]
-        cy, cx = ny / 2, nx / 2
-
-        mask = ((X - cx) / a) ** 2 + ((Y - cy) / b) ** 2 <= 1.0
-        return mask
-
-    @staticmethod
-    def _xcorr2d(fixed, moving, xp):
-        f_fixed = xp.fft.fft2(fixed)
-        f_moving = xp.fft.fft2(moving)
-        cross_power = f_moving * f_fixed.conj()
-        cross_power /= (xp.abs(cross_power) + 1e-12)
-        return xp.fft.ifft2(cross_power)
-
-    @staticmethod
-    def _xcorr2_fft(a, b, xp):
-        fa = xp.fft.fft2(a)
-        fb = xp.fft.fft2(b)
-        return xp.fft.ifft2(fa * xp.conj(fb))
-    
-    @staticmethod
-    def _roll2d(img, peaks, xp):
-        peak_y, peak_x = peaks
-        return xp.roll(xp.roll(img, peak_y, axis = -2), peak_x, axis = -1)
-    
-    @staticmethod
-    def _signed_peak(ky, kx, ny, nx):
-        if ky > ny // 2:
-            ky -= ny
-        if kx > nx // 2:
-            kx -= nx
-        return float(ky), float(kx)
-
-    @staticmethod
-    def _subpixel_parabola(vm, v0, vp):
-        denom = vm - 2.0 * v0 + vp
-        if abs(float(denom)) < 1e-12:
-            return 0.0
-        return 0.5 * float(vm - vp) / float(denom)
-
-    def _phase_corr_subpixel(self, a, b, xp):
-        ny, nx = a.shape[-2:]
-
-        fa = xp.fft.fft2(a)
-        fb = xp.fft.fft2(b)
-
-        cps = fb * fa.conj()
-        cps /= xp.abs(cps) + 1e-12
-
-        corr = xp.fft.ifft2(cps)
-        mag = xp.abs(corr)
-
-        ky, kx = xp.unravel_index(xp.argmax(mag), mag.shape)
-        ky, kx = int(ky), int(kx)
-
-        peak_y, peak_x = self._signed_peak(ky, kx, ny, nx)
-
-        sub_y = self._subpixel_parabola(
-            mag[(ky - 1) % ny, kx],
-            mag[ky, kx],
-            mag[(ky + 1) % ny, kx],
-        )
-
-        sub_x = self._subpixel_parabola(
-            mag[ky, (kx - 1) % nx],
-            mag[ky, kx],
-            mag[ky, (kx + 1) % nx],
-        )
-
-        peak_y += sub_y
-        peak_x += sub_x
-
-        return -peak_y, -peak_x
-
-    @staticmethod
-    def _logpolar(img, radial_bins, angular_bins, xp):
-        if xp.__name__ == "cupy":
-            from cupyx.scipy.ndimage import map_coordinates
+    def load_file(self, file_path):
+        """Load a .holo or .cine file"""
+        if self.file_reader is not None:
+            self.file_reader.close()
+        
+        self.file_reader = FileReaderFactory.create(file_path)
+        self.file_reader.open()
+        
+        # Store metadata for export
+        if self.file_reader.ext == ".holo":
+            self.holo_header = self.file_reader.file_header
+            self.holo_footer = self.file_reader.file_footer
         else:
-            from scipy.ndimage import map_coordinates
-
-        ny, nx = img.shape
-        cy = (ny - 1) * 0.5
-        cx = (nx - 1) * 0.5
-
-        max_radius = min(cx, cy)
-        log_r = xp.linspace(0.0, xp.log(max_radius), radial_bins)
-        theta = xp.linspace(0.0, 2.0 * xp.pi, angular_bins, endpoint=False)
-
-        rr = xp.exp(log_r).reshape(-1, 1)
-        tt = theta.reshape(1, -1)
-
-        yy = cy + rr * xp.sin(tt)
-        xx = cx + rr * xp.cos(tt)
-
-        coords = xp.stack([yy, xx], axis=0)
-
-        return map_coordinates(img, coords, order=1, mode="constant", cval=0.0)
-
-    @staticmethod
-    def _fourier_magnitude_for_similarity(img, xp):
-        mag = xp.abs(xp.fft.fftshift(xp.fft.fft2(img)))
-        mag = xp.log1p(mag)
-
-        ny, nx = mag.shape
-        cy, cx = ny // 2, nx // 2
-
-        r = max(4, min(ny, nx) // 32)
-        yy, xx = xp.ogrid[:ny, :nx]
-        dc_mask = (yy - cy) ** 2 + (xx - cx) ** 2 <= r * r
-
-        mag = mag.copy()
-        mag[dc_mask] = 0
-
-        return mag
-
-    def _estimate_rotation_scale(self, fixed, moving, xp, radial_bins=256, angular_bins=360):
-        fixed_mag = self._fourier_magnitude_for_similarity(fixed, xp)
-        moving_mag = self._fourier_magnitude_for_similarity(moving, xp)
-
-        fixed_lp = self._logpolar(fixed_mag, radial_bins, angular_bins, xp)
-        moving_lp = self._logpolar(moving_mag, radial_bins, angular_bins, xp)
-
-        d_r, d_theta = self._phase_corr_subpixel(fixed_lp, moving_lp, xp)
-
-        angle_deg = -d_theta * 360.0 / angular_bins
-
-        max_radius = min(fixed.shape[-1], fixed.shape[-2]) * 0.5
-        log_base = xp.log(max_radius) / radial_bins
-        scale = float(xp.exp(d_r * log_base))
-
-        return float(angle_deg), scale
-
-    @staticmethod
-    def _apply_rotation_scale(img, angle_deg, scale, xp):
-        if xp.__name__ == "cupy":
-            from cupyx.scipy.ndimage import affine_transform
-        else:
-            from scipy.ndimage import affine_transform
-
-        ny, nx = img.shape[-2:]
-        cy = (ny - 1) * 0.5
-        cx = (nx - 1) * 0.5
-
-        angle = xp.deg2rad(angle_deg)
-        c = float(xp.cos(angle))
-        s = float(xp.sin(angle))
-
-        matrix = xp.asarray(
-            [
-                [c / scale, s / scale],
-                [-s / scale, c / scale],
-            ],
-            dtype=xp.float32,
-        )
-
-        center = xp.asarray([cy, cx], dtype=xp.float32)
-        offset = center - matrix @ center
-
-        out = affine_transform(
-            img,
-            matrix,
-            offset=offset,
-            order=1,
-            mode="nearest",
-        )
-
-        return out.astype(img.dtype, copy=False)
+            self.cine_metadata = self.file_reader.metadata_json
     
-    @staticmethod
-    def new_applyshifts(img, shift_y, shift_x, xp):
-        ny, nx = img.shape[-2:]
-
-        fy = xp.fft.fftfreq(ny).reshape(ny, 1)
-        fx = xp.fft.fftfreq(nx).reshape(1, nx)
-
-        phase = xp.exp(-2j * xp.pi * (fy * shift_y + fx * shift_x))
-
-        out = xp.fft.ifft2(
-            xp.fft.fft2(img, axes=(-2, -1)) * phase,
-            axes=(-2, -1),
-        )
-
-        if xp.isrealobj(img):
-            out = out.real
-
-        return out.astype(img.dtype, copy=False)
-
-    def _registration_trs(
-        self,
-        fixed,
-        moving,
-        radius=None,
-        *,
-        estimate_similarity=False,
-        radial_bins=256,
-        angular_bins=360,
-        return_registered=False,
-    ):
-        xp = self.xp
-        ny, nx = fixed.shape
-
-        mask = (
-            self._elliptical_mask(ny, nx, radius, xp)
-            if radius
-            else xp.ones((ny, nx), dtype=bool)
-        )
-
-        fixed_f = fixed.astype(xp.float32, copy=False)
-        moving_f = moving.astype(xp.float32, copy=False)
-
-        fixed_c = (fixed_f - xp.mean(fixed_f[mask])) * mask
-        moving_c = (moving_f - xp.mean(moving_f[mask])) * mask
-
-        if estimate_similarity:
-            angle_deg, scale = self._estimate_rotation_scale(
-                fixed_c,
-                moving_c,
-                xp,
-                radial_bins=radial_bins,
-                angular_bins=angular_bins,
-            )
-
-            moving_rs = self._apply_rotation_scale(
-                moving_f,
-                angle_deg,
-                scale,
-                xp,
-            )
-
-            moving_rs_c = (moving_rs - xp.mean(moving_rs[mask])) * mask
-
-        else:
-            angle_deg = 0.0
-            scale = 1.0
-            moving_rs = moving_f
-            moving_rs_c = moving_c
-
-        shift_y, shift_x = self._phase_corr_subpixel(fixed_c, moving_rs_c, xp)
-
-        if not return_registered:
-            return shift_y, shift_x, angle_deg, scale
-
-        moving_registered = self.new_applyshifts(
-            moving_rs,
-            shift_y,
-            shift_x,
-            xp,
-        )
-
-        return shift_y, shift_x, angle_deg, scale, moving_registered
+    def close_file(self):
+        """Close the currently open file"""
+        if self.file_reader is not None:
+            self.file_reader.close()
+            self.file_reader = None
     
-    def applyregistration(self, img, reg, xp):
-        """
-        Apply a registration tuple to an image.
-
-        Parameters
-        ----------
-        img : array (numpy or cupy)
-        reg : tuple
-            (shift_y, shift_x, angle_deg, scale)
-            or (shift_y, shift_x) for translation-only
-        xp : numpy or cupy module
-
-        Returns
-        -------
-        registered image
-        """
-        # --- Parse registration tuple ---
-        if len(reg) == 2:
-            shift_y, shift_x = reg
-            angle_deg = 0.0
-            scale = 1.0
-        else:
-            shift_y, shift_x, angle_deg, scale = reg
-
-        out = img
-
-        # --- Apply rotation + scale (if needed) ---
-        if angle_deg != 0.0 or scale != 1.0:
-            out = self._apply_rotation_scale(out, angle_deg, scale, xp)
-
-        # --- Apply subpixel translation ---
-        out = self.new_applyshifts(out, shift_y, shift_x, xp)
-
-        return out
-
-    def old_registration(self, fixed, moving, radius):
-        ny, nx = fixed.shape
-
-        xp = self.xp
-
-        mask = self._elliptical_mask(ny, nx, radius, xp) if radius else xp.ones((ny, nx), dtype=bool)
-
-        _fixed = self.gaussian_filter(fixed,1.5)
-        _moving = self.gaussian_filter(moving,1.5)
-
-        fixed_c = (_fixed - xp.mean(_fixed[mask])) * mask
-        moving_c = (_moving - xp.mean(_moving[mask])) * mask
-
-        fixed_c = fixed_c / xp.max(xp.abs(fixed_c))
-        moving_c = moving_c / xp.max(xp.abs(moving_c))
-
-        xcorr = self._xcorr2_fft(fixed_c, moving_c, xp)
-
-        mag = xp.abs(xcorr)
-
-        ky0, kx0 = xp.unravel_index(xp.argmax(mag), mag.shape)
-        peak_y, peak_x = int(ky0), int(kx0)
-
-        # moving_reg = self._roll2d(moving, -peak_y, -peak_x, xp)
-        return (peak_y, peak_x)
+    def read_frames(self, first_frame, batch_size):
+        """Read frames (returns CPU array)"""
+        frames = self.file_reader.read_frames(first_frame, batch_size)
+        if frames is None:
+            return None
+        return self.bm.to_backend(frames)
     
     # ------------------------------------------------------------
-    # Shack-Hartmann wavefront reconstruction
+    # Single batch processing
     # ------------------------------------------------------------
-
-    def _svd_filter_shack_hartmann(self, U_subaps, svd_threshold):
-        """Batched SVD filter for all subapertures at once (ny_sub, nx_sub, sub_ny, sub_nx, Nz)."""
-        xp = self.xp
-        if svd_threshold < 0:
-            return U_subaps
-
-        ny_s, nx_s, sub_ny, sub_nx, nz = U_subaps.shape
-        B = ny_s * nx_s
-
-        # (B, ny*nx, nz)
-        H2 = U_subaps.reshape(B, sub_ny * sub_nx, nz)
-
-        eps = 1e-12
-        # Batched covariance (B, nz, nz)
-        cov = xp.einsum('bpi,bpj->bij', H2.conj(), H2) + eps * xp.eye(nz, dtype=H2.dtype)
-
-        # eigh per subaperture (CuPy does not support batched eigh)
-        V_list = []
-        for b in range(B):
-            _, Vb = xp.linalg.eigh(cov[b])   # ascending order, (nz, nz)
-            V_list.append(Vb[:, ::-1])        # flip to descending, keep top-k
-        Vt = xp.stack([Vb[:, :svd_threshold] for Vb in V_list], axis=0)  # (B, nz, k)
-
-        # Project out tissue: H2 - (H2 @ Vt) @ Vt^H
-        H2_Vt = xp.einsum('bpi,bik->bpk', H2, Vt)            # (B, sub_ny*sub_nx, k)
-        proj   = xp.einsum('bpk,bjk->bpj', H2_Vt, Vt.conj()) # (B, sub_ny*sub_nx, nz)
-
-        return (H2 - proj).reshape(ny_s, nx_s, sub_ny, sub_nx, nz)
-
-    def _shack_hartmann_constructsubapsimages(self, U0, dx, dy, wavelength, z_prop, f0, f1, fs,
-                                           time_window, nx_subabs, ny_subabs, svd_threshold):
-        RangePush("Shack-Hartmann subaperture construction")
-        xp = self.xp
-        
-        Nz, Ny, Nx = U0.shape
-        sub_ny, sub_nx = Ny // ny_subabs, Nx // nx_subabs
-
-        idxs, _ = self._frequency_symmetric_filtering(time_window, fs, f0, high_freq=f1)
-
-        # --- Fresnel kernel (cached) ---
-        if "Fresnel_in" not in self.kernels:
-            self._build_fresnel_kernel(z_prop, (dy, dx), wavelength, Ny, Nx)
-            
-        Qin = self.crop_array_centrally(self.kernels["Fresnel_in"], (Ny, Nx))
-
-        # Fresnel-multiply once on full field
-        U_prop_qin = U0 * Qin  # (Nz, Ny, Nx)
-
-        # --- Crop to central region that tiles exactly into subapertures ---
-        crop_ny, crop_nx = sub_ny * ny_subabs, sub_nx * nx_subabs
-        y0, x0 = (Ny - crop_ny) // 2, (Nx - crop_nx) // 2
-        U_prop_qin = U_prop_qin[:, y0:y0 + crop_ny, x0:x0 + crop_nx]  # (Nz, crop_ny, crop_nx)
-
-        # Reshape into subapertures: (ny_s, nx_s, sub_ny, sub_nx, Nz)
-        U_subap_all = (U_prop_qin
-                    .reshape(Nz, ny_subabs, sub_ny, nx_subabs, sub_nx)
-                    .transpose(1, 3, 2, 4, 0))
-
-        # Batched SVD filter across all subapertures
-        U_subap_all = self._svd_filter_shack_hartmann(U_subap_all, svd_threshold)
-        # (ny_s, nx_s, sub_ny, sub_nx, Nz) -> (B, Nz, sub_ny, sub_nx)
-        B = ny_subabs * nx_subabs
-        U_subap_all = U_subap_all.reshape(B, sub_ny, sub_nx, Nz).transpose(0, 3, 1, 2)
-
-        # Batched FFT2 + temporal FFT
-        U_f2 = xp.fft.fftshift(xp.fft.fft2(U_subap_all, axes=(-2, -1)), axes=(-2, -1))  # (B, Nz, sub_ny, sub_nx)
-        U_ft = xp.fft.fft(U_f2, axis=1)[:, idxs, :, :]                                  # (B, |idxs|, sub_ny, sub_nx)
-
-        # Power spectrum mean over frequency band
-        M0 = xp.mean(xp.abs(U_ft) ** 2, axis=1)                                          # (B, sub_ny, sub_nx)
-        U_subaps = M0.reshape(ny_subabs, nx_subabs, sub_ny, sub_nx).astype(xp.float32)
-        RangePop()
-        return U_subaps
     
-    def _shack_hartmann_constructsubapsimages_angular_spectrum(self,U0,dx,dy,wavelength,z_prop,f0,f1,fs,time_window,nx_subabs,ny_subabs,svd_threshold):
-
-        xp = self.xp
-        Nz, Ny, Nx = U0.shape
-
-        sub_ny = Ny // ny_subabs
-        sub_nx = Nx // nx_subabs
-
-        crop_ny = sub_ny * ny_subabs
-        crop_nx = sub_nx * nx_subabs
-        y0 = (Ny - crop_ny) // 2
-        x0 = (Nx - crop_nx) // 2
-
-        idxs, _ = self._frequency_symmetric_filtering(
-            time_window,
-            fs,
-            f0,
-            high_freq=f1,
-        )
-
-        # Global angular-spectrum multiplication in the Fourier plane.
-        if "AngularSpectrum" not in self.kernels:
-            self._build_angular_kernel(z_prop, (dy, dx), wavelength, Ny, Nx)
-
-        H = self.crop_array_centrally(self.kernels["AngularSpectrum"], (Ny, Nx))
-        if H.ndim == 2:
-            H = H[None, :, :]
-
-        U_fft = self.fft.fft2(U0, axes=(-2, -1)) * self.fft.fftshift(H, axes=(-2, -1))
-
-        # Crop the global Fourier plane so it tiles exactly into subapertures.
-        U_fft = U_fft[:, y0 : y0 + crop_ny, x0 : x0 + crop_nx]
-        
-        U_fft = self.fft.fftshift(U_fft, axes=(-2, -1)) # fft shift to get low freq in the center now
-
-        # Split Fourier plane into local subaperture tiles:
-        # (Nz, crop_ny, crop_nx) -> (Nz, ny_subabs, nx_subabs, sub_ny, sub_nx)
-        U_subap_all = (
-            U_fft.reshape(Nz, ny_subabs, sub_ny, nx_subabs, sub_nx)
-            .transpose(0, 1, 3, 2, 4)
-        )
-
-        # Local inverse FFT per subaperture.
-        
-        U_subap_all = self.fft.ifftshift(U_subap_all, axes=(-2, -1)) #ifft shift to prepare for ifft2 to correct the previous global fftshift
-        U_subap_all = self.fft.ifft2(U_subap_all, axes=(-2, -1))
-
-        # SVD expects: (ny_subabs, nx_subabs, sub_ny, sub_nx, Nz)
-        U_subap_all = U_subap_all.transpose(1, 2, 3, 4, 0)
-        U_subap_all = xp.ascontiguousarray(U_subap_all)
-
-        # U_subap_all = self._svd_filter_shack_hartmann(
-        #     U_subap_all,
-        #     svd_threshold,
-        # )
-
-        # Temporal FFT expects: (B, Nz, sub_ny, sub_nx)
-        B = ny_subabs * nx_subabs
-        U_subap_all = (
-            U_subap_all.reshape(B, sub_ny, sub_nx, Nz)
-            .transpose(0, 3, 1, 2)
-        )
-
-        U_ft = self.fft.fft(U_subap_all, axis=1)[:, idxs, :, :]
-        M0 = xp.mean(xp.abs(U_ft) ** 2, axis=1)
-
-        return M0.reshape(ny_subabs, nx_subabs, sub_ny, sub_nx).astype(
-            xp.float32,
-            copy=False,
-        )
-
-    def _shack_hartmann_displacement_calculation(self, U_subabs, xp, pupil_threshold = 1.0, deviation_threshold = 3.0, shifts_pixel_range_threshold = 20.0, ref = None):
-        """Vectorized Shack-Hartmann displacement with single FFT2 call."""
-        RangePush("Shack-Hartmann displacement calculation")
-        ny_s, nx_s, Ny, Nx = U_subabs.shape
-        
-        # Reference sub-aperture
-        if ref is None:
-            if not (ny_s % 2 == nx_s % 2 == 1):
-                print("Warning: number of sub-apertures must be odd.")
-            ref = U_subabs[ny_s // 2, nx_s // 2]
-        
-        # Stack all sub-apertures: (ny_s*nx_s, Ny, Nx)
-        moving_stack = U_subabs.reshape(ny_s * nx_s, Ny, Nx)
-        
-        # Zero-mean
-        ref_zm = ref - xp.mean(ref)
-        moving_zm = moving_stack - xp.mean(moving_stack, axis=(1, 2), keepdims=True)
-        
-        # Single batched FFT2 for all correlations
-        F_ref = xp.fft.fft2(ref_zm)
-        F_moving = xp.fft.fft2(moving_zm)
-        cp = F_moving * F_ref.conj()
-        xcorr = xp.abs(xp.fft.fftshift(xp.fft.ifft2(cp / (xp.abs(cp) + 1e-12)), axes=(1, 2)))
-        
-        # Peak locations - reshape to allow simple slicing
-        # Flatten once
-        xcorr_2d = xcorr.reshape(-1, Ny * Nx)
-
-        # Peak indices
-        peaks = xp.argmax(xcorr_2d, axis=1)
-        py = peaks // Nx
-        px = peaks % Nx
-
-        # Clip peaks to avoid boundary (do it ONCE)
-        py = xp.clip(py, 1, Ny - 2)
-        px = xp.clip(px, 1, Nx - 2)
-
-        n = py.shape[0]
-        idx = xp.arange(n)
-
-        # --- Direct neighbor access (no fancy indexing grids) ---
-        v0 = xcorr[idx, py, px]
-
-        vm_y = xcorr[idx, py - 1, px]
-        vp_y = xcorr[idx, py + 1, px]
-
-        vm_x = xcorr[idx, py, px - 1]
-        vp_x = xcorr[idx, py, px + 1]
-
-        # --- Parabolic refinement ---
-        den_y = vm_y - 2 * v0 + vp_y + 1e-12
-        den_x = vm_x - 2 * v0 + vp_x + 1e-12
-
-        shift_y = py + 0.5 * (vm_y - vp_y) / den_y - Ny / 2
-        shift_x = px + 0.5 * (vm_x - vp_x) / den_x - Nx / 2
-
-        shift_y = shift_y.reshape(ny_s, nx_s)
-        shift_x = shift_x.reshape(ny_s, nx_s)
-
-        # --- Pupil mask for outlier rejection ---
-        xs = xp.linspace(-1, 1, nx_s)
-        ys = xp.linspace(-1, 1, ny_s)
-        YY, XX = xp.meshgrid(ys, xs, indexing='ij')
-        pupil_mask = (XX**2 + YY**2) <= pupil_threshold
-
-        # --- Filtering ---
-        shift_y_flat = shift_y[pupil_mask]
-        shift_x_flat = shift_x[pupil_mask]
-
-        mean_y = xp.mean(shift_y_flat)
-        mean_x = xp.mean(shift_x_flat)
-
-        std_y = xp.std(shift_y_flat)
-        std_x = xp.std(shift_x_flat)
-
-        thresh_y = deviation_threshold * std_y
-        thresh_x = deviation_threshold * std_x
-
-        # --- Pixel range filtering ---
-        bad = (
-            (xp.abs(shift_y - mean_y) > thresh_y) |
-            (xp.abs(shift_x - mean_x) > thresh_x) |
-            (xp.abs(shift_y) > shifts_pixel_range_threshold) |
-            (xp.abs(shift_x) > shifts_pixel_range_threshold) |
-            (~pupil_mask)
-        )
-
-        shift_y[bad] = xp.nan
-        shift_x[bad] = xp.nan
-        
-        RangePop()
-        return shift_y.astype(xp.float32), shift_x.astype(xp.float32)
-    
-    def _get_zernike_mode2(self, mode_index, Nx, Ny, radius = 2.0):
-        xp = self.xp
-        # Scale so that the smallest dimension spans [-1, 1]
-        if Nx > Ny:
-            x = xp.linspace(-Nx / Ny, Nx / Ny, Nx)
-            y = xp.linspace(-1, 1, Ny)
-        else:
-            x = xp.linspace(-1, 1, Nx)
-            y = xp.linspace(-Ny / Nx, Ny / Nx, Ny)
-        X, Y = xp.meshgrid(x, y)
-        R = xp.sqrt(X**2 + Y**2)
-        Theta = xp.arctan2(Y, X)
-        Z = xp.full_like(R, xp.nan)
-        mask = R <= radius
-        if mode_index == 1:
-            Z[mask] = 1  # Piston
-        elif mode_index == 2:
-            Z[mask] = 2 * X[mask]  # Tilt X
-        elif mode_index == 3:
-            Z[mask] = 2 * Y[mask]  # Tilt Y
-        elif mode_index == 4:
-            Z[mask] = xp.sqrt(3) * (2 * R[mask]**2 - 1)  # Defocus
-        elif mode_index == 5:
-            Z[mask] = xp.sqrt(6) * R[mask]**2 * xp.sin(2 * Theta[mask])  # Astigmatism 45°
-        elif mode_index == 6:
-            Z[mask] = xp.sqrt(6) * R[mask]**2 * xp.cos(2 * Theta[mask])  # Astigmatism 0°
-        elif mode_index == 7:
-            Z[mask] = xp.sqrt(8) * (3*R[mask]**3 - 2*R[mask]) * xp.sin(Theta[mask])  # Coma Y
-        elif mode_index == 8:
-            Z[mask] = xp.sqrt(8) * (3*R[mask]**3 - 2*R[mask]) * xp.cos(Theta[mask])  # Coma X
-        elif mode_index == 9:
-            Z[mask] = xp.sqrt(8) * R[mask]**3 * xp.sin(3 * Theta[mask])  # Trefoil Y
-        elif mode_index == 10:
-            Z[mask] = xp.sqrt(8) * R[mask]**3 * xp.cos(3 * Theta[mask])  # Trefoil X
-        elif mode_index == 11:
-            Z[mask] = xp.sqrt(5) * (6*R[mask]**4 - 6*R[mask]**2 + 1)  # Spherical
-        elif mode_index == 12:
-            Z[mask] = xp.sqrt(10) * (4*R[mask]**4 - 3*R[mask]**2) * xp.cos(2 * Theta[mask])  # Astigmatism 0° (higher)
-        elif mode_index == 13:
-            Z[mask] = xp.sqrt(10) * (4*R[mask]**4 - 3*R[mask]**2) * xp.sin(2 * Theta[mask])  # Astigmatism 45° (higher)
-        elif mode_index == 14:
-            Z[mask] = xp.sqrt(10) * R[mask]**4 * xp.cos(4 * Theta[mask])  # Quadrafoil X
-        elif mode_index == 15:
-            Z[mask] = xp.sqrt(10) * R[mask]**4 * xp.sin(4 * Theta[mask])  # Quadrafoil Y
-        elif mode_index == 16:
-            Z[mask] = xp.sqrt(12) * (10*R[mask]**5 - 12*R[mask]**3 + 3*R[mask]) * xp.cos(Theta[mask])  # Secondary coma X
-        elif mode_index == 17:
-            Z[mask] = xp.sqrt(12) * (10*R[mask]**5 - 12*R[mask]**3 + 3*R[mask]) * xp.sin(Theta[mask])  # Secondary coma Y
-        elif mode_index == 18:
-            Z[mask] = xp.sqrt(12) * (5*R[mask]**5 - 4*R[mask]**3) * xp.cos(3 * Theta[mask])  # Secondary trefoil X
-        elif mode_index == 19:
-            Z[mask] = xp.sqrt(12) * (5*R[mask]**5 - 4*R[mask]**3) * xp.sin(3 * Theta[mask])  # Secondary trefoil Y
-        elif mode_index == 20:
-            Z[mask] = xp.sqrt(12) * R[mask]**5 * xp.cos(5 * Theta[mask])  # Pentafoil X
-        elif mode_index == 21:
-            Z[mask] = xp.sqrt(12) * R[mask]**5 * xp.sin(5 * Theta[mask])  # Pentafoil Y
-        else:
-            raise ValueError("Mode index not implemented")
-        return Z.astype(xp.float32) #important to be float32
-    
-    def _get_legendre_mode(self, mode_index, Nx, Ny):
-        xp = self.xp
-
-        # Grid in [-1, 1]
-        x = xp.linspace(-1, 1, Nx)
-        y = xp.linspace(-1, 1, Ny)
-        X, Y = xp.meshgrid(x, y)
-
-        # --- Legendre polynomials (up to order 5) ---
-        def P0(t): return xp.ones_like(t)
-        def P1(t): return t
-        def P2(t): return 0.5 * (3*t**2 - 1)
-        def P3(t): return 0.5 * (5*t**3 - 3*t)
-        def P4(t): return (1/8) * (35*t**4 - 30*t**2 + 3)
-        def P5(t): return (1/8) * (63*t**5 - 70*t**3 + 15*t)
-
-        # Precompute
-        Px = [P0(X), P1(X), P2(X), P3(X), P4(X), P5(X)]
-        Py = [P0(Y), P1(Y), P2(Y), P3(Y), P4(Y), P5(Y)]
-
-        Z = xp.zeros_like(X)
-
-        # Mode mapping (similar spirit to Zernike ordering)
-        if mode_index == 1:
-            Z = Px[0] * Py[0]  # piston
-        elif mode_index == 2:
-            Z = Px[1] * Py[0]  # tilt X
-        elif mode_index == 3:
-            Z = Px[0] * Py[1]  # tilt Y
-        elif mode_index == 4:
-            Z = Px[2] * Py[0]  # defocus-like (X)
-        elif mode_index == 5:
-            Z = Px[1] * Py[1]  # astig-like (diagonal)
-        elif mode_index == 6:
-            Z = Px[0] * Py[2]  # defocus-like (Y)
-        elif mode_index == 7:
-            Z = Px[3] * Py[0]
-        elif mode_index == 8:
-            Z = Px[2] * Py[1]
-        elif mode_index == 9:
-            Z = Px[1] * Py[2]
-        elif mode_index == 10:
-            Z = Px[0] * Py[3]
-        elif mode_index == 11:
-            Z = Px[4] * Py[0]
-        elif mode_index == 12:
-            Z = Px[3] * Py[1]
-        elif mode_index == 13:
-            Z = Px[2] * Py[2]
-        elif mode_index == 14:
-            Z = Px[1] * Py[3]
-        elif mode_index == 15:
-            Z = Px[0] * Py[4]
-        elif mode_index == 16:
-            Z = Px[5] * Py[0]
-        elif mode_index == 17:
-            Z = Px[4] * Py[1]
-        elif mode_index == 18:
-            Z = Px[3] * Py[2]
-        elif mode_index == 19:
-            Z = Px[2] * Py[3]
-        elif mode_index == 20:
-            Z = Px[1] * Py[4]
-        elif mode_index == 21:
-            Z = Px[0] * Py[5]
-        else:
-            raise ValueError("Mode index not implemented")
-    
-    def _shack_hartmann_zernike(self, ny, nx, pixel_pitch_y, pixel_pitch_x, wavelength, shifts_y, shifts_x, zernike_modes):
-        xp = np # go to numpy because it is FASTER (don'nt know why maybe lstsq)
-        def make_G_gradient_zernike_matrix(Ny, Nx, mode_indices, n_sub_x, n_sub_y, dx, dy):
-            n_modes = len(mode_indices)
-            M = xp.zeros((2,n_sub_y, n_sub_x, n_modes), dtype=xp.float32)
-            for k, idx in enumerate(mode_indices):
-                Z = self._get_zernike_mode2(idx, Nx, Ny, radius = 2)
-                dZdx = xp.gradient(Z, dx, axis=1)
-                dZdy = xp.gradient(Z, dy, axis=0)
-                for (iy, ix) in [(iy, ix) for iy in range(n_sub_y) for ix in range(n_sub_x)]:
-                    y_start = iy * (Ny // n_sub_y)
-                    y_end = y_start + (Ny // n_sub_y)
-                    x_start = ix * (Nx // n_sub_x)
-                    x_end = x_start + (Nx // n_sub_x)
-                    dZdx_subap = dZdx[y_start:y_end, x_start:x_end]
-                    dZdy_subap = dZdy[y_start:y_end, x_start:x_end]
-                    dZdx_avg = xp.nanmean(dZdx_subap, axis=(0,1))
-                    dZdy_avg = xp.nanmean(dZdy_subap, axis=(0,1))
-                    M[0 ,iy, ix, k] = dZdy_avg
-                    M[1 ,iy, ix, k] = dZdx_avg
-            return M
-        
-        def solve_modes(M, s, plot=False):
-            _, ny, nx, nm = M.shape
-            A = M.reshape(-1, nm)
-            b = s.reshape(-1)
-            m = (~xp.isnan(b)) & (~xp.isnan(A).any(1))
-            c, r, rank, sv = xp.linalg.lstsq(A[m], b[m], rcond=None)
-            recon = xp.full_like(b, xp.nan, dtype=float)
-            recon[m] = A[m] @ c
-            recon = recon.reshape(2, ny, nx)
-            return c, recon
-        
-        nysubabs, nxsubabs = shifts_y.shape
-        
-        slopes_y = self._to_numpy(shifts_y) * (wavelength)/(pixel_pitch_y*(ny//nysubabs)) 
-        slopes_x = self._to_numpy(shifts_x) * (wavelength)/(pixel_pitch_x*(nx//nxsubabs))
-        nysubabs, nxsubabs = shifts_y.shape
-        
-        s = xp.stack([slopes_y,slopes_x])
-        
-        if (not "G_gradient_zernike_matrix" in self.kernels):
-            G = make_G_gradient_zernike_matrix(ny, nx, zernike_modes, nxsubabs, nysubabs, pixel_pitch_x, pixel_pitch_y) * wavelength / (2*xp.pi)
-            self.kernels["G_gradient_zernike_matrix"] = G
-        
-        zernike_coefs_radians, _ = solve_modes(self.kernels["G_gradient_zernike_matrix"], s) 
-        # print(zernike_coefs_radians, "radians")
-
-        zern_phase = xp.sum(xp.stack([coef * self._get_zernike_mode2(idx, nx, ny, radius = 2) for idx, coef in zip(zernike_modes, zernike_coefs_radians)]), axis=0)
-        
-        return zernike_coefs_radians, zern_phase
-    
-    def _shack_hartmann_southwell(self, ny, nx, pixel_pitch_y, pixel_pitch_x, wavelength, shifts_y, shifts_x):
-        xp = np
-        fftpack = scipy.fftpack
-        def southwell_fourier_nan(slope_y, slope_x):
-            """NaN-robust Southwell DCT Poisson solver."""
-            rows, cols = slope_y.shape
-            mask_x = xp.isfinite(slope_x)
-            mask_y = xp.isfinite(slope_y)
-            div = xp.zeros((rows, cols), dtype=float)
-            valid_x = mask_x[:, :-1]
-            sx = xp.where(valid_x, slope_x[:, :-1], 0.0)
-            div[:, :-1] += sx
-            div[:, 1:]  -= sx
-            valid_y = mask_y[:-1, :]
-            sy = xp.where(valid_y, slope_y[:-1, :], 0.0)
-            div[:-1, :] += sy
-            div[1:, :]  -= sy
-            valid_div = xp.zeros_like(div, dtype=bool)
-            valid_div[:, :-1] |= valid_x
-            valid_div[:, 1:]  |= valid_x
-            valid_div[:-1, :] |= valid_y
-            valid_div[1:, :]  |= valid_y
-            div = xp.where(valid_div, div, 0.0)
-            div_dct = fftpack.dct(
-                fftpack.dct(div, axis=0, norm="ortho"),
-                axis=1, norm="ortho"
-            )
-            cx = xp.cos(xp.pi * xp.arange(cols) / cols)
-            cy = xp.cos(xp.pi * xp.arange(rows) / rows)
-            CX, CY = xp.meshgrid(cx, cy)
-            eig = 2.0 * (CX + CY - 2.0)
-            eig[0, 0] = 1.0  # avoid division by zero
-            phi_dct = div_dct / eig
-            phi_dct[0, 0] = 0.0  # remove piston
-            phi = fftpack.idct(
-                fftpack.idct(phi_dct, axis=1, norm="ortho"),
-                axis=0, norm="ortho"
-            )
-            phi[~valid_div] = xp.nan
-            return phi  
-
-        from cupyx.scipy.ndimage import zoom
-
-        def resize_phase_nan_cp(phi, NY, NX, order=1):
-            phi = phi.reshape(phi.shape[-2], phi.shape[-1])
-
-            # Mask of valid values
-            mask = ~cp.isnan(phi)
-
-            # Replace NaNs with 0
-            phi_filled = cp.where(mask, phi, 0)
-
-            # Compute zoom factors
-            zoom_y = NY / phi.shape[0]
-            zoom_x = NX / phi.shape[1]
-
-            # Interpolate data and mask
-            phi_zoom = zoom(phi_filled, (zoom_y, zoom_x), order=order)
-            mask_zoom = zoom(mask.astype(cp.float32), (zoom_y, zoom_x), order=order)
-
-            # Avoid division by zero
-            eps = 1e-6
-            phi_resized = phi_zoom / (mask_zoom + eps)
-
-            # Optional: reintroduce NaNs where confidence is too low
-            phi_resized = cp.where(mask_zoom > 0.1, phi_resized, cp.nan)
-
-            return phi_resized.reshape(NY, NX)
-        
-        def resize_phase_nan_np(phi, NY, NX):
-            y, x = np.indices(phi.shape)
-            mask = np.isfinite(phi)
-
-            y_new, x_new = np.meshgrid(
-                np.linspace(0, phi.shape[0]-1, NY),
-                np.linspace(0, phi.shape[1]-1, NX),
-                indexing='ij'
-            )
-
-            return griddata(
-                (y[mask], x[mask]),
-                phi[mask],
-                (y_new, x_new),
-                method='cubic'
-            )
-            
-        if xp == np:
-            resize_phase_nan = resize_phase_nan_np
-            shifts_y = self._to_numpy(shifts_y)
-            shifts_x = self._to_numpy(shifts_x)
-        elif xp == cp:
-            resize_phase_nan = resize_phase_nan_cp
-               
-        slopes_y = shifts_y * wavelength # /(pixel_pitch_y*(ny//nysubabs)) same as before *(pixel_pitch_y*(ny//nysubabs)) the pitch between subaps before integration
-        slopes_x = shifts_x * wavelength 
-        southwell_fourier_phase = southwell_fourier_nan(slopes_y, slopes_x) * (2*xp.pi) / wavelength
-        southwell_fourier_phase = resize_phase_nan(southwell_fourier_phase, ny, nx)
-        return southwell_fourier_phase
-    
-    def _fresnel_transform_phase(self, frames, phase_term, zero_padding = False):
-        
-        if zero_padding:
-            frames = self.pad_array_centrally(frames, zero_padding)
-            
-        if self.pipeline_version == "latest" : 
-
-            return self.fft.fftshift(
-                self.fft.fft2(frames *self.kernels["Fresnel_in"] * phase_term, axes=(-1, -2), norm="ortho"), axes=(-1, -2)
-            ) *self.kernels["Fresnel_out"]
-        else :
-            return self.fft.fftshift(
-            self.fft.fft2(frames * self.kernels["Fresnel_in"] * phase_term, axes=(-1, -2), norm="ortho"), axes=(-1, -2)
-            )
-            
-    def _angular_spectrum_transform_phase(self, frames, phase_term, zero_padding = False):
-        
-        if zero_padding:
-            frames = self.pad_array_centrally(frames, zero_padding)
-            
-        return self.fft.ifft2(
-            self.fft.fft2(frames, axes=(-1, -2)) * self.fft.fftshift(self.kernels["AngularSpectrum"] * phase_term, axes=(-1, -2)) 
-        )
-
-    # ------------------------------------------------------------
-    # Render tools for debug and visualization
-    # ------------------------------------------------------------
-
-    class ImagePlotter:
-        def __init__(self):
-            pass
-        def plot(self, image):
-            image_ = (image - np.min(image)) / (np.max(image) - np.min(image)) * 255
-            if isinstance(image_, cp.ndarray):
-                image_ = image_.get()
-            return image_.astype(np.uint8)
-        def close(self):
-            pass
-
-    class PhasePlotter:
-        def __init__(self, relative=False):
-            self.relative = relative  
-        def plot(self, phase):
-            if isinstance(phase, cp.ndarray):
-                phase = cp.asnumpy(phase)
-            if self.relative :
-                ny, nx = phase.shape
-                phase = phase - phase[ny//2,nx//2]
-            phase = (phase + np.pi) % (2*np.pi) - np.pi
-            norm = (phase + np.pi) / (2*np.pi)
-            img = (norm * 255).astype(np.uint8)
-            img = np.stack([img, img, img], axis=-1)
-            # No resizing → output keeps exact input shape (rectangular preserved)
-            return img
-        def close(self):
-            pass
-
-    class ShiftsPlotter:
-        # TODO no matplotlib just cv2
-        def __init__(self, title="Wavefront Slopes from Sub-aperture Shifts", figsize=(8, 6), dpi=100, scale=None):
-            self.fig, self.ax = plt.subplots(figsize=figsize, dpi=dpi)
-            self.canvas = FigureCanvasAgg(self.fig)
-            self.title = title
-            self.scale = scale
-
-        def plot(self, shifts_y, shifts_x):
-            if isinstance(shifts_y, cp.ndarray):
-                shifts_y = cp.asnumpy(shifts_y)
-            if isinstance(shifts_x, cp.ndarray):
-                shifts_x = cp.asnumpy(shifts_x)
-            # --- AUTO SCALE IF NONE ---
-            if self.scale is None:
-                mag = np.sqrt(shifts_x**2 + shifts_y**2)
-                med = np.median(mag[mag > 0]) if np.any(mag > 0) else 1.0
-                scale = 1.0 / (med + 1e-12)
-            else:
-                scale = self.scale
-            self.ax.clear()
-            ny_subabs, nx_subabs = shifts_y.shape
-            X, Y = np.meshgrid(np.arange(nx_subabs), np.arange(ny_subabs))
-            self.ax.quiver(X, Y, shifts_x, shifts_y, scale=self.scale)
-            self.ax.set_title(self.title)
-            self.ax.set_xlabel('Sub-aperture X Index')
-            self.ax.set_ylabel('Sub-aperture Y Index')
-            self.ax.set_xlim(-0.5, nx_subabs - 0.5)
-            self.ax.set_ylim(-0.5, ny_subabs - 0.5)
-            self.ax.grid(True, linestyle='--', alpha=0.7)
-            self.ax.set_aspect('equal')
-            self.canvas.draw()
-            img = np.frombuffer(self.canvas.buffer_rgba(), dtype=np.uint8).reshape(self.canvas.get_width_height()[::-1] + (4,))
-            img = img[..., :3]  # drop alpha channel
-            return img
-        def close(self):
-            plt.close(self.fig)
-        
-    class SpectrumPlotter:
-
-        def __init__(self, fs, f1, f2,
-                    title="Spectrum",
-                    figsize=(8, 6), dpi=100,
-                    show_bands=True,
-                    ylim=None,
-                    use_stem=False):
-
-            self.fs = fs
-            self.f1 = f1
-            self.f2 = f2
-            self.show_bands = show_bands
-            self.ylim = ylim
-            self.use_stem = use_stem
-
-            self.fig, self.ax = plt.subplots(figsize=figsize, dpi=dpi)
-            self.canvas = FigureCanvasAgg(self.fig)
-            self.title = title
-
-        def plot(self, spectrum_line, freqs):
-
-            if isinstance(spectrum_line, cp.ndarray):
-                spectrum_line = cp.asnumpy(spectrum_line)
-            freqs = np.fft.fftfreq(len(spectrum_line), d=1/self.fs)
-
-            freqs = np.fft.fftshift(freqs)
-            spectrum_line = np.fft.fftshift(spectrum_line)
-
-            # log scale
-            spectrum_line[spectrum_line <= 0] = np.nan
-            signal_log = np.log10(spectrum_line)
-
-            self.ax.clear()
-
-            # main plot
-            if self.use_stem:
-                markerline, stemlines, baseline = self.ax.stem(freqs, signal_log, basefmt=" ")
-                plt.setp(markerline, color='black')
-                plt.setp(stemlines, color='black', linewidth=1)
-            else:
-                self.ax.plot(freqs, signal_log, color='black', linewidth=1)
-
-            # shaded bands
-            if self.show_bands:
-                r1 = (-self.f2 < freqs) & (freqs < -self.f1)
-                r2 = (self.f1 < freqs) & (freqs < self.f2)
-
-                self.ax.fill_between(freqs[r1], signal_log[r1],
-                                    color='lightgray', edgecolor='black')
-                self.ax.fill_between(freqs[r2], signal_log[r2],
-                                    color='lightgray', edgecolor='black')
-
-            # vertical lines
-            for val in [self.f1, self.f2, -self.f1, -self.f2]:
-                self.ax.axvline(val, linestyle='--', color='black')
-
-            # x limits
-            self.ax.set_xlim([freqs.min(), freqs.max()])
-
-            # y limits
-            if self.ylim is not None:
-                self.ax.set_ylim(self.ylim)
-            else:
-                valid = (~np.isnan(spectrum_line)) & (np.abs(freqs) > self.f1)
-                if np.any(valid):
-                    ymin = 0.9 * np.log10(np.nanmin(spectrum_line[valid]))
-                    ymax = 1.11 * np.log10(np.nanmax(spectrum_line[valid]))
-                    self.ax.set_ylim([ymin, ymax])
-
-            # ticks
-            if self.f1 != 0:
-                ticks = [-self.f2, -self.f1, self.f1, self.f2]
-            else:
-                ticks = [-self.f2, self.f2]
-
-            self.ax.set_xticks(ticks)
-            self.ax.set_xticklabels([f"{t:.1f}" for t in ticks])
-
-            # labels
-            self.ax.set_title(self.title)
-            self.ax.set_xlabel('frequency (Hz)')
-            self.ax.set_ylabel('log10 S')
-
-            self.ax.grid(True, linestyle='--', alpha=0.5)
-
-            # render
-            self.canvas.draw()
-            img = np.frombuffer(self.canvas.buffer_rgba(), dtype=np.uint8)
-            img = img.reshape(self.canvas.get_width_height()[::-1] + (4,))
-
-            return img[..., :3]
-
-        def close(self):
-            plt.close(self.fig)
-        
-    class SubapertureMontagePlotter:
-        def __init__(self):
-            pass
-        def plot(self, U_subaps):
-            if isinstance(U_subaps, cp.ndarray):
-                U_subaps = cp.asnumpy(U_subaps)
-            rows = []
-            for iy in range(U_subaps.shape[0]):
-                row_imgs = [U_subaps[iy, ix] for ix in range(U_subaps.shape[1])]
-                rows.append(np.hstack(row_imgs))
-            montage_img = np.vstack(rows)
-            return montage_img
-        def close(self):
-            pass
-        
-    def init_plot_debug(self, parameters):
-        matplotlib.use("Agg")
-        # --- CENTRAL DEBUG REGISTRY (edit only here to add new outputs) ---
-        self.debug_plotters = {
-            "montage": self.SubapertureMontagePlotter(),
-            "shifts": self.ShiftsPlotter(scale=30),
-            "shifts_rel": self.ShiftsPlotter(scale=None),
-            "phase": self.PhasePlotter(),
-            "phase_rel": self.PhasePlotter(relative=True),
-            "M0notfixed": self.ImagePlotter(),
-            "spectrum": self.SpectrumPlotter(
-                fs=parameters["sampling_freq"],
-                f1=parameters["low_freq"],
-                f2=parameters["high_freq"],
-                ylim=(12,20),
-                use_stem=False
-            ),
-        }
-
-        # maps key -> function(res) -> args for plotter
-        self.debug_sources = {
-            "montage": lambda res: (res["U_subaps"],),
-            "shifts":  lambda res: (res["shifts_y"], res["shifts_x"]),
-            "shifts_rel":  lambda res: (res["shifts_y"], res["shifts_x"]),
-            "phase":   lambda res: (res["phase"],),
-            "phase_rel": lambda res: (res["phase"],),
-            "M0notfixed": lambda res: (res["M0notfixed"],),
-            "spectrum": lambda res: (res["spectrum_line"], res["freqs"]),
-        }
-    
-    def plot_debug(self, res, i):
-        out = {}
-
-        for key, plotter in self.debug_plotters.items():
-
-            try:
-                args = self.debug_sources[key](res)
-            except KeyError:
-                continue  # required data not present
-
-            out[key] = plotter.plot(*args)
-
-        return out
-        
-    # ------------------------------------------------------------
-    # One batch full pipeline
-    # ------------------------------------------------------------
-
-    def render_moments(self, parameters, frames = None, registration_ref = None, tictoc = False):
-        RangePush("render_moments")
-        
-        def tic():
-            if tictoc:
-                return time.perf_counter(), time.process_time()
-        def toc(t1, name="", arr=None):
-            if tictoc:
-                print(name)
-                t2 = time.perf_counter(), time.process_time()
-                print(f" Real time: {t2[0] - t1[0]:.2f} seconds")
-                # print(f" CPU time: {t2[1] - t1[1]:.2f} seconds")
-                if arr is not None and isinstance(arr, (np.ndarray, cp.ndarray)): 
-                    print(arr.dtype)
-        
+    def render_moments(self, parameters, frames=None, registration_ref=None, tictoc=False):
+        """Process a single batch of frames"""
         if frames is None:
             frames = self.read_frames(parameters["first_frame"], parameters["batch_size"])
         if frames is None:
             raise RuntimeError("Could not read frames properly")
-
-        nt, ny, nx = frames.shape
         
-        res = {} # intitialze result dict
-
-        from collections import defaultdict
-
+        nt, ny, nx = frames.shape
+        res = {}
+        
         class Accumulator:
             def __init__(self, batch_size, xp):
                 self.xp = xp
                 self.batch_size = batch_size
                 self.buffers = defaultdict(list)
-
+            
             def add(self, data_dict):
                 for k, v in data_dict.items():
                     self.buffers[k].append(v)
-
                 if len(next(iter(self.buffers.values()))) >= self.batch_size:
                     return self.flush()
                 return None
-
+            
             def flush(self):
                 if not self.buffers:
                     return None
-
-                batch = {
-                    k: self.xp.sum(self.xp.stack(v),axis=0) / self.batch_size 
-                    for k, v in self.buffers.items()
-                }
+                batch = {k: self.xp.sum(self.xp.stack(v), axis=0) / self.batch_size 
+                        for k, v in self.buffers.items()}
                 self.buffers.clear()
                 return batch
+        
+        subaps_acc = Accumulator(parameters.get("shack_hartmann_accumulation", 1), self.bm.xp)
+        main_acc = Accumulator(parameters.get("accumulation", 1), self.bm.xp)
+        
+        t0 = time.perf_counter()
+        
+        def toc(name=""):
+            if tictoc:
+                dt = time.perf_counter() - t0
+                print(name, f"{dt*1000:.3f} ms")
 
-        subapsacc = Accumulator(parameters["shack_hartmann_accumulation"], self.xp)
-
-        mainacc = Accumulator(parameters["accumulation"], self.xp)
-
-        t1 = tic()
-        if parameters["shack_hartmann"] :
-            
-            t2 = tic()
-            sub_batch_size = (nt // subapsacc.batch_size)
+        # Shack-Hartmann phase estimation
+        if parameters.get("shack_hartmann", False):
+            sub_batch_size = nt // subaps_acc.batch_size
             sub_batch_stride = sub_batch_size
-            assert sub_batch_size > 0
-            for it in range(subapsacc.batch_size) :
-                frames_sub = frames[sub_batch_stride*it:sub_batch_stride*it+sub_batch_size]
-                if parameters["spatial_propagation"] == "Fresnel" :
-                    if (not "Fresnel_in" in self.kernels):
-                        self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx, zero_padding = parameters["zero_padding"])
-                    U_subaps = self._shack_hartmann_constructsubapsimages(frames_sub, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], frames_sub.shape[0], parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
-                elif parameters["spatial_propagation"] == "AngularSpectrum" :
-                    if (not "AngularSpectrum" in self.kernels):
-                        self._build_angular_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx, zero_padding = parameters["zero_padding"])
-                    U_subaps = self._shack_hartmann_constructsubapsimages_angular_spectrum(frames_sub, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], parameters["z"], parameters["low_freq"], parameters["high_freq"], parameters["sampling_freq"], nt, parameters["shack_hartmann_nx_subap"], parameters["shack_hartmann_ny_subap"], parameters["svd_threshold"]) # construct small images from the sub apertures of the Shack-Hartmann sensor
-                b = subapsacc.add({"U_subaps":U_subaps})
+            
+            for it in range(subaps_acc.batch_size):
+                frames_sub = frames[sub_batch_stride*it:sub_batch_stride*it + sub_batch_size]
+                
+                if parameters["spatial_propagation"] == "Fresnel":
+                    self.propagation.build_fresnel_kernel(
+                        parameters["z"], parameters["pixel_pitch"],
+                        parameters["wavelength"], ny, nx,
+                        zero_padding=parameters.get("zero_padding")
+                    )
+                    U_subaps = self.shack_hartmann.construct_subapertures_fresnel(
+                        frames_sub, parameters["pixel_pitch"], parameters["pixel_pitch"],
+                        parameters["wavelength"], parameters["z"],
+                        parameters["low_freq"], parameters["high_freq"],
+                        parameters["sampling_freq"], frames_sub.shape[0],
+                        parameters["shack_hartmann_nx_subap"],
+                        parameters["shack_hartmann_ny_subap"],
+                        parameters["svd_threshold"]
+                    )
+                else:  # AngularSpectrum
+                    self.propagation.build_angular_kernel(
+                        parameters["z"], parameters["pixel_pitch"],
+                        parameters["wavelength"], ny, nx,
+                        zero_padding=parameters.get("zero_padding")
+                    )
+                    U_subaps = self.shack_hartmann.construct_subapertures_angular(
+                        frames_sub, parameters["pixel_pitch"], parameters["pixel_pitch"],
+                        parameters["wavelength"], parameters["z"],
+                        parameters["low_freq"], parameters["high_freq"],
+                        parameters["sampling_freq"], frames_sub.shape[0],
+                        parameters["shack_hartmann_nx_subap"],
+                        parameters["shack_hartmann_ny_subap"],
+                        parameters["svd_threshold"]
+                    )
+                
+                subaps_acc.add({"U_subaps": U_subaps})
+            
+            b = subaps_acc.flush()
             if b is not None:
                 U_subaps = b["U_subaps"]
-            toc(t2, "Usubaps calculation",U_subaps)
-
-            if parameters["debug"]:
+            
+            if parameters.get("debug"):
                 res["U_subaps"] = U_subaps
-
-            t2 = tic()
-            shifts_y, shifts_x = self._shack_hartmann_displacement_calculation(U_subaps, self.xp, pupil_threshold = parameters["shack_hartmann_pupil_threshold"], deviation_threshold = parameters["shack_hartmann_deviation_threshold"], shifts_pixel_range_threshold = parameters["shack_hartmann_shifts_pixel_range_threshold"], ref = None) # get the shifts in pixels in the subapertures images
-            toc(t2, "Shack-Hartmann displacement calculation time", shifts_y)
-            if parameters["debug"]:
+            
+            # Calculate displacements
+            shifts_y, shifts_x = self.shack_hartmann.calculate_displacements(
+                U_subaps,
+                pupil_threshold=parameters.get("shack_hartmann_pupil_threshold", 1.0),
+                deviation_threshold=parameters.get("shack_hartmann_deviation_threshold", 3.0),
+                shifts_range=parameters.get("shack_hartmann_shifts_pixel_range_threshold", 20.0)
+            )
+            
+            if parameters.get("debug"):
                 res["shifts_y"] = shifts_y
                 res["shifts_x"] = shifts_x
-            t2 = tic()
-            if parameters["shack_hartmann_zernike_fit"] :
-                coefs, phase = self._shack_hartmann_zernike(ny, nx, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], shifts_y, shifts_x, parameters["shack_hartmann_zernike_fit_modes"]) # fit the shifts to Zernike polynomials to get the wavefront phase
+            
+            # Phase reconstruction
+            if parameters.get("shack_hartmann_zernike_fit"):
+                coefs, phase = self.zernike.fit_zernike(
+                    ny, nx, parameters["pixel_pitch"], parameters["pixel_pitch"],
+                    parameters["wavelength"], shifts_y, shifts_x,
+                    parameters["shack_hartmann_zernike_fit_modes"]
+                )
                 res["coefs"] = coefs
-                if parameters["debug"]:
+                if parameters.get("debug"):
                     res["phase"] = phase
-            elif parameters["shack_hartmann_southwell_phase_integration "] :
-                phase = self._shack_hartmann_southwell(ny, nx, parameters["pixel_pitch"], parameters["pixel_pitch"], parameters["wavelength"], shifts_y, shifts_x)
-                if parameters["debug"]:
-                    res["phase"] = phase
-            toc(t2, "Shack-Hartmann phase reconstruction time")
+            else:
+                phase = None
             
-            phase_term = self.xp.exp(- 1j * phase) 
-            phase_term = self.xp.nan_to_num(phase_term, nan=0.0) # completely mask the nan zone where the phase could'nt be estimated
-            if parameters["zero_padding"]:
-                phase_term = self.pad_array_centrally(phase_term, parameters["zero_padding"])
-        
-        toc(t1, "Shack-Hartmann total phase calculation time")
-            
-            
-        t1 = tic()
-        res_ = {}
-        sub_batch_size = (nt // mainacc.batch_size)
+            # Apply phase correction
+            if phase is not None:
+                phase_term = self.bm.xp.exp(-1j * phase)
+                phase_term = self.bm.xp.nan_to_num(phase_term, nan=0.0)
+                if parameters.get("zero_padding"):
+                    phase_term = pad_array_centrally(phase_term, parameters["zero_padding"], self.bm.xp)
+            else:
+                phase_term = None
+        toc("Usubap")
+        # Main processing loop
+        sub_batch_size = nt // main_acc.batch_size
         sub_batch_stride = sub_batch_size
-        assert sub_batch_size > 0
-        for it in range(mainacc.batch_size) :
-            frames_sub = frames[sub_batch_stride*it:sub_batch_stride*it+sub_batch_size]
-            if parameters["shack_hartmann"]:
-                if parameters["spatial_propagation"] == "Fresnel" :
-                    holograms = self._fresnel_transform_phase(frames_sub, phase_term, zero_padding = parameters["zero_padding"])            
-                elif parameters["spatial_propagation"] == "AngularSpectrum" :
-                    holograms = self._angular_spectrum_transform_phase(frames_sub, phase_term, zero_padding = parameters["zero_padding"])   
-                if parameters["debug"]:
-                    if parameters["spatial_propagation"] == "Fresnel" :
-                        hologramsnotfixed = self._fresnel_transform(frames_sub, zero_padding = parameters["zero_padding"])
-                    elif parameters["spatial_propagation"] == "AngularSpectrum" :
-                        hologramsnotfixed = self._angular_spectrum_transform(frames_sub, zero_padding = parameters["zero_padding"]) 
-                        
-            elif parameters["spatial_propagation"] == "Fresnel":
-                if (not "Fresnel_in" in self.kernels):
-                    self._build_fresnel_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx, zero_padding = parameters["zero_padding"])
-                holograms = self._fresnel_transform(frames_sub, zero_padding = parameters["zero_padding"])
-            elif parameters["spatial_propagation"] == "AngularSpectrum":
-                if (not "AngularSpectrum" in self.kernels):
-                    self._build_angular_kernel(parameters["z"],parameters["pixel_pitch"],parameters["wavelength"], ny, nx, zero_padding = parameters["zero_padding"])
-                holograms = self._angular_spectrum_transform(frames_sub, zero_padding = parameters["zero_padding"])
+        
+        for it in range(main_acc.batch_size):
+            frames_sub = frames[sub_batch_stride*it:sub_batch_stride*it + sub_batch_size]
             
-            holograms_f = self._svd_filter(holograms, parameters["svd_threshold"])
-
-            spectrum_f = self._fourier_time_transform(holograms_f)
-
-            idxs, freqs = self._frequency_symmetric_filtering(frames_sub.shape[0], parameters["sampling_freq"], parameters["low_freq"], parameters["high_freq"])
-            psd = self.xp.abs(spectrum_f[idxs,:,:]) ** 2
-
-            if parameters["debug"]:
-                res_["spectrum_line"] = self.xp.mean(self.xp.abs(spectrum_f[:,:,:]) ** 2, axis=(-1, -2)) # spectrum line at the center of the image for debug purposes
-                res_["freqs"] = freqs
-
-            res_["M0"] = self._moment(psd, freqs, 0)
-            res_["M1"] = self._moment(psd, freqs, 1)
-            res_["M2"] = self._moment(psd, freqs, 2)
+            # Propagate with or without phase correction
+            if parameters.get("shack_hartmann") and phase_term is not None:
+                if parameters["spatial_propagation"] == "Fresnel":
+                    holograms = self.propagation.fresnel_transform_with_phase(frames_sub, phase_term, 
+                                                           zero_padding=parameters.get("zero_padding"))
+                else:
+                    holograms = self.propagation.angular_spectrum_transform_with_phase(
+                        frames_sub, phase_term, zero_padding=parameters.get("zero_padding")
+                    )
+                
+                if parameters.get("debug"):
+                    if parameters["spatial_propagation"] == "Fresnel":
+                        holograms_not_fixed = self.propagation.fresnel_transform(frames_sub, 
+                                                               zero_padding=parameters.get("zero_padding"))
+                    else:
+                        holograms_not_fixed = self.propagation.angular_spectrum_transform(
+                            frames_sub, zero_padding=parameters.get("zero_padding")
+                        )
+            else:
+                if parameters["spatial_propagation"] == "Fresnel":
+                    self.propagation.build_fresnel_kernel(
+                        parameters["z"], parameters["pixel_pitch"],
+                        parameters["wavelength"], ny, nx,
+                        zero_padding=parameters.get("zero_padding")
+                    )
+                    holograms = self.propagation.fresnel_transform(frames_sub, zero_padding=parameters.get("zero_padding"))
+                else:
+                    self.propagation.build_angular_kernel(
+                        parameters["z"], parameters["pixel_pitch"],
+                        parameters["wavelength"], ny, nx,
+                        zero_padding=parameters.get("zero_padding")
+                    )
+                    holograms = self.propagation.angular_spectrum_transform(
+                        frames_sub, zero_padding=parameters.get("zero_padding")
+                    )
+                holograms_not_fixed = None
             
-            if parameters["shack_hartmann"] and parameters["debug"]: # to compute the res without the phase correction for debug purposes
-                hologramsnotfixed_f = self._svd_filter(hologramsnotfixed, parameters["svd_threshold"])
-                spectrumnotfixed_f = self._fourier_time_transform(hologramsnotfixed_f)
-                psdnotfixed = self.xp.abs(spectrumnotfixed_f[idxs,:,:]) ** 2
-                M0notfixed = self._moment(psdnotfixed, freqs, 0)
-                res_["M0notfixed"] = M0notfixed
-
-            b = mainacc.add(res_)
+            # SVD filtering
+            # holograms_f = self.filtering.svd_filter(holograms, parameters["svd_threshold"])
+            holograms_f = self.filtering.tucker_filter(holograms, ranks=holograms.shape, temporal_modes_to_remove=parameters["svd_threshold"])
+            
+            # Temporal FFT
+            spectrum_f = self.filtering.fourier_time_transform(holograms_f)
+            
+            # Frequency filtering
+            idxs, freqs = self._frequency_filter(
+                frames_sub.shape[0], parameters["sampling_freq"],
+                parameters["low_freq"], parameters.get("high_freq")
+            )
+            psd = self.bm.xp.abs(spectrum_f[idxs, :, :]) ** 2
+            
+            res_batch = {
+                "M0": self._moment(psd, freqs, 0),
+                "M1": self._moment(psd, freqs, 1),
+                "M2": self._moment(psd, freqs, 2)
+            }
+            
+            if parameters.get("debug"):
+                res_batch["spectrum_line"] = self.bm.xp.mean(
+                    self.bm.xp.abs(spectrum_f[:, :, :]) ** 2, axis=(-1, -2)
+                )
+                res_batch["freqs"] = freqs
+                
+                if holograms_not_fixed is not None:
+                    holograms_not_fixed_f = self.filtering.svd_filter(holograms_not_fixed, 
+                                                                       parameters["svd_threshold"])
+                    spectrum_not_fixed = self.filtering.fourier_time_transform(holograms_not_fixed_f)
+                    psd_not_fixed = self.bm.xp.abs(spectrum_not_fixed[idxs, :, :]) ** 2
+                    res_batch["M0notfixed"] = self._moment(psd_not_fixed, freqs, 0)
+            
+            b = main_acc.add(res_batch)
+        toc(name="Propag")
+        
         if b is not None:
             res.update(b)
-
-        toc(t1, "Spatial and temporal transforms total calculation time")
         
-        # --- Register current batch ---  
-        if parameters["image_registration"] and registration_ref is not None:
-            t2 = tic()
-            M0_ff = self._flatfield(res["M0"], parameters["registration_flatfield_gw"])
-            reg = self._registration(registration_ref, M0_ff, parameters["registration_disc_ratio"])
-            res["M0"] = self._applyregistration(res["M0"], reg, self.xp)
-            res["M1"] = self._applyregistration(res["M1"], reg, self.xp)
-            res["M2"] = self._applyregistration(res["M2"], reg, self.xp)
+        # Registration
+        if parameters.get("image_registration") and registration_ref is not None:
+            M0_ff = gaussian_flatfield(res["M0"], parameters["registration_flatfield_gw"], 
+                                        self.bm.gaussian_filter)
+            res["M0_ff_noreg"] = M0_ff
+            reg = self._register(registration_ref, M0_ff, parameters.get("registration_disc_ratio"))
+            res["M0"] = self._apply_registration(res["M0"], reg)
+            res["M1"] = self._apply_registration(res["M1"], reg)
+            res["M2"] = self._apply_registration(res["M2"], reg)
             res["registration"] = reg
-            toc(t2, "Image registration time", reg)
-            
-        RangePop()
-        
-        toc(t1, "total render_moments time")
-        
+        toc(name="Reg")
         
         return res
-
+    
     # ------------------------------------------------------------
     # Full video processing
     # ------------------------------------------------------------
-
-    def process_moments_(self, parameters, h5_path = None, mp4_path = None, return_numpy = False, holodoppler_path = False):
+    
+    def process_moments(self, parameters, mp4_path = None, 
+                        return_numpy = False, holodoppler_path = True):
+        """Process entire video"""
         
         batch_size = parameters["batch_size"]
         batch_stride = parameters["batch_stride"]
         first_frame = parameters["first_frame"]
-        end_frame = parameters["end_frame"]
-        if end_frame <= 0:
-            if self.ext == ".holo":
-                end_frame = self.file_header["num_frames"]
-            elif self.ext == ".cine":
-                end_frame = self.cine_metadata.ImageCount
+        end_frame = parameters.get("end_frame", 0)
         
-        # please do not remove it is good
-        if batch_stride >= (end_frame-first_frame):
-            if batch_size <= (end_frame-first_frame):
-                num_batch = 1
+        if end_frame <= 0:
+            if self.file_reader.ext == ".holo":
+                end_frame = self.file_reader.file_header["num_frames"]
             else:
-                num_batch = 0
+                end_frame = self.file_reader.metadata["ImageCount"]
+        
+        if batch_stride >= (end_frame - first_frame):
+            num_batch = 1 if batch_size <= (end_frame - first_frame) else 0
         else:
-            num_batch = int((end_frame-first_frame) / batch_stride)
-
-        out_list = []
-
+            num_batch = int((end_frame - first_frame) / batch_stride)
+        
         if num_batch <= 0:
             return None
         
-        if parameters["debug"]:
+        out_list = []
+        
+        # Debug setup
+        debug_manager = DebugPlotterManager(parameters) if parameters.get("debug") else None
+        
+        if parameters.get("debug") and debug_manager is not None:
             import threading
             import queue
             
-            self.init_plot_debug(parameters)
-
-            # --- create plotting worker ---
-
             debug_results = {}
-            res_store = {}   # shared storage
+            res_store = {}
             lock = threading.Lock()
-
-            def plotting_worker(in_q, stop_event):
-                while not stop_event.is_set() or not in_q.empty():
+            debug_queue = queue.Queue(maxsize=14)
+            stop_event = threading.Event()
+            
+            def plotting_worker():
+                while not stop_event.is_set() or not debug_queue.empty():
                     try:
-                        i = in_q.get(timeout=0.1)
+                        i = debug_queue.get(timeout=0.1)
+                        with lock:
+                            res = res_store.pop(i)
+                        out = debug_manager.plot_all(res)
+                        with lock:
+                            debug_results[i] = out
+                        debug_queue.task_done()
                     except queue.Empty:
                         continue
-
-                    with lock:
-                        res = res_store.pop(i)  # remove to free memory early
-
-                    out = self.plot_debug(res, i)
-
-                    with lock:
-                        debug_results[i] = out
-
-                    in_q.task_done()
-
-            debugin_queue = queue.Queue(maxsize=14)
-            stop_event = threading.Event()
-
-            debug_thread = threading.Thread(
-                target=plotting_worker,
-                args=(debugin_queue, stop_event),
-                daemon=True
-            )
+            
+            debug_thread = threading.Thread(target=plotting_worker, daemon=True)
             debug_thread.start()
         
-        if parameters["image_registration"]:
-            frames = self.read_frames(first_frame, parameters["batch_size_registration"]) # the first frame to be rendered
-            M0_reg = self.render_moments(parameters, frames = frames)["M0"] # render the first frame to be used as reference for the registration
-            M0_reg = self._flatfield(M0_reg, parameters["registration_flatfield_gw"])
-            reg_list = [None] * num_batch
+        # Registration reference
+        if parameters.get("image_registration"):
+            frames_reg = self.read_frames(first_frame, parameters["batch_size_registration"])
+            M0_reg = self.render_moments(parameters, frames=frames_reg)["M0"]
+            M0_reg = gaussian_flatfield(M0_reg, parameters["registration_flatfield_gw"], 
+                                         self.bm.gaussian_filter)
+            M0_reg = self.bm.to_backend(M0_reg)
         else:
             M0_reg = None
-            
-        if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and parameters["shack_hartmann_zernike_fit"]:
-            coefs_list = [None] * num_batch
-
-        if self.backend == "cupy":
-            stream_h2d = cp.cuda.Stream(non_blocking=True)
-            stream_compute = cp.cuda.Stream(non_blocking=True)
-
-            # --- Prefetch first batch ---
-            frames_next = self.read_frames(
-                first_frame,
-                parameters["batch_size"]
-            )
-
-            with stream_h2d:
-                d_frames_next = cp.asarray(frames_next) 
-
-            for i in tqdm(range(num_batch)):
-
-                # Swap buffers
-                d_frames = d_frames_next
-
-                # --- Prefetch next batch (CPU side) ---
-                if i + 1 < num_batch:
-                    
-                    with stream_h2d:
-                        d_frames_next = self.read_frames(
-                        first_frame + (i + 1) * parameters["batch_stride"],
-                        parameters["batch_size"]
-                    )
-
-                # --- Compute current batch ---
-                with stream_compute:
-                    res = self.render_moments(parameters, frames=d_frames, registration_ref=M0_reg)
-
-                if res is None:
-                    break
-
-                M0, M1, M2 = res["M0"], res["M1"], res["M2"]
-                
-                if parameters["debug"]:
-                    # debug_imgs = {k: res[k] for k in res if k not in ["M0", "M1", "M2"]}
-                    with lock:
-                        res_store[i] = res
-                    debugin_queue.put((i))
-                
-                stream_compute.synchronize()
-                
-                out_list.append(
-                    cp.stack([M0, M1, M2], axis=2)
-                )
-                if "coefs" in res:
-                    coefs_list[i] = res["coefs"]
-                if "registration" in res:
-                    reg_list[i] = res["registration"]
-                
-
-            # Ensure transfers complete
-            stream_h2d.synchronize()
-
-            cp.cuda.Device().synchronize()
-
-        elif self.backend == "cupyRAM":
-            import queue
-            import threading
-            import time
-            from collections import deque
-            
-            # Profiling data collection
-            profile_data = {
-                'read_times': deque(maxlen=100),  # Keep last 100 reads
-                'transfer_times': deque(maxlen=100),
-                'compute_times': deque(maxlen=100),
-                'registration_times': deque(maxlen=100),
-                'queue_wait_times': deque(maxlen=100),
-                'total_batch_times': deque(maxlen=100),
-                'queue_sizes': deque(maxlen=100),
-            }
-            
-            # Create queues for frames and results
-            frame_queue = queue.Queue(maxsize=4)  # Configurable queue depth
-            
-            # Control flags
-            stop_reader = threading.Event()
-            reader_done = threading.Event()
-            
-            # Reader thread function - continuously reads frames
-            def reader_thread_func():
-                frame_idx = first_frame
-                batch_num = 0
-                
-                while batch_num < num_batch and not stop_reader.is_set():
-                    read_start = time.perf_counter()
-                    
-                    # Read frames
-                    frames = self.read_frames(frame_idx, batch_size)
-                    
-                    read_time = time.perf_counter() - read_start
-                    profile_data['read_times'].append(read_time)
-                    
-                    # Put into queue (will block if queue is full)
-                    queue_start = time.perf_counter()
-                    frame_queue.put((batch_num, frame_idx, frames))
-                    queue_time = time.perf_counter() - queue_start
-                    profile_data['queue_wait_times'].append(queue_time)
-                    
-                    # Track queue size
-                    profile_data['queue_sizes'].append(frame_queue.qsize())
-                    
-                    batch_num += 1
-                    frame_idx += batch_stride
-                
-                reader_done.set()
-            
-            # Start reader thread
-            reader_thread = threading.Thread(target=reader_thread_func, daemon=True)
-            reader_thread.start()
-            
-            # CUDA streams for async operations
-            stream_h2d = cp.cuda.Stream(non_blocking=True)
-            stream_compute = cp.cuda.Stream(non_blocking=True)
-            stream_registration = cp.cuda.Stream(non_blocking=True) if parameters["image_registration"] else None
-            
-            # Pre-start with first batch
-            first_batch_num, first_frame_idx, first_frames = frame_queue.get()
-            
-            # Async transfer to GPU
-            transfer_start = time.perf_counter()
-            with stream_h2d:
-                d_frames_current = cp.asarray(first_frames)
-            stream_h2d.synchronize()
-            transfer_time = time.perf_counter() - transfer_start
-            profile_data['transfer_times'].append(transfer_time)
-            
-            current_batch_num = first_batch_num
-            current_frame_idx = first_frame_idx
-            d_frames = d_frames_current
-            
-            # Main processing loop
-            processed_batches = 0
-            next_batch_prefetched = False
-            
-            for i in tqdm(range(num_batch)):
-                batch_start_time = time.perf_counter()
-                
-                # Check if we need to get next batch from queue
-                if not next_batch_prefetched and i > 0:
-                    queue_wait_start = time.perf_counter()
-                    next_batch_num, next_frame_idx, next_frames = frame_queue.get()
-                    queue_wait_time = time.perf_counter() - queue_wait_start
-                    profile_data['queue_wait_times'].append(queue_wait_time)
-                    
-                    # Async transfer next batch
-                    transfer_start = time.perf_counter()
-                    with stream_h2d:
-                        d_frames_next = cp.asarray(next_frames)
-                    stream_h2d.synchronize()
-                    transfer_time = time.perf_counter() - transfer_start
-                    profile_data['transfer_times'].append(transfer_time)
-                    
-                    next_batch_prefetched = True
-                
-                # Compute current batch
-                compute_start = time.perf_counter()
-                with stream_compute:
-                    res = self.render_moments(parameters, frames=d_frames, registration_ref=M0_reg)
-                
-                if res is None:
-                    break
-                
-                M0, M1, M2 = res["M0"], res["M1"], res["M2"]
-                if parameters["debug"]:
-                    # debug_imgs = {k: res[k] for k in res if k not in ["M0", "M1", "M2"]}
-                    with lock:
-                        res_store[i] = res
-                    debugin_queue.put((i))
-                if "coefs" in res:
-                    coefs_list[i] = res["coefs"]
-                if "registration" in res:
-                    reg_list[i] = res["registration"]
-                    
-                compute_time = time.perf_counter() - compute_start
-                profile_data['compute_times'].append(compute_time)
-                
-                # Ensure compute is done
-                stream_compute.synchronize()
-                
-                # Store result
-                out_list.append(cp.stack([M0, M1, M2], axis=2))
-                
-                # Swap buffers for next iteration
-                if next_batch_prefetched and i + 1 < num_batch:
-                    d_frames = d_frames_next
-                    current_batch_num = next_batch_num
-                    next_batch_prefetched = False
-                    processed_batches += 1
-                
-                # Profile total batch time
-                batch_time = time.perf_counter() - batch_start_time
-                profile_data['total_batch_times'].append(batch_time)
-            
-            # Signal reader to stop and wait for completion
-            stop_reader.set()
-            reader_thread.join(timeout=5)
-            
-            # Ensure all CUDA operations complete
-            stream_h2d.synchronize()
-            stream_compute.synchronize()
-            if stream_registration:
-                stream_registration.synchronize()
-            cp.cuda.Device().synchronize()
-            
-            # Print profiling summary
-            if parameters.get("enable_profiling", True):
-                print("\n" + "="*60)
-                print("PROFILING SUMMARY - cupyRAM Backend")
-                print("="*60)
-
-                import numpy as np
-                
-                def print_stats(name, times):
-                    if len(times) > 0:
-                        avg = np.mean(times) * 1000  # Convert to ms
-                        std = np.std(times) * 1000
-                        min_t = np.min(times) * 1000
-                        max_t = np.max(times) * 1000
-                        print(f"{name:20s}: Avg={avg:6.2f}ms ±{std:5.2f}ms, Min={min_t:6.2f}ms, Max={max_t:6.2f}ms")
-                    else:
-                        print(f"{name:20s}: No data")
-                
-                print_stats("File Read Time", profile_data['read_times'])
-                print_stats("Queue Wait Time", profile_data['queue_wait_times'])
-                print_stats("H2D Transfer Time", profile_data['transfer_times'])
-                print_stats("Compute Time", profile_data['compute_times'])
-                print_stats("Registration Time", profile_data['registration_times'])
-                print_stats("Total Batch Time", profile_data['total_batch_times'])
-                
-                if len(profile_data['queue_sizes']) > 0:
-                    avg_queue = np.mean(profile_data['queue_sizes'])
-                    max_queue = np.max(profile_data['queue_sizes'])
-                    print(f"\nQueue Statistics:")
-                    print(f"  Average Queue Size: {avg_queue:.1f}")
-                    print(f"  Max Queue Size: {max_queue}")
-                
-                # Calculate throughput
-                if len(profile_data['total_batch_times']) > 0:
-                    total_time = np.sum(profile_data['total_batch_times'])
-                    total_batches = len(profile_data['total_batch_times'])
-                    total_frames = total_batches * batch_size
-                    print(f"\nThroughput:")
-                    print(f"  Batches/sec: {total_batches/total_time:.2f}")
-                    print(f"  Frames/sec: {total_frames/total_time:.2f}")
-                    
-                    # Utilization metrics
-                    compute_total = np.sum(profile_data['compute_times'])
-                    read_total = np.sum(profile_data['read_times'])
-                    transfer_total = np.sum(profile_data['transfer_times'])
-                    
-                    if total_time > 0:
-                        print(f"\nUtilization (of total time):")
-                        print(f"  Compute: {compute_total/total_time*100:.1f}%")
-                        print(f"  File I/O: {read_total/total_time*100:.1f}%")
-                        print(f"  H2D Transfer: {transfer_total/total_time*100:.1f}%")
-                        
-                        # Overlap efficiency
-                        ideal_time = max(compute_total, read_total + transfer_total)
-                        overlap_efficiency = ideal_time / total_time * 100 if total_time > 0 else 0
-                        print(f"  Overlap Efficiency: {overlap_efficiency:.1f}%")
-                
-                print("="*60 + "\n")
-
-        elif self.backend == "numpy multiprocessing":
-
-            raise NotImplementedError("Multiprocessing backend is not implemented yet. Please use 'cupy' or 'cupyRAM' for GPU acceleration or 'numpy' for CPU serial execution.")
-
+        
+        coefs_list = [None] * num_batch if parameters.get("shack_hartmann") else None
+        reg_list = [None] * num_batch if parameters.get("image_registration") else None
+        
+        # Main processing loop with GPU streaming if enabled
+        if self.backend_name =="cupy":
+            self._process_gpu_streaming(parameters, num_batch, first_frame, batch_stride,
+                                        batch_size, M0_reg, out_list, coefs_list, reg_list,
+                                        debug_manager, debug_queue, res_store, lock if parameters.get("debug") else None)
+        elif self.backend_name =="cupyRAM":
+            self._process_gpu_streaming_onram(parameters, num_batch, first_frame, batch_stride,
+                                    batch_size, M0_reg, out_list, coefs_list, reg_list,
+                                    debug_manager, debug_queue, res_store, lock if parameters.get("debug") else None)
         else:
-            for i in tqdm(range(num_batch)):
-
-                try:
-
-                    frames = self.read_frames(first_frame + i * parameters["batch_stride"] , parameters["batch_size"])
-
-                    res = self.render_moments(parameters, frames = frames, registration_ref=M0_reg)
-
-                    if res is None:
-                        break
-
-                    M0, M1, M2 = res["M0"], res["M1"], res["M2"]
-                    if parameters["debug"]:
-                        # debug_imgs = {k: res[k] for k in res if k not in ["M0", "M1", "M2"]}
-                        with lock:
-                            res_store[i] = res
-                        debugin_queue.put((i))
-                    if "coefs" in res:
-                        coefs_list[i] = res["coefs"]
-                    if "registration" in res:
-                        reg_list[i] = res["registration"]
-
-                    out_list.append(
-                        self.xp.stack([M0, M1, M2], axis=2)
-                    )
-
-                except Exception:
-                    traceback.print_exc()
-                    break
-
-            if len(out_list) == 0:
-                return None
+            self._process_cpu(parameters, num_batch, first_frame, batch_stride,
+                             batch_size, M0_reg, out_list, coefs_list, reg_list,
+                             debug_manager, debug_queue, res_store, lock if parameters.get("debug") else None)
         
-        if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and all(coefs is not None for coefs in coefs_list):
-            zernike_coefs = self._to_numpy(self.xp.array(coefs_list))
-        else:
-            zernike_coefs = None
+        # Stack results
+        vid = self.bm.xp.stack(out_list, axis=3)
         
-        vid = self.xp.stack(out_list, axis=3) 
-        
-        # ------------------------------------------------------------
-        # Debug handling
-        # ------------------------------------------------------------
-        import time
-        t0 = time.perf_counter()
-        if parameters["debug"]:
-            # --- build streams automatically ---
-            streams = {k: [None]*len(debug_results) for k in self.debug_plotters.keys()}
-
-            for i, dic in debug_results.items():
-                for key, img in dic.items():
-                    if parameters["square"] and key in ["montage", "M0notfixed"]:
-                        m = max(img.shape[0], img.shape[1])
-                        img = self._resize(img, m, m)
-
-                    streams[key][i] = img
-
-            # stack only non-empty streams
-            import numpy as np
-            vid_debug = [
-                np.stack([img for img in stream if img is not None], axis=2)
-                for stream in streams.values()
-                if any(img is not None for img in stream)
-            ]
-            debugin_queue.join()
+        # Cleanup debug
+        if parameters.get("debug") and debug_manager is not None:
+            debug_queue.join()
             stop_event.set()
             debug_thread.join()
-
+            debug_manager.close_all()
+            
+        # Convert to numpy for saving
+        vid_np = self.bm.to_numpy(vid)
+        for i in range(num_batch) :
+            coefs_list[i] =self.bm.to_numpy(coefs_list[i])
+            reg_list[i] =self.bm.to_numpy(reg_list[i])
+        if parameters["debug"]:
+            vid_debug = {
+                key: np.moveaxis(np.stack([self.bm.to_numpy(debug_results[k][key]) for k in range(num_batch)]), 0, -1)
+                for key in debug_results[0]
+            }
         else:
-            vid_debug = None
-        t_debug = time.perf_counter() - t0
-        # print(f"[TIMING] debug handling: {t_debug:.3f}s")
-
-        # ------------------------------------------------------------
-        # Zernike coefficients
-        # ------------------------------------------------------------
-        if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and all(coefs is not None for coefs in coefs_list):
-            zernike_coefs = self._to_numpy(self.xp.array(coefs_list))
-        else:
-            zernike_coefs = None
-
-        # ------------------------------------------------------------
-        # Temporal accumulation
-        # ------------------------------------------------------------
-        # t0 = time.perf_counter()
-        # if parameters["accumulation"] > 1:
-        #     acc = parameters["accumulation"] 
-        #     ny, nx, nimgs, nt = vid.shape
-        #     vid = self.xp.reshape(vid[:,:,:,:(nt//acc)*acc], (ny, nx, nimgs, nt//acc, acc)) @ self.xp.ones(acc)
-        # t_acc = time.perf_counter() - t0
-        # print(f"[TIMING] accumulation: {t_acc:.3f}s")
-
-        # ------------------------------------------------------------
-        # Spatial transformations (square, transpose, flips)
-        # ------------------------------------------------------------
-        import numpy as np
-        t0 = time.perf_counter()
-        if parameters["square"]:
-            m = max(vid.shape[0], vid.shape[1])
-            vid = self._to_numpy(vid).astype(np.float64)
-            vid = self._resize(vid, m, m)
-        if parameters["transpose"]:
-            vid = self.xp.transpose(vid, axes=(1, 0, 2, 3))
-        if parameters["flip_x"]:
-            vid = self.xp.flip(vid, axis=1)
-        if parameters["flip_y"]:
-            vid = self.xp.flip(vid, axis=0)
-        t_spatial = time.perf_counter() - t0
-        # print(f"[TIMING] spatial transforms: {t_spatial:.3f}s")
-
-        # ------------------------------------------------------------
-        # Convert to numpy if needed
-        # ------------------------------------------------------------
-        t0 = time.perf_counter()
-        if (h5_path is not None) or (mp4_path is not None) or holodoppler_path:
-            vid = self._to_numpy(vid)
-        t_to_numpy = time.perf_counter() - t0
-        # print(f"[TIMING] to_numpy conversion: {t_to_numpy:.3f}s")
+            vid_debug = {}
+            
+        # clear gpu memory to enforce no memory leak
+        self.bm.clear_gpu_memory()
         
-        # -------------------------------------------------------------
-        # Close file if needed
-        # -------------------------------------------------------------
-        self._close_file()
-
-        # ------------------------------------------------------------
-        # Saving outputs (h5, mp4, holodoppler)
-        # ------------------------------------------------------------
+        # Post-processing: spatial transforms
+        if parameters.get("square"):
+            m = max(vid_np.shape[0], vid_np.shape[1])
+            vid_np = self._resize_to_square(vid_np, m, m)
+        if parameters.get("transpose"):
+            vid_np = np.transpose(vid_np, axes=(1, 0, 2, 3))
+        if parameters.get("flip_x"):
+            vid_np = np.flip(vid_np, axis=1)
+        if parameters.get("flip_y"):
+            vid_np = np.flip(vid_np, axis=0)
         
-        def save_to_h5path(h5_path, v, parameters, reg_list = None, zernike_coefs = None, git_commit = None):
-            with h5py.File(h5_path, "w") as f:
-                f.create_dataset("moment0", data=v[:, :, :, 0])
-                f.create_dataset("moment1", data=v[:, :, :, 1])
-                f.create_dataset("moment2", data=v[:, :, :, 2])
-                f.create_dataset("HD_parameters", data=json.dumps(parameters))
-                if parameters["image_registration"]:
-                    f.create_dataset("registration", data=self._to_numpy(self.xp.array(reg_list)))
-                    
-                if parameters["shack_hartmann"] and parameters["spatial_propagation"] == "Fresnel" and zernike_coefs is not None:
-                    f.create_dataset("zernike_coefs_radians", data=self._to_numpy((zernike_coefs).astype(np.float64)))
-
-                def json_serializer(obj):
-                    if isinstance(obj, np.ndarray):
-                        return obj.tolist()
-                    raise TypeError(f"Type {type(obj)} not serializable")
-
-                if self.ext == ".holo":
-                    f.create_dataset("holo_header", data=json.dumps(self.file_header, default=json_serializer))
-                    f.create_dataset("holo_footer", data=json.dumps(self.file_footer, default=json_serializer))
-                elif self.ext == ".cine":
-                    f.create_dataset("cine_metadata", data=json.dumps(self.cine_metadata_json, default=json_serializer))
-                if git_commit is not None:
-                    f.create_dataset("git_commit", data=git_commit)
-                    
-                    
-        t_save = 0.0
-
-        if h5_path is not None:
-            tt = time.perf_counter()
-            try:
-                import subprocess
-                git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
-            except Exception:
-                git_commit = None
-            save_to_h5path(h5_path, v, parameters, reg_list = None, zernike_coefs = None, git_commit = git_commit)
-            t_save += time.perf_counter() - tt
-            # print(f"[TIMING] save HDF5: {time.perf_counter()-tt:.3f}s")
-
-        if mp4_path is not None:
-            tt = time.perf_counter()
-            
-            # save m0 as mp4
-            def normalize(arr):
-                arr = arr.astype(np.float32)
-                lo, hi = arr.min(), arr.max()
-                return ((arr - lo) / (hi - lo) * 255).astype(np.uint8) if hi > lo else arr.astype(np.uint8)
-            def write_video(path, frames, fps):
-                h, w, n = frames.shape[0], frames.shape[1], frames.shape[2]
-                out = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*"mp4v"), fps, (w, h), isColor=False)
-                for i in range(n):
-                    out.write(normalize(frames[:, :, i]))
-                out.release()
-            fps = num_batch / (end_frame - first_frame) * parameters["sampling_freq"]
-            write_video(mp4_path, vid[:, :, 0, :], min(fps, 65), "mp4v")
-            t_save += time.perf_counter() - tt
-            # print(f"[TIMING] save MP4: {time.perf_counter()-tt:.3f}s")
-
-        if holodoppler_path:
-            tt = time.perf_counter()
-            
-            base_name = os.path.splitext(os.path.basename(self.file_path))[0]
-            dir_name = f"{base_name}"
-            parent_dir = os.path.dirname(self.file_path)
-            holodoppler_dir_name = f"{dir_name}_HD"
-            holodoppler_path = os.path.join(parent_dir,dir_name, holodoppler_dir_name)
-            os.makedirs(holodoppler_path, exist_ok=True)
-            # make a png, mp4 json and h5 sub directories with their respective content
-            png_dir = os.path.join((holodoppler_path), "png")
-            mp4_dir = os.path.join((holodoppler_path), "mp4")
-            avi_dir = os.path.join((holodoppler_path), "avi")
-            json_dir = os.path.join((holodoppler_path), "json")
-            h5_dir = os.path.join((holodoppler_path), "h5")
-            print(f"Saving output to: {holodoppler_path}")
-            os.makedirs(png_dir, exist_ok=True)
-            os.makedirs(mp4_dir, exist_ok=True)
-            os.makedirs(avi_dir, exist_ok=True)
-            os.makedirs(json_dir, exist_ok=True)
-            os.makedirs(h5_dir, exist_ok=True)
-            
-            # save m0 as mp4 and avi
-            def normalize(arr):
-                arr = arr.astype(np.float32)
-                lo, hi = arr.min(), arr.max()
-                return ((arr - lo) / (hi - lo) * 255).astype(np.uint8) if hi > lo else arr.astype(np.uint8)
-
-            def temporal_gaussian(arr, sigma):
-                if sigma == 0 :
-                    return arr
-                return gaussian_filter1d(arr.astype(np.float32), sigma=sigma, axis=2)
-
-            def write_video(path, frames, fps, fourcc, is_color=False):
-                h, w, n = frames.shape[0], frames.shape[1], frames.shape[2]
-                out = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*fourcc), fps, (w, h), isColor=is_color)
-                for i in range(n):
-                    out.write(frames[:, :, i] if frames.ndim == 3 else frames[:, :, i, :])
-                out.release()
-
-            def save_pair(stem, frames, fps, mp4_dir, avi_dir, sigma = 4.0, is_color=False, save_png=True):
-                frames = temporal_gaussian(frames, sigma) # removing for clarity only raw output
-                frames = normalize(frames)
-                
-                # print(frames.shape, frames.dtype, type(frames))
-                write_video(os.path.join(mp4_dir, f"{stem}.mp4"), frames, min(fps, 65), "mp4v", is_color)
-                write_video(os.path.join(avi_dir, f"{stem}.avi"), frames, min(fps, 65), "MJPG", is_color)
-                if save_png:
-                    plt.imsave(os.path.join(png_dir, f"{stem}.png"), np.mean(frames, axis=2), cmap="gray")
-
-            fps = num_batch / (end_frame - first_frame) * parameters["sampling_freq"]
-
-            save_pair("moment_0", vid[:, :, 0, :], fps, mp4_dir, avi_dir, sigma=0)
-            save_pair("moment_1", vid[:, :, 1, :], fps, mp4_dir, avi_dir, sigma=0)
-            save_pair("moment_2", vid[:, :, 2, :], fps, mp4_dir, avi_dir, sigma=0)
-
-            if parameters["debug"]:
-                def flatfield3D(arr, gw):
-                    if arr.ndim != 3:
-                        raise ValueError("Input array must be 3D")
-                    if gw <= 1:
-                        return arr
-                    blurred = np_gaussian_filter(arr, sigma=(gw, gw, 1))
-                    blurred[blurred == 0] = 1
-                    return arr / blurred
-                save_pair("moment_0_slidingavg_flatfield", flatfield3D(vid[:, :, 0, :], parameters["registration_flatfield_gw"]), fps, mp4_dir, avi_dir, sigma=1.50)
-            
-
-            if parameters["debug"] and vid_debug is not None:
-                for idx, v in enumerate(vid_debug):
-                    save_pair(f"debug_{list(self.debug_plotters.keys())[idx]}", v, fps, mp4_dir, avi_dir, sigma=0, is_color=v.ndim == 4, save_png=False)
-
-            # save json
-            with open(os.path.join(json_dir, "parameters.json"), "w") as f:
-                json.dump(parameters, f, indent=4)
-                
-            # get git info 
-            # if git is available write the current commit hash
-            try:
-                import subprocess
-                git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
-                git_txt = "Git commit hash: " + git_commit + "\n"
-                # check if there are uncommited changes and add a warning if there are
-                git_status = subprocess.check_output(["git", "status", "--porcelain"]).decode("utf-8").strip()
-                if git_status:
-                    git_txt += "Warning: There are uncommited changes in the repository, the results may not be reproducible\n"
-            except Exception:
-                git_txt = "Git commit hash: Not available\n"
-            # save h5
-            save_to_h5path(os.path.join(h5_dir, f"{holodoppler_dir_name}_output.h5"), np.permute_dims(vid, (3, 1, 0, 2)), parameters, reg_list if parameters["image_registration"] else None, zernike_coefs, git_commit=git_txt)
-            # add a version.txt file with the version of the holodoppler pipeline used
-            with open(os.path.join(holodoppler_path, "git_version.txt"), "w") as f:
-                f.write(f"Python:\n")
-                f.write(f"Holodoppler pipeline version: {self.pipeline_version}\n")
-                f.write(f"Holodoppler backend: {self.backend}\n") 
-                f.write(f"{git_txt}")
-                
-            with open(os.path.join(holodoppler_path, "version_holodoppler.txt"), "w") as f:
-                f.write(f"py 0.1.0")
-            if self.ext == ".holo":
-                with open(os.path.join(holodoppler_path, "version_holovibes.txt"), "w") as f:
-                    f.write(f"{self.file_footer.get('info',{}).get('holovibes_version', 'unknown')}")
-                    
-            t_save += time.perf_counter() - tt
-            # print(f"[TIMING] holodoppler outputs: {time.perf_counter()-tt:.3f}s")
-            
-        # Dispose of GPU arrays to free memory
-        if self.backend in ["cupy", "cupyRAM"]:
-            del d_frames
-            if 'd_frames_next' in locals():
-                del d_frames_next
-            cp.cuda.Device().synchronize()
-            cp.get_default_memory_pool().free_all_blocks()
-            cp.get_default_pinned_memory_pool().free_all_blocks()
-            
-        plt.close('all') # close any open figures to free memory
-
-        print(f"total saving time: {t_save:.3f}s")
-
+        # Save outputs
+        self._save_outputs(mp4_path, holodoppler_path, vid_np, vid_debug, parameters,
+                          reg_list, coefs_list, end_frame, first_frame, num_batch)
+        
+        self.close_file()
+        plt.close('all')
+        
         if return_numpy:
-            return self._to_numpy(vid)
+            return vid_np
         
+        return None
+    
+    def _process_cpu(self, parameters, num_batch, first_frame, batch_stride,
+                     batch_size, M0_reg, out_list, coefs_list, reg_list,
+                     debug_manager, debug_queue, res_store, lock):
+        """CPU processing loop"""
+        for i in tqdm(range(num_batch)):
+            frames = self.read_frames(first_frame + i * batch_stride, batch_size)
+            res = self.render_moments(parameters, frames=frames, registration_ref=M0_reg)
+            
+            if res is None:
+                break
+            
+            out_list.append(self.bm.xp.stack([res["M0"], res["M1"], res["M2"]], axis=2))
+            
+            if "coefs" in res and coefs_list is not None:
+                coefs_list[i] = res["coefs"]
+            if "registration" in res and reg_list is not None:
+                reg_list[i] = res["registration"]
+            
+            if debug_manager is not None and lock is not None:
+                with lock:
+                    res_store[i] = res
+                debug_queue.put(i)
+    
+    def _process_gpu_streaming(self, parameters, num_batch, first_frame, batch_stride,
+                               batch_size, M0_reg, out_list, coefs_list, reg_list,
+                               debug_manager, debug_queue, res_store, lock):
+        """GPU streaming processing loop"""
+        import cupy as cp
         
+        stream_h2d = cp.cuda.Stream(non_blocking=True)
+        stream_compute = cp.cuda.Stream(non_blocking=True)
+        
+        # Prefetch first batch
+        frames_next = self.read_frames(first_frame, batch_size)
+        with stream_h2d:
+            d_frames_next = cp.asarray(frames_next)
+        
+        for i in tqdm(range(num_batch)):
+            d_frames = d_frames_next
+            
+            # Prefetch next batch
+            if i + 1 < num_batch:
+                with stream_h2d:
+                    frames_next = self.read_frames(
+                        first_frame + (i + 1) * batch_stride, batch_size
+                    )
+                    d_frames_next = cp.asarray(frames_next)
+            
+            # Compute current batch
+            with stream_compute:
+                res = self.render_moments(parameters, frames=d_frames, registration_ref=M0_reg)
+            
+            if res is None:
+                break
+            
+            out_list.append(cp.stack([res["M0"], res["M1"], res["M2"]], axis=2))
+            
+            if "coefs" in res and coefs_list is not None:
+                coefs_list[i] = res["coefs"]
+            if "registration" in res and reg_list is not None:
+                reg_list[i] = res["registration"]
+            
+            if debug_manager is not None and lock is not None:
+                with lock:
+                    res_store[i] = res
+                debug_queue.put(i)
+            
+            stream_compute.synchronize()
+        
+        stream_h2d.synchronize()
+        cp.cuda.Device().synchronize()
+        
+    def _process_gpu_streaming_onram(self, parameters, num_batch, first_frame, batch_stride,
+                                    batch_size, M0_reg, out_list, coefs_list, reg_list,
+                                    debug_manager, debug_queue, res_store, lock):
+        """GPU streaming processing loop with CPU RAM prefetch queue."""
+        import queue, threading
+        import cupy as cp
+        from tqdm import tqdm
+
+        frame_queue = queue.Queue(maxsize=4)
+        stop_reader = threading.Event()
+
+        def reader():
+            frame_idx = first_frame
+            for i in range(num_batch):
+                if stop_reader.is_set():
+                    break
+                frames = self.read_frames(frame_idx, batch_size)
+                frame_queue.put((i, frames))
+                frame_idx += batch_stride
+            frame_queue.put(None)
+
+        reader_thread = threading.Thread(target=reader, daemon=True)
+        reader_thread.start()
+
+        stream_h2d = cp.cuda.Stream(non_blocking=True)
+        stream_compute = cp.cuda.Stream(non_blocking=True)
+
+        item = frame_queue.get()
+        if item is None:
+            return
+
+        _, frames = item
+        with stream_h2d:
+            d_frames = cp.asarray(frames)
+        stream_h2d.synchronize()
+
+        for i in tqdm(range(num_batch)):
+            next_item = frame_queue.get() if i + 1 < num_batch else None
+
+            d_frames_next = None
+            if next_item is not None:
+                _, frames_next = next_item
+                with stream_h2d:
+                    d_frames_next = cp.asarray(frames_next)
+
+            with stream_compute:
+                res = self.render_moments(parameters, frames=d_frames, registration_ref=M0_reg)
+
+            stream_compute.synchronize()
+
+            if res is None:
+                break
+
+            out_list.append(cp.stack([res["M0"], res["M1"], res["M2"]], axis=2))
+
+            if "coefs" in res and coefs_list is not None:
+                coefs_list[i] = res["coefs"]
+            if "registration" in res and reg_list is not None:
+                reg_list[i] = res["registration"]
+
+            if debug_manager is not None and debug_queue is not None and lock is not None:
+                with lock:
+                    res_store[i] = res
+                debug_queue.put(i)
+
+            if d_frames_next is not None:
+                stream_h2d.synchronize()
+                d_frames = d_frames_next
+
+        stop_reader.set()
+        reader_thread.join(timeout=5)
+
+        stream_h2d.synchronize()
+        stream_compute.synchronize()
+        cp.cuda.Device().synchronize()
+    
+    def _save_outputs(self, mp4_path, holodoppler_path, vid, vid_debug, parameters,
+                      reg_list, coefs_list, end_frame, first_frame, num_batch):
+        """Save outputs to disk"""
+        
+        fps = num_batch / (end_frame - first_frame) * parameters["sampling_freq"]
+        fps = min(fps, 65)
+            
+        if mp4_path is not None:
+            self._write_video(mp4_path, vid[:, :, 0, :], fps)
+        
+        if holodoppler_path is not None:
+            self._save_holodoppler_output(vid, vid_debug, parameters, fps,
+                                          reg_list, coefs_list, end_frame, first_frame, num_batch)
+    
+    def _write_video(self, path, frames, fps, fourcc="mp4v"):
+        """Write grayscale (H, W, N) or color (H, W, C, N) video."""
+        import cv2
+        import numpy as np
+
+        frames = np.asarray(frames)
+
+        if frames.ndim == 3:
+            # (H, W, N) -> (N, H, W)
+            video = np.moveaxis(frames, -1, 0)
+            is_color = False
+
+        elif frames.ndim == 4:
+            # (H, W, C, N) -> (N, H, W, C)
+            video = np.moveaxis(frames, -1, 0)
+            is_color = video.shape[-1] > 1
+
+            if video.shape[-1] == 3:
+                video = video[..., ::-1]  # RGB -> BGR for OpenCV
+
+        else:
+            raise ValueError(f"Unsupported frame shape: {frames.shape}")
+
+        video = video.astype(np.float32, copy=False)
+        vmin = video.min(axis=tuple(range(1, video.ndim)), keepdims=True)
+        vmax = video.max(axis=tuple(range(1, video.ndim)), keepdims=True)
+
+        video = (255 * (video - vmin) / (vmax - vmin + 1e-12)).clip(0, 255).astype(np.uint8)
+        video = np.ascontiguousarray(video)
+
+        h, w = video.shape[1:3]
+
+        out = cv2.VideoWriter(
+            path,
+            cv2.VideoWriter_fourcc(*fourcc),
+            fps,
+            (w, h),
+            isColor=is_color,
+        )
+
+        for frame in video:
+            out.write(frame)
+
+        out.release()
+    
+    def _save_holodoppler_output(self, vid, vid_debug, parameters, fps, reg_list, coefs_list, end_frame, first_frame, num_batch):
+        """Save complete Holodoppler output directory"""
+        import subprocess
+        import json
+        
+        base_name = os.path.splitext(os.path.basename(self.file_reader.file_path))[0]
+        dir_name = f"{base_name}_HD"
+        parent_dir = os.path.dirname(self.file_reader.file_path)
+        full_path = os.path.join(parent_dir, base_name, dir_name)
+        
+        print("Saving holodoppler outputs to : ",full_path)
+        os.makedirs(full_path, exist_ok=True)
+        
+        # Create subdirectories
+        for subdir in ["png", "mp4", "avi", "json", "h5"]:
+            os.makedirs(os.path.join(full_path, subdir), exist_ok=True)
+        
+        def save_pair(name, frames, png=True):
+            self._write_video(os.path.join(full_path, "mp4", f"{name}.mp4"), frames, fps, "mp4v")
+            self._write_video(os.path.join(full_path, "avi", f"{name}.avi"), frames, fps, "MJPG")
+            if png:
+                plt.imsave(os.path.join(full_path, "png", f"{name}.png"), np.mean(frames, axis=-1), cmap="gray")
+        
+        save_pair("moment_0", vid[:, :, 0, :])
+        save_pair("moment_1", vid[:, :, 1, :])
+        save_pair("moment_2", vid[:, :, 2, :])
+        save_pair("moment_0_flatfield", flatfield3D(vid[:, :, 0, :], parameters["registration_flatfield_gw"]))
+        
+        for key, video_debug in vid_debug.items():
+            if key in {"montage","M0notfixed", "M0ffnoreg"}:
+                ny, nx, nt = video_debug.shape
+                m = max(nx,ny)
+                video_debug = self._resize_to_square(video_debug, m, m)
+            save_pair(f"debug_{key}", video_debug, png=False)
+        
+        # Save JSON parameters
+        with open(os.path.join(full_path, "json", "parameters_holodoppler.json"), "w") as f:
+            json.dump(parameters, f, indent=4)
+        
+        # Save version info
+        with open(os.path.join(full_path, "git_version.txt"), "w") as f:
+            f.write(f"Holodoppler pipeline version: {self.pipeline_version}\n")
+            f.write(f"Holodoppler backend: {self.backend_name}\n")
+            try:
+                git_commit = subprocess.check_output(["git", "rev-parse", "HEAD"]).decode("utf-8").strip()
+                f.write(f"Git commit hash: {git_commit}\n")
+            except Exception:
+                f.write("Git commit hash: Not available\n")
+        with open(os.path.join(full_path, "version_holodoppler.txt"), "w") as f:
+            f.write(f"py{self.__version__}")
+        with open(os.path.join(full_path, "info_holodoppler.txt"), "w") as f:
+            f.write(f"py{self.__version__}  {self.backend_name}  {self.pipeline_version}")
+            
+        # copy camera aquisition metadata information if any
+        if self.file_reader.ext == ".holo":
+            with open(os.path.join(full_path, "version_holovibes.txt"), "w") as f:
+                f.write(f"{self.file_reader.file_footer.get('info',{}).get('holovibes_version', 'unknown')}")
+            with open(os.path.join(full_path, "json", "holovibes_footer.json"), "w") as f:
+                json.dump(self.file_reader.file_footer, f, indent=4)
+        
+        plt.close('all') # close any open figures to free memory
+        
+        # Save HDF5
+        with h5py.File(os.path.join(full_path, "h5", f"{dir_name}_output.h5"), "w") as f:
+            f.create_dataset("moment0", data=vid[:, :, 0, :])
+            f.create_dataset("moment1", data=vid[:, :, 1, :])
+            f.create_dataset("moment2", data=vid[:, :, 2, :])
+            f.create_dataset("HD_parameters", data=json.dumps(parameters))
+            f.create_dataset("HD_info", data=f"py{self.__version__}  {self.backend_name}  {self.pipeline_version}")
+            if parameters["image_registration"]:
+                reg_array = np.array(reg_list, dtype=np.float32)
+                f.create_dataset("registration", data=reg_array)
+            if parameters["shack_hartmann"] and parameters["shack_hartmann_zernike_fit"] and coefs_list is not None:
+                coefs_zernike = np.stack(coefs_list).astype(np.float32)
+                dset = f.create_dataset("zernike_coefs_radians", data=coefs_zernike)
+                dset.attrs["noll_indices"] = parameters["shack_hartmann_zernike_fit_modes"]

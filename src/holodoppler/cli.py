@@ -8,33 +8,28 @@ import numpy as np
 from holodoppler.Holodoppler import Holodoppler
 from matlab_imresize.imresize import imresize
 import os
+from .plotting import DebugPlotterManager
+
 
 def preview(holo_path, parameters: dict) -> None:
     HD = Holodoppler(backend = "cupyRAM", pipeline_version = "latest_old_reg")
 
     HD.load_file(holo_path)
     
-    if HD.ext == ".holo":
-        print("file header :", HD.file_header)
+    # if HD.ext == ".holo":
+    #     print("file header :", HD.file_header)
     
     print(parameters)
 
     frames = HD.read_frames(0, 1)
-    res = HD.render_moments(parameters, tictoc= False)
+    res = HD.render_moments(parameters)
 
     def plot_debug_safe(HD, res):
-        HD.init_plot_debug(parameters)
-        debug = {}
+        debug_manager = DebugPlotterManager(parameters) if parameters.get("debug") else None
+        
+        out = debug_manager.plot_all(res) if parameters.get("debug") else {}
 
-        for key, plotter in HD.debug_plotters.items():
-            try:
-                args = HD.debug_sources[key](res)
-            except KeyError:
-                continue
-
-            debug[key] = plotter.plot(*args)
-
-        return debug
+        return out
 
     import imageio.v3 as iio
 
@@ -45,7 +40,7 @@ def preview(holo_path, parameters: dict) -> None:
             if img is None:
                 continue
 
-            img_np = HD._to_numpy(img)
+            img_np = HD.bm.to_numpy(img)
 
             if img_np.ndim == 2 and parameters["square"]:
                 H, W = img_np.shape
@@ -73,12 +68,12 @@ def preview(holo_path, parameters: dict) -> None:
     debug_imgs = plot_debug_safe(HD, res)
 
     if parameters["debug"] and parameters["shack_hartmann"] and parameters["shack_hartmann_zernike_fit"]:
-        print("zernike_fit_coeffs (radians):", HD._to_numpy(res["coefs"]) if "coefs" in res else "N/A")
-        print("delta to true z in mm if coef[0] is defocus : ", 4* np.sqrt(3) * parameters["z"]**2 / ((min(frames.shape[1:])* parameters["pixel_pitch"])**2)  * parameters["wavelength"] / (2*np.pi) * (HD._to_numpy(res["coefs"])[0] if "coefs" in res else 0) * 1e3)
+        print("zernike_fit_coeffs (radians):", HD.bm.to_numpy(res["coefs"]) if "coefs" in res else "N/A")
+        print("delta to true z in mm if coef[0] is defocus : ", 4* np.sqrt(3) * parameters["z"]**2 / ((min(frames.shape[1:])* parameters["pixel_pitch"])**2)  * parameters["wavelength"] / (2*np.pi) * (HD.bm.to_numpy(res["coefs"])[0] if "coefs" in res else 0) * 1e3)
 
     # --- Add M0 ---
     if "M0" in res:
-        M0 = HD._to_numpy(res["M0"])
+        M0 = HD.bm.to_numpy(res["M0"])
         M0 = (M0 - np.min(M0)) / (np.max(M0) - np.min(M0) + 1e-12)
         debug_imgs["M0"] = (M0 * 255).astype(np.uint8)
 
@@ -100,14 +95,16 @@ def preview(holo_path, parameters: dict) -> None:
 
 
 def process(holo_path, parameters: dict) -> None:
-    HD = Holodoppler(backend = "cupy", pipeline_version = "latest_old_reg")
+    HD = Holodoppler(backend = "cupyRAM", pipeline_version = "latest")
 
     HD.load_file(holo_path)
 
-    if HD.ext == ".holo":
-        print("file header :", HD.file_header)
+    if HD.file_reader.ext == ".holo":
+        print("file header :", HD.file_reader.file_header)
+        
+    print("parameters : ", parameters)
 
-    HD.process_moments_(parameters, holodoppler_path = True)
+    HD.process_moments(parameters, holodoppler_path = True)
 
 def _existing_file(value: str) -> Path:
     path = Path(value).expanduser().resolve()
@@ -131,23 +128,75 @@ def _load_json(path: Path) -> dict[str, Any]:
     return data
 
 
+def _load_json(path: Path) -> dict:
+    """Load and parse JSON file."""
+    with open(path, 'r') as f:
+        return json.load(f)
+
+def _get_debug_config() -> dict:
+    """Load debug configuration if it exists."""
+    debug_paths_file = Path(".debug_paths.json")
+    if debug_paths_file.exists():
+        with open(debug_paths_file, 'r') as f:
+            return json.load(f)
+    return {}
+
 def _cmd_preview(args: argparse.Namespace) -> int:
-    input_path: Path = args.input
-    config_path: Path = args.config
+    debug_config = _get_debug_config()
+    
+    # Determine input path
+    if args.input is None:
+        holofilepath = debug_config.get("HOLOFILEPATH")
+        if not holofilepath:
+            print("Error: No input file provided and HOLOFILEPATH not found in .debug_paths.json")
+            return 1
+        input_path = Path(holofilepath)
+        if not input_path.exists():
+            print(f"Error: HOLOFILEPATH '{input_path}' does not exist")
+            return 1
+    else:
+        input_path = args.input
+    
+    # Determine config path
+    if args.config is None:
+        config_path = Path("parameters/default_parameters_debug.json")
+        if not config_path.exists():
+            print("Error: No config file provided and parameters/default_parameters_debug.json not found")
+            return 1
+    else:
+        config_path = args.config
+    
     config = _load_json(config_path)
-
     preview(input_path, config)
-
     return 0
 
-
 def _cmd_process(args: argparse.Namespace) -> int:
-    input_path: Path = args.input
-    config_path: Path = args.config
+    debug_config = _get_debug_config()
+    
+    # Determine input path
+    if args.input is None:
+        holofilepath = debug_config.get("HOLOFILEPATH")
+        if not holofilepath:
+            print("Error: No input file provided and HOLOFILEPATH not found in .debug_paths.json")
+            return 1
+        input_path = Path(holofilepath)
+        if not input_path.exists():
+            print(f"Error: HOLOFILEPATH '{input_path}' does not exist")
+            return 1
+    else:
+        input_path = args.input
+    
+    # Determine config path
+    if args.config is None:
+        config_path = Path("parameters/default_parameters_debug.json")
+        if not config_path.exists():
+            print("Error: No config file provided and parameters/default_parameters_debug.json not found")
+            return 1
+    else:
+        config_path = args.config
+    
     config = _load_json(config_path)
-
     process(input_path, config)
-
     return 0
 
 
@@ -170,12 +219,16 @@ def _build_parser() -> argparse.ArgumentParser:
     preview_parser.add_argument(
         "input",
         type=_existing_file,
-        help="Input file path.",
+        nargs="?",  # Make optional
+        default=None,
+        help="Input file path. If not provided, uses HOLOFILEPATH from .debug_paths.json",
     )
     preview_parser.add_argument(
         "config",
         type=_existing_file,
-        help="JSON configuration file path.",
+        nargs="?",  # Make optional
+        default=None,
+        help="JSON configuration file path. If not provided, uses parameters/default_parameters_debug.json",
     )
     preview_parser.set_defaults(func=_cmd_preview)
 
@@ -186,12 +239,16 @@ def _build_parser() -> argparse.ArgumentParser:
     process_parser.add_argument(
         "input",
         type=_existing_file,
-        help="Input file path.",
+        nargs="?",
+        default=None,
+        help="Input file path. If not provided, uses HOLOFILEPATH from .debug_paths.json",
     )
     process_parser.add_argument(
         "config",
         type=_existing_file,
-        help="JSON configuration file path.",
+        nargs="?",
+        default=None,
+        help="JSON configuration file path. If not provided, uses parameters/default_parameters_debug.json",
     )
     process_parser.set_defaults(func=_cmd_process)
 

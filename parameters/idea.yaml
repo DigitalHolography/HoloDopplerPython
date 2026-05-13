@@ -1,0 +1,60 @@
+acquisition:
+  first_frame: 0
+  end_frame: 0
+  sampling_freq: 37037
+
+batching:
+  size: 256
+  stride: 256
+
+optics:
+  wavelength: 8.52e-7
+  pixel_pitch: [2e-5,2e-5]
+  propagation:
+    method: Fresnel
+    distance: 0.480
+    zero_padding: 
+      enabled: false
+      value: 512
+
+registration:
+  enabled: true
+  disc_ratio: 0.8
+  flatfield_gaussian_width: 35
+  batch_size: 512
+
+shack_hartmann:
+  enabled: true
+
+  grid:
+    ny_subap: 5
+    nx_subap: 5
+
+  thresholds:
+    pupil: 1.2
+    deviation: 3.0
+    shift_range_pixels: 20
+
+  zernike:
+    enabled: true
+    modes: [4, 5, 6]
+
+  southwell_phase_integration:
+    enabled: false
+
+filtering:
+  svd:
+    enabled: true
+    components: 32
+  fourier:
+    low_freq: 6000
+    high_freq: 18300
+
+display:
+  square: true
+  transpose: false
+  flip_x: false
+  flip_y: false
+
+debug:
+  enabled: true
